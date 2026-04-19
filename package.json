@@ -1,0 +1,18 @@
+{
+  "name": "bsv-middleware-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "cargo install -q worker-build && worker-build --release",
+    "build:dev": "cargo install -q worker-build && worker-build --dev",
+    "deploy": "wrangler deploy",
+    "deploy:dev": "wrangler deploy --config wrangler.dev.toml",
+    "dev": "wrangler dev --config wrangler.dev.toml",
+    "tail": "wrangler tail",
+    "kv:create": "wrangler kv:namespace create AUTH_SESSIONS && wrangler kv:namespace create PAYMENTS",
+    "kv:create:dev": "wrangler kv:namespace create AUTH_SESSIONS --preview && wrangler kv:namespace create PAYMENTS --preview"
+  },
+  "devDependencies": {
+    "wrangler": "^3.91.0"
+  }
+}

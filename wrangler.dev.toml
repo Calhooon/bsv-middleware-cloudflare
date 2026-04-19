@@ -1,0 +1,22 @@
+name = "bsv-auth-worker-dev"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --dev"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "your-dev-kv-id-here"
+preview_id = "your-dev-kv-preview-id-here"
+
+[[kv_namespaces]]
+binding = "PAYMENTS"
+id = "your-dev-payments-kv-id-here"
+preview_id = "your-dev-payments-kv-preview-id-here"
+
+[vars]
+ENVIRONMENT = "development"
+
+# For local development, set secrets via:
+# wrangler secret put SERVER_PRIVATE_KEY --config wrangler.dev.toml

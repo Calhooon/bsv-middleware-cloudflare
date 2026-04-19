@@ -1,0 +1,20 @@
+name = "bsv-auth-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "your-kv-id-here"
+
+[[kv_namespaces]]
+binding = "PAYMENTS"
+id = "your-payments-kv-id-here"
+
+[vars]
+ENVIRONMENT = "production"
+
+# Secrets (set via `wrangler secret put`):
+# SERVER_PRIVATE_KEY - 64-char hex private key for server identity

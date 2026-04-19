@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+
+# Cloudflare / Node
+.wrangler/
+build/
+dist/
+node_modules/
+*.wasm
+
+# Secrets / env
+.dev.vars
+.env
+.env.*
+SECRETS.md
+*.pem
+*.key
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
