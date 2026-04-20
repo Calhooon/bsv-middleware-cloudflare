@@ -104,9 +104,9 @@ Known divergences (architectural, not bugs):
 
 ## Consumers
 
-Known production consumers using BRC-31 auth + dynamic pricing + optional refund:
+Known production consumers using BRC-103/104 auth + dynamic pricing + optional refund:
 
-- [`rust-message-box`](https://github.com/Calhooon/rust-message-box) — BSV peer-to-peer messaging service
+- `bsv-messagebox-cloudflare` — BSV peer-to-peer messaging service (upcoming public release)
 - Various agents (image gen, LLM inference) that pre-charge and refund on upstream failure
 
 ## License
