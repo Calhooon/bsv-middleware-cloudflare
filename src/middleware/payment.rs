@@ -263,6 +263,12 @@ where
                 "identityKey": server_identity,
                 "userId": user_id
             });
+            // NB: omit `insertionRemittance` entirely for wallet-payment outputs.
+            // Sending it as `null` tripped wallet-infra's internalize handler
+            // (TypeError: Cannot read properties of null (reading 'basket')) —
+            // the JS shim around bsv-sdk's `BasketInsertion` type dereferences
+            // `.basket` before checking the protocol discriminator. The TS
+            // reference middleware omits the field entirely; we match that.
             let args_json = serde_json::json!({
                 "tx": tx_bytes,
                 "outputs": [{
@@ -272,8 +278,7 @@ where
                         "derivationPrefix": payment.derivation_prefix,
                         "derivationSuffix": payment.derivation_suffix,
                         "senderIdentityKey": auth_context.identity_key
-                    },
-                    "insertionRemittance": null
+                    }
                 }],
                 "description": "Payment for request"
             });
