@@ -1,7 +1,7 @@
 //! CORS handling utilities for Cloudflare Workers.
 
-use crate::transport::auth_headers;
 use crate::middleware::payment::payment_headers;
+use crate::transport::auth_headers;
 use worker::{Headers, Response};
 
 /// CORS configuration.

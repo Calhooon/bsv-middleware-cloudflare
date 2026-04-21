@@ -172,8 +172,7 @@ pub async fn issue_refund(
 
     // 3. Sign the template
     let signing_wallet = ProtoWallet::new(Some(
-        PrivateKey::from_hex(server_key)
-            .map_err(|e| RefundError::Signing(e.to_string()))?,
+        PrivateKey::from_hex(server_key).map_err(|e| RefundError::Signing(e.to_string()))?,
     ));
     let signed_tx = signer::sign_create_action_template(&signing_wallet, &create_result)
         .map_err(|e| RefundError::Signing(e))?;

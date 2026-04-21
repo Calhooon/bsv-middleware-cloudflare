@@ -31,9 +31,9 @@ impl<'a> WorkerEnv<'a> {
 
     /// Gets the AUTH_SESSIONS KV namespace.
     pub fn get_auth_sessions_kv(&self) -> Result<worker::kv::KvStore> {
-        self.env
-            .kv("AUTH_SESSIONS")
-            .map_err(|e| AuthCloudflareError::ConfigError(format!("AUTH_SESSIONS KV not bound: {}", e)))
+        self.env.kv("AUTH_SESSIONS").map_err(|e| {
+            AuthCloudflareError::ConfigError(format!("AUTH_SESSIONS KV not bound: {}", e))
+        })
     }
 
     /// Gets the PAYMENTS KV namespace.
@@ -50,6 +50,7 @@ impl<'a> WorkerEnv<'a> {
 
     /// Gets the environment (development, production, etc.).
     pub fn get_environment(&self) -> String {
-        self.get_var("ENVIRONMENT").unwrap_or_else(|| "production".to_string())
+        self.get_var("ENVIRONMENT")
+            .unwrap_or_else(|| "production".to_string())
     }
 }

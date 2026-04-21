@@ -125,8 +125,7 @@ pub fn sign_create_action_template(
                 // so this guarantees create/spend produce an inverse key pair.
                 // See module docs and the round-trip test in this file.
                 let key_id = format!("{} {}", derivation_prefix, suffix);
-                let brc29_protocol =
-                    Protocol::new(SecurityLevel::Counterparty, "3241645161d8");
+                let brc29_protocol = Protocol::new(SecurityLevel::Counterparty, "3241645161d8");
                 let derived_key = proto_wallet
                     .key_deriver()
                     .derive_private_key(&brc29_protocol, &key_id, &Counterparty::Self_)
@@ -139,9 +138,7 @@ pub fn sign_create_action_template(
                 script.extend_from_slice(&[0x88, 0xac]);
                 script
             } else {
-                return Err(
-                    "Output has empty locking script and no derivation info".to_string()
-                );
+                return Err("Output has empty locking script and no derivation info".to_string());
             }
         } else {
             hex::decode(locking_script_hex)
@@ -180,9 +177,7 @@ pub fn sign_create_action_template(
             .ok_or(format!("input {} missing derivationSuffix", vin))?;
 
         // Determine counterparty from senderIdentityKey
-        let sender_key_str = input
-            .get("senderIdentityKey")
-            .and_then(|v| v.as_str());
+        let sender_key_str = input.get("senderIdentityKey").and_then(|v| v.as_str());
         let counterparty = if let Some(sender_key) = sender_key_str {
             let pubkey = bsv_sdk::primitives::PublicKey::from_hex(sender_key)
                 .map_err(|e| format!("Invalid sender key: {}", e))?;
@@ -192,8 +187,7 @@ pub fn sign_create_action_template(
         };
 
         // Derive the signing key using BRC-29 protocol
-        let brc29_protocol =
-            Protocol::new(SecurityLevel::Counterparty, "3241645161d8");
+        let brc29_protocol = Protocol::new(SecurityLevel::Counterparty, "3241645161d8");
         let key_id = format!("{} {}", input_derivation_prefix, input_derivation_suffix);
 
         // Extract expected hash from P2PKH locking script
@@ -246,12 +240,8 @@ pub fn sign_create_action_template(
         };
 
         // Compute BIP-143 sighash
-        let sighash = compute_sighash(
-            &raw_tx,
-            vin as u32,
-            &source_locking_script,
-            source_satoshis,
-        )?;
+        let sighash =
+            compute_sighash(&raw_tx, vin as u32, &source_locking_script, source_satoshis)?;
 
         // Sign the sighash
         let signature = signing_key
@@ -358,9 +348,7 @@ struct TxOutput {
     script: Vec<u8>,
 }
 
-fn parse_transaction(
-    tx_data: &[u8],
-) -> Result<(u32, Vec<TxInput>, Vec<TxOutput>, u32), String> {
+fn parse_transaction(tx_data: &[u8]) -> Result<(u32, Vec<TxInput>, Vec<TxOutput>, u32), String> {
     let mut offset = 0;
 
     if tx_data.len() < 10 {
@@ -368,8 +356,10 @@ fn parse_transaction(
     }
 
     let version = u32::from_le_bytes([
-        tx_data[offset], tx_data[offset + 1],
-        tx_data[offset + 2], tx_data[offset + 3],
+        tx_data[offset],
+        tx_data[offset + 1],
+        tx_data[offset + 2],
+        tx_data[offset + 3],
     ]);
     offset += 4;
 
@@ -386,8 +376,10 @@ fn parse_transaction(
         offset += 32;
 
         let vout = u32::from_le_bytes([
-            tx_data[offset], tx_data[offset + 1],
-            tx_data[offset + 2], tx_data[offset + 3],
+            tx_data[offset],
+            tx_data[offset + 1],
+            tx_data[offset + 2],
+            tx_data[offset + 3],
         ]);
         offset += 4;
 
@@ -404,12 +396,19 @@ fn parse_transaction(
             return Err("Unexpected end of tx (sequence)".to_string());
         }
         let sequence = u32::from_le_bytes([
-            tx_data[offset], tx_data[offset + 1],
-            tx_data[offset + 2], tx_data[offset + 3],
+            tx_data[offset],
+            tx_data[offset + 1],
+            tx_data[offset + 2],
+            tx_data[offset + 3],
         ]);
         offset += 4;
 
-        inputs.push(TxInput { txid, vout, script, sequence });
+        inputs.push(TxInput {
+            txid,
+            vout,
+            script,
+            sequence,
+        });
     }
 
     let (output_count, bytes_read) = read_varint(&tx_data[offset..])?;
@@ -421,8 +420,14 @@ fn parse_transaction(
             return Err("Unexpected end of tx (output satoshis)".to_string());
         }
         let satoshis = u64::from_le_bytes([
-            tx_data[offset], tx_data[offset + 1], tx_data[offset + 2], tx_data[offset + 3],
-            tx_data[offset + 4], tx_data[offset + 5], tx_data[offset + 6], tx_data[offset + 7],
+            tx_data[offset],
+            tx_data[offset + 1],
+            tx_data[offset + 2],
+            tx_data[offset + 3],
+            tx_data[offset + 4],
+            tx_data[offset + 5],
+            tx_data[offset + 6],
+            tx_data[offset + 7],
         ]);
         offset += 8;
 
@@ -442,8 +447,10 @@ fn parse_transaction(
         return Err("Unexpected end of tx (locktime)".to_string());
     }
     let locktime = u32::from_le_bytes([
-        tx_data[offset], tx_data[offset + 1],
-        tx_data[offset + 2], tx_data[offset + 3],
+        tx_data[offset],
+        tx_data[offset + 1],
+        tx_data[offset + 2],
+        tx_data[offset + 3],
     ]);
 
     Ok((version, inputs, outputs, locktime))

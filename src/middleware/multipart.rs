@@ -39,7 +39,10 @@ struct MultipartPart {
 /// let (request_body, multipart_payment) = prepare_multipart_payment(&req, request_body)?;
 /// // Use multipart_payment.or_else(|| header read) for payment extraction
 /// ```
-pub fn prepare_multipart_payment(req: &Request, body: Vec<u8>) -> Result<(Vec<u8>, Option<String>)> {
+pub fn prepare_multipart_payment(
+    req: &Request,
+    body: Vec<u8>,
+) -> Result<(Vec<u8>, Option<String>)> {
     let content_type = req
         .headers()
         .get("content-type")
@@ -219,7 +222,7 @@ fn extract_part_name(headers: &str) -> Option<String> {
         if let Some(idx) = line.find("name=") {
             let start = idx + 5;
             let end = line[start..]
-                .find(|c: char| c == ';' || c == ' ' || c == '\r')
+                .find([';', ' ', '\r'])
                 .unwrap_or(line.len() - start);
             return Some(line[start..start + end].to_string());
         }
@@ -308,10 +311,7 @@ mod tests {
         assert_eq!(parts.len(), 2);
 
         assert_eq!(parts[0].0, "x-bsv-payment");
-        assert_eq!(
-            parts[0].1.content_type.as_deref(),
-            Some("application/json")
-        );
+        assert_eq!(parts[0].1.content_type.as_deref(), Some("application/json"));
         let payment_str = std::str::from_utf8(&parts[0].1.bytes).unwrap();
         assert!(payment_str.contains("derivationPrefix"));
 
@@ -323,7 +323,8 @@ mod tests {
     #[test]
     fn test_parse_multipart_binary_body() {
         let boundary = "bsv123";
-        let payment_json = r#"{"derivationPrefix":"p","derivationSuffix":"s","transaction":"dHg="}"#;
+        let payment_json =
+            r#"{"derivationPrefix":"p","derivationSuffix":"s","transaction":"dHg="}"#;
         let audio_bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x02, 0x03];
 
         let mut body = Vec::new();
@@ -398,8 +399,10 @@ mod tests {
     #[test]
     fn test_roundtrip_client_format() {
         let boundary = "----BsvPayment00a1b2c3d4e5f678";
-        let payment_json = r#"{"derivationPrefix":"pfx","derivationSuffix":"sfx","transaction":"AQAAAA=="}"#;
-        let original_body = br#"{"model":"gpt-5-nano","messages":[{"role":"user","content":"hello"}]}"#;
+        let payment_json =
+            r#"{"derivationPrefix":"pfx","derivationSuffix":"sfx","transaction":"AQAAAA=="}"#;
+        let original_body =
+            br#"{"model":"gpt-5-nano","messages":[{"role":"user","content":"hello"}]}"#;
         let original_ct = "application/json";
 
         // Build multipart body in client format (mirrors rust-bsv-worm build_multipart_body)
@@ -424,7 +427,10 @@ mod tests {
 
         // Verify payment part
         assert_eq!(parts[0].0, "x-bsv-payment");
-        assert_eq!(std::str::from_utf8(&parts[0].1.bytes).unwrap(), payment_json);
+        assert_eq!(
+            std::str::from_utf8(&parts[0].1.bytes).unwrap(),
+            payment_json
+        );
 
         // Verify body part
         assert_eq!(parts[1].0, "body");
@@ -436,7 +442,8 @@ mod tests {
     #[test]
     fn test_roundtrip_binary_body() {
         let boundary = "----BsvPaymentdeadbeefcafe1234";
-        let payment_json = r#"{"derivationPrefix":"p","derivationSuffix":"s","transaction":"dHg="}"#;
+        let payment_json =
+            r#"{"derivationPrefix":"p","derivationSuffix":"s","transaction":"dHg="}"#;
         let audio_bytes: Vec<u8> = (0..256).map(|i| i as u8).collect();
 
         let mut buf = Vec::new();
@@ -456,7 +463,10 @@ mod tests {
 
         let parts = parse_multipart(&buf, boundary).unwrap();
         assert_eq!(parts.len(), 2);
-        assert_eq!(std::str::from_utf8(&parts[0].1.bytes).unwrap(), payment_json);
+        assert_eq!(
+            std::str::from_utf8(&parts[0].1.bytes).unwrap(),
+            payment_json
+        );
         assert_eq!(parts[1].1.bytes, audio_bytes);
     }
 }

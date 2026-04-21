@@ -152,8 +152,9 @@ impl CloudflareTransport {
                 AuthCloudflareError::InvalidAuthentication("Missing request ID header".into())
             })?;
 
-        let bytes = from_base64(&request_id_str)
-            .map_err(|e| AuthCloudflareError::InvalidAuthentication(format!("Invalid request ID: {}", e)))?;
+        let bytes = from_base64(&request_id_str).map_err(|e| {
+            AuthCloudflareError::InvalidAuthentication(format!("Invalid request ID: {}", e))
+        })?;
 
         if bytes.len() != 32 {
             return Err(AuthCloudflareError::InvalidAuthentication(
@@ -200,10 +201,18 @@ impl CloudflareTransport {
             .unwrap_or_else(|| "general".to_string());
 
         let nonce = req.headers().get(auth_headers::NONCE).ok().flatten();
-        let initial_nonce = req.headers().get(auth_headers::INITIAL_NONCE).ok().flatten();
+        let initial_nonce = req
+            .headers()
+            .get(auth_headers::INITIAL_NONCE)
+            .ok()
+            .flatten();
         let your_nonce = req.headers().get(auth_headers::YOUR_NONCE).ok().flatten();
         let sig_str = req.headers().get(auth_headers::SIGNATURE).ok().flatten();
-        let certs_json = req.headers().get(auth_headers::REQUESTED_CERTIFICATES).ok().flatten();
+        let certs_json = req
+            .headers()
+            .get(auth_headers::REQUESTED_CERTIFICATES)
+            .ok()
+            .flatten();
 
         // Get request metadata for general messages
         let method = req.method().to_string();
@@ -234,9 +243,7 @@ impl CloudflareTransport {
 
         // Parse signature
         if let Some(sig) = sig_str {
-            msg.signature = hex::decode(&sig)
-                .or_else(|_| from_base64(&sig))
-                .ok();
+            msg.signature = hex::decode(&sig).or_else(|_| from_base64(&sig)).ok();
         }
 
         // Parse requested certificates
@@ -256,7 +263,10 @@ impl CloudflareTransport {
             // Capture raw body bytes for passthrough to handlers
             raw_body_bytes = body.clone();
 
-            let search = full_url.query().map(|q| format!("?{}", q)).unwrap_or_default();
+            let search = full_url
+                .query()
+                .map(|q| format!("?{}", q))
+                .unwrap_or_default();
 
             // Extract signable headers from the request.
             // Must match SimplifiedFetchTransport rules: include x-bsv-* (excluding
@@ -330,7 +340,10 @@ impl CloudflareTransport {
         }
 
         if let Some(ref initial_nonce) = message.initial_nonce {
-            headers.push((auth_headers::INITIAL_NONCE.to_string(), initial_nonce.clone()));
+            headers.push((
+                auth_headers::INITIAL_NONCE.to_string(),
+                initial_nonce.clone(),
+            ));
         }
 
         if let Some(ref your_nonce) = message.your_nonce {
@@ -366,6 +379,7 @@ impl CloudflareTransport {
 ///   - Headers starting with `x-bsv-` (but NOT `x-bsv-auth-*`)
 ///   - The `authorization` header
 ///   - The `content-type` header (value stripped to media type, no params)
+///
 /// Sorted alphabetically by lowercase key.
 fn extract_signable_headers(req: &Request) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -516,7 +530,10 @@ mod tests {
     fn test_varint_four_byte() {
         // 0x10000 is the boundary for 4-byte encoding
         assert_eq!(write_varint(0x10000), vec![0xFE, 0, 0, 1, 0]);
-        assert_eq!(write_varint(0xFFFFFFFF_i64), vec![0xFE, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            write_varint(0xFFFFFFFF_i64),
+            vec![0xFE, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -598,9 +615,7 @@ mod tests {
         let response_data = HttpResponseData {
             request_id: [0u8; 32],
             status: 404,
-            headers: vec![
-                ("content-type".to_string(), "application/json".to_string()),
-            ],
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
             body: vec![],
         };
         let payload = response_data.to_payload();
@@ -648,14 +663,7 @@ mod tests {
     #[test]
     fn test_request_payload_get_request() {
         let request_id = [42u8; 32];
-        let payload = build_request_payload(
-            &request_id,
-            "GET",
-            "/api/data",
-            "",
-            &[],
-            &[],
-        );
+        let payload = build_request_payload(&request_id, "GET", "/api/data", "", &[], &[]);
 
         // Check request_id
         assert_eq!(&payload[0..32], &[42u8; 32]);
@@ -676,18 +684,11 @@ mod tests {
     fn test_request_payload_post_with_body() {
         let request_id = [0u8; 32];
         let body = b"{\"key\":\"value\"}";
-        let payload = build_request_payload(
-            &request_id,
-            "POST",
-            "/api/create",
-            "",
-            &[],
-            body,
-        );
+        let payload = build_request_payload(&request_id, "POST", "/api/create", "", &[], body);
 
         // Should contain the body
         assert!(payload.len() > 32 + 4 + 11); // request_id + method + path min
-        // Body should be in the payload (not as -1 empty marker)
+                                              // Body should be in the payload (not as -1 empty marker)
         let payload_str = String::from_utf8_lossy(&payload);
         assert!(payload_str.contains("key"));
     }
@@ -695,14 +696,8 @@ mod tests {
     #[test]
     fn test_request_payload_with_query_params() {
         let request_id = [0u8; 32];
-        let payload = build_request_payload(
-            &request_id,
-            "GET",
-            "/search",
-            "?q=test&page=1",
-            &[],
-            &[],
-        );
+        let payload =
+            build_request_payload(&request_id, "GET", "/search", "?q=test&page=1", &[], &[]);
 
         // Verify search string is included (not -1 empty marker)
         let payload_str = String::from_utf8_lossy(&payload);
@@ -716,14 +711,7 @@ mod tests {
             ("x-bsv-test".to_string(), "value1".to_string()),
             ("authorization".to_string(), "Bearer token".to_string()),
         ];
-        let payload = build_request_payload(
-            &request_id,
-            "GET",
-            "/api",
-            "",
-            &headers,
-            &[],
-        );
+        let payload = build_request_payload(&request_id, "GET", "/api", "", &headers, &[]);
 
         let payload_str = String::from_utf8_lossy(&payload);
         assert!(payload_str.contains("x-bsv-test"));

@@ -28,7 +28,7 @@
 //!
 //! 4. Deploy: `npm run deploy`
 
-use bsv_middleware_cloudflare::{
+use bsv_auth_cloudflare::{
     add_cors_headers, init_panic_hook,
     middleware::{
         auth::handle_cors_preflight, process_auth, process_payment, sign_json_response,
@@ -90,17 +90,14 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Dispatch.
     match (req.method(), req.path().as_str()) {
         (Method::Post, "/protected") => handle_protected(&auth_context, &session).await,
-        (Method::Post, "/paid") => {
-            handle_paid(req, &auth_context, &session, &server_key).await
-        }
+        (Method::Post, "/paid") => handle_paid(req, &auth_context, &session, &server_key).await,
         _ => {
             let body = json!({
                 "status": "error",
                 "code": "ERR_NOT_FOUND",
                 "description": "Not Found",
             });
-            sign_json_response(&body, 404, &[], &session)
-                .map_err(|e| Error::from(e.to_string()))
+            sign_json_response(&body, 404, &[], &session).map_err(|e| Error::from(e.to_string()))
         }
     }
 }
@@ -152,6 +149,5 @@ async fn handle_paid(
         })
         .unwrap_or_default();
 
-    sign_json_response(&body, 200, &extra_headers, session)
-        .map_err(|e| Error::from(e.to_string()))
+    sign_json_response(&body, 200, &extra_headers, session).map_err(|e| Error::from(e.to_string()))
 }

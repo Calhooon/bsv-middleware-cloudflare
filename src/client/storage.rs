@@ -52,7 +52,7 @@ struct PeerSessionState {
 /// # Example
 ///
 /// ```rust,ignore
-/// use bsv_middleware_cloudflare::client::WorkerStorageClient;
+/// use bsv_auth_cloudflare::client::WorkerStorageClient;
 /// use bsv_sdk::wallet::ProtoWallet;
 /// use bsv_sdk::primitives::PrivateKey;
 ///
@@ -219,9 +219,7 @@ impl WorkerStorageClient {
         let key_id = response_msg.get_key_id(None); // InitialResponse ignores this param
 
         let signature = response_msg.signature.as_ref().ok_or_else(|| {
-            AuthCloudflareError::InvalidAuthentication(
-                "InitialResponse not signed".into(),
-            )
+            AuthCloudflareError::InvalidAuthentication("InitialResponse not signed".into())
         })?;
 
         let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
@@ -298,10 +296,7 @@ impl WorkerStorageClient {
             method: "POST".to_string(),
             path: "/".to_string(),
             search: String::new(),
-            headers: vec![(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )],
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
             body: rpc_body,
         };
         let payload = http_request.to_payload();
@@ -342,19 +337,10 @@ impl WorkerStorageClient {
         // Build headers for the HTTP request
         let mut http_headers = vec![
             (headers::VERSION.to_string(), msg.version.clone()),
-            (
-                headers::IDENTITY_KEY.to_string(),
-                msg.identity_key.to_hex(),
-            ),
+            (headers::IDENTITY_KEY.to_string(), msg.identity_key.to_hex()),
             (headers::MESSAGE_TYPE.to_string(), "general".to_string()),
-            (
-                headers::REQUEST_ID.to_string(),
-                to_base64(&request_id),
-            ),
-            (
-                "content-type".to_string(),
-                "application/json".to_string(),
-            ),
+            (headers::REQUEST_ID.to_string(), to_base64(&request_id)),
+            ("content-type".to_string(), "application/json".to_string()),
         ];
 
         if let Some(ref nonce) = msg.nonce {
@@ -436,33 +422,22 @@ impl WorkerStorageClient {
     ///
     /// Returns the user object with `userId`, `identityKey`, etc.
     pub async fn find_or_insert_user(&mut self, identity_key: &str) -> Result<Value> {
-        self.rpc_call(
-            "findOrInsertUser",
-            vec![serde_json::json!(identity_key)],
-        )
-        .await
+        self.rpc_call("findOrInsertUser", vec![serde_json::json!(identity_key)])
+            .await
     }
 
     /// Calls `internalizeAction` to accept an incoming transaction.
     ///
     /// This is the key method for payment processing — it tells the storage
     /// server to record the transaction and credit the outputs to the wallet.
-    pub async fn internalize_action(
-        &mut self,
-        auth: Value,
-        args: Value,
-    ) -> Result<Value> {
+    pub async fn internalize_action(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("internalizeAction", vec![auth, args]).await
     }
 
     /// Calls `listOutputs` to get wallet outputs.
     ///
     /// Returns an array of output objects with `satoshis`, `outputIndex`, etc.
-    pub async fn list_outputs(
-        &mut self,
-        auth: Value,
-        args: Value,
-    ) -> Result<Value> {
+    pub async fn list_outputs(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("listOutputs", vec![auth, args]).await
     }
 
@@ -471,11 +446,7 @@ impl WorkerStorageClient {
     /// Returns a `StorageCreateActionResult` with the unsigned transaction
     /// template, input details (for signing), output details, and a reference.
     /// The caller must sign the inputs locally and then call `process_action`.
-    pub async fn create_action(
-        &mut self,
-        auth: Value,
-        args: Value,
-    ) -> Result<Value> {
+    pub async fn create_action(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("createAction", vec![auth, args]).await
     }
 
@@ -483,11 +454,7 @@ impl WorkerStorageClient {
     ///
     /// After signing the template from `create_action`, call this with the
     /// signed transaction bytes and reference to broadcast and get final BEEF.
-    pub async fn process_action(
-        &mut self,
-        auth: Value,
-        args: Value,
-    ) -> Result<Value> {
+    pub async fn process_action(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("processAction", vec![auth, args]).await
     }
 
@@ -497,11 +464,7 @@ impl WorkerStorageClient {
     /// so the wallet stops treating the sent output as its own spendable UTXO.
     ///
     /// `args` should contain `{"basket": "<name>", "output": "<txid>.<vout>"}`.
-    pub async fn relinquish_output(
-        &mut self,
-        auth: Value,
-        args: Value,
-    ) -> Result<Value> {
+    pub async fn relinquish_output(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("relinquishOutput", vec![auth, args]).await
     }
 }

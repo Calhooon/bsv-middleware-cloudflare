@@ -37,7 +37,10 @@ impl KvSessionStorage {
 
     /// Constructs the KV key for the identity -> session index.
     fn identity_key(&self, identity_key: &str, session_nonce: &str) -> String {
-        format!("{}:identity:{}:{}", self.prefix, identity_key, session_nonce)
+        format!(
+            "{}:identity:{}:{}",
+            self.prefix, identity_key, session_nonce
+        )
     }
 
     /// Gets a session by its nonce.
@@ -135,7 +138,10 @@ impl KvSessionStorage {
     }
 
     /// Gets a session by identity key (returns the most recent one if multiple exist).
-    pub async fn get_session_by_identity(&self, identity_key_hex: &str) -> Result<Option<StoredSession>> {
+    pub async fn get_session_by_identity(
+        &self,
+        identity_key_hex: &str,
+    ) -> Result<Option<StoredSession>> {
         let sessions = self.get_sessions_for_identity(identity_key_hex).await?;
         // Return the most recently updated session
         Ok(sessions.into_iter().max_by_key(|s| s.last_update))

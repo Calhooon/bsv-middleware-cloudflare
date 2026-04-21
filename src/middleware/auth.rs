@@ -106,7 +106,7 @@ pub enum AuthResult {
     Response(Response),
 }
 
-const ORIGINATOR: &str = "bsv-middleware-cloudflare";
+const ORIGINATOR: &str = "bsv-auth-cloudflare";
 
 /// Process authentication for a Cloudflare Worker request.
 ///
@@ -149,13 +149,20 @@ pub async fn process_auth(
                 body: vec![],
             });
         } else {
-            // Express: res.status(401).json({ status: 'error', code: 'UNAUTHORIZED', ... })
-            let response = Response::from_json(&ErrorResponse::new(
-                "UNAUTHORIZED",
-                "Mutual-authentication failed!",
-            ))
-            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-            .with_status(401);
+            // TS Express middleware wire format:
+            //   { status: "error", code: "UNAUTHORIZED", message: "Mutual-authentication failed!" }
+            // Field is `message` (not `description`) — verified against live
+            // TS server at messagebox.babbage.systems. Handler-layer errors
+            // (ERR_MESSAGEBOX_REQUIRED etc.) use `description`; middleware-
+            // layer auth errors use `message`. Mirror exactly.
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "UNAUTHORIZED",
+                "message": "Mutual-authentication failed!",
+            });
+            let response = Response::from_json(&body)
+                .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+                .with_status(401);
             return Ok(AuthResult::Response(add_cors_headers(response)));
         }
     }
@@ -252,10 +259,7 @@ pub async fn process_auth(
 ///
 /// # Returns
 /// The response with BRC-104 auth headers added (including signature)
-pub fn sign_response(
-    response: Response,
-    session: &AuthSession,
-) -> Result<Response> {
+pub fn sign_response(response: Response, session: &AuthSession) -> Result<Response> {
     let private_key = PrivateKey::from_hex(&session.server_private_key).map_err(|e| {
         AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
     })?;
@@ -515,8 +519,7 @@ async fn handle_initial_request(
         counterparty: None,
         for_self: None,
     })?;
-    let my_identity_key =
-        bsv_sdk::primitives::PublicKey::from_hex(&my_identity_result.public_key)?;
+    let my_identity_key = bsv_sdk::primitives::PublicKey::from_hex(&my_identity_result.public_key)?;
 
     // Create our session nonce (matches Peer: create_nonce with counterparty=Self)
     let session_nonce = create_nonce(wallet, None, ORIGINATOR).await?;
@@ -677,14 +680,9 @@ async fn handle_certificate_request(
     // Get requested certificates from our wallet
     let certificates = if let Some(ref requested) = message.requested_certificates {
         let peer_key = bsv_sdk::primitives::PublicKey::from_hex(&peer_identity_key)?;
-        bsv_sdk::auth::utils::get_verifiable_certificates(
-            wallet,
-            requested,
-            &peer_key,
-            ORIGINATOR,
-        )
-        .await
-        .unwrap_or_default()
+        bsv_sdk::auth::utils::get_verifiable_certificates(wallet, requested, &peer_key, ORIGINATOR)
+            .await
+            .unwrap_or_default()
     } else {
         vec![]
     };
@@ -697,8 +695,7 @@ async fn handle_certificate_request(
         counterparty: None,
         for_self: None,
     })?;
-    let my_identity_key =
-        bsv_sdk::primitives::PublicKey::from_hex(&my_identity_result.public_key)?;
+    let my_identity_key = bsv_sdk::primitives::PublicKey::from_hex(&my_identity_result.public_key)?;
 
     let mut response_msg = AuthMessage::new(MessageType::CertificateResponse, my_identity_key);
     response_msg.nonce = Some(generate_random_nonce());
@@ -861,10 +858,8 @@ mod tests {
     }
 
     // Known test keys
-    const SERVER_KEY_HEX: &str =
-        "0000000000000000000000000000000000000000000000000000000000000001";
-    const CLIENT_KEY_HEX: &str =
-        "0000000000000000000000000000000000000000000000000000000000000002";
+    const SERVER_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const CLIENT_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000002";
 
     // ===========================================
     // Message signing and verification tests
@@ -1023,8 +1018,7 @@ mod tests {
         sign_message(&server_wallet, &mut msg, &session).unwrap();
 
         // Try to verify with a different key (third party)
-        let third_key_hex =
-            "0000000000000000000000000000000000000000000000000000000000000003";
+        let third_key_hex = "0000000000000000000000000000000000000000000000000000000000000003";
         let third_wallet = test_wallet(third_key_hex);
         let third_session = StoredSession {
             session_nonce: "sn".to_string(),
@@ -1076,7 +1070,11 @@ mod tests {
         // Should be valid base64
         let decoded = bsv_sdk::primitives::from_base64(&nonce);
         assert!(decoded.is_ok(), "Nonce should be valid base64");
-        assert_eq!(decoded.unwrap().len(), 32, "Nonce should be 32 bytes decoded");
+        assert_eq!(
+            decoded.unwrap().len(),
+            32,
+            "Nonce should be 32 bytes decoded"
+        );
     }
 
     #[test]
@@ -1181,11 +1179,27 @@ mod tests {
         };
 
         let json = serde_json::to_string(&session).unwrap();
-        assert!(json.contains("sessionNonce"), "Should use camelCase: {}", json);
-        assert!(json.contains("peerIdentityKey"), "Should use camelCase: {}", json);
-        assert!(json.contains("isAuthenticated"), "Should use camelCase: {}", json);
+        assert!(
+            json.contains("sessionNonce"),
+            "Should use camelCase: {}",
+            json
+        );
+        assert!(
+            json.contains("peerIdentityKey"),
+            "Should use camelCase: {}",
+            json
+        );
+        assert!(
+            json.contains("isAuthenticated"),
+            "Should use camelCase: {}",
+            json
+        );
         assert!(json.contains("createdAt"), "Should use camelCase: {}", json);
-        assert!(json.contains("lastUpdate"), "Should use camelCase: {}", json);
+        assert!(
+            json.contains("lastUpdate"),
+            "Should use camelCase: {}",
+            json
+        );
     }
 
     // ===========================================
@@ -1196,8 +1210,14 @@ mod tests {
     fn test_filter_signable_headers_includes_x_bsv_non_auth() {
         let headers = vec![
             ("x-bsv-payment-version".to_string(), "1.0".to_string()),
-            ("x-bsv-payment-satoshis-required".to_string(), "10".to_string()),
-            ("x-bsv-payment-derivation-prefix".to_string(), "nonce123".to_string()),
+            (
+                "x-bsv-payment-satoshis-required".to_string(),
+                "10".to_string(),
+            ),
+            (
+                "x-bsv-payment-derivation-prefix".to_string(),
+                "nonce123".to_string(),
+            ),
         ];
         let result = filter_signable_headers(&headers);
         assert_eq!(result.len(), 3);
@@ -1233,9 +1253,7 @@ mod tests {
 
     #[test]
     fn test_filter_signable_headers_lowercases_keys() {
-        let headers = vec![
-            ("X-BSV-Payment-Version".to_string(), "1.0".to_string()),
-        ];
+        let headers = vec![("X-BSV-Payment-Version".to_string(), "1.0".to_string())];
         let result = filter_signable_headers(&headers);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "x-bsv-payment-version");
@@ -1289,14 +1307,17 @@ mod tests {
         // After request_id (32) + status varint (1 for 200) + header count varint (1 for 0)
         // = offset 34, then body length varint + body bytes
         let body_start = 34; // 32 + 1 (200) + 1 (0 headers)
-        // Body length should be a varint, not -1 (0xFF...)
+                             // Body length should be a varint, not -1 (0xFF...)
         assert_ne!(payload[body_start], 0xFF, "Body should not be empty marker");
 
         // The actual JSON bytes should appear in the payload
         let payload_contains_body = payload
             .windows(json_bytes.len())
             .any(|w| w == json_bytes.as_slice());
-        assert!(payload_contains_body, "Payload should contain the JSON body bytes");
+        assert!(
+            payload_contains_body,
+            "Payload should contain the JSON body bytes"
+        );
     }
 
     #[test]
@@ -1306,9 +1327,7 @@ mod tests {
         let json_bytes = serde_json::to_vec(&body).unwrap();
         let request_id = [1u8; 32];
 
-        let headers = vec![
-            ("x-bsv-payment-satoshis-paid".to_string(), "10".to_string()),
-        ];
+        let headers = vec![("x-bsv-payment-satoshis-paid".to_string(), "10".to_string())];
 
         let response_data = HttpResponseData {
             request_id,

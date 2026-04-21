@@ -40,7 +40,7 @@ pub mod payment_headers {
 }
 
 const PAYMENT_VERSION: &str = "1.0";
-const ORIGINATOR: &str = "bsv-middleware-cloudflare";
+const ORIGINATOR: &str = "bsv-auth-cloudflare";
 
 /// Options for payment middleware.
 ///
@@ -201,14 +201,9 @@ where
 
             // Step 6: Verify derivation prefix (nonce)
             // Express: `const valid = await verifyNonce(paymentData.derivationPrefix, wallet)`
-            let nonce_valid = verify_nonce(
-                &payment.derivation_prefix,
-                &wallet,
-                None,
-                ORIGINATOR,
-            )
-            .await
-            .unwrap_or_default();
+            let nonce_valid = verify_nonce(&payment.derivation_prefix, &wallet, None, ORIGINATOR)
+                .await
+                .unwrap_or_default();
 
             if !nonce_valid {
                 // Express: returns ERR_INVALID_DERIVATION_PREFIX
@@ -232,9 +227,7 @@ where
             //     description: 'Payment for request'
             //   })
             let tx_bytes = from_base64(&payment.transaction).map_err(|_| {
-                AuthCloudflareError::MalformedPayment(
-                    "Invalid base64 transaction data".to_string(),
-                )
+                AuthCloudflareError::MalformedPayment("Invalid base64 transaction data".to_string())
             })?;
 
             // Create storage client for this request.
@@ -243,14 +236,10 @@ where
             // (matches wallet-toolbox StorageClient initialization pattern)
             let storage_wallet = ProtoWallet::new(Some(
                 PrivateKey::from_hex(&options.server_private_key).map_err(|e| {
-                    AuthCloudflareError::ConfigError(format!(
-                        "Invalid server private key: {}",
-                        e
-                    ))
+                    AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
                 })?,
             ));
-            let mut storage_client =
-                WorkerStorageClient::new(storage_wallet, &options.storage_url);
+            let mut storage_client = WorkerStorageClient::new(storage_wallet, &options.storage_url);
 
             // Initialize connection and register user
             storage_client.make_available().await?;
@@ -263,12 +252,6 @@ where
                 "identityKey": server_identity,
                 "userId": user_id
             });
-            // NB: omit `insertionRemittance` entirely for wallet-payment outputs.
-            // Sending it as `null` tripped wallet-infra's internalize handler
-            // (TypeError: Cannot read properties of null (reading 'basket')) —
-            // the JS shim around bsv-sdk's `BasketInsertion` type dereferences
-            // `.basket` before checking the protocol discriminator. The TS
-            // reference middleware omits the field entirely; we match that.
             let args_json = serde_json::json!({
                 "tx": tx_bytes,
                 "outputs": [{
@@ -278,13 +261,15 @@ where
                         "derivationPrefix": payment.derivation_prefix,
                         "derivationSuffix": payment.derivation_suffix,
                         "senderIdentityKey": auth_context.identity_key
-                    }
+                    },
+                    "insertionRemittance": null
                 }],
                 "description": "Payment for request"
             });
 
-            let internalize_result: std::result::Result<serde_json::Value, _> =
-                storage_client.internalize_action(auth_json, args_json).await;
+            let internalize_result: std::result::Result<serde_json::Value, _> = storage_client
+                .internalize_action(auth_json, args_json)
+                .await;
 
             match internalize_result {
                 Ok(result) => {
@@ -328,8 +313,8 @@ pub fn add_payment_headers(response: Response, payment: &PaymentContext) -> Resp
 
 /// Creates a payment failed response.
 pub fn payment_failed_response(error: &str) -> worker::Result<Response> {
-    let response = Response::from_json(&ErrorResponse::new("ERR_PAYMENT_FAILED", error))?
-        .with_status(400);
+    let response =
+        Response::from_json(&ErrorResponse::new("ERR_PAYMENT_FAILED", error))?.with_status(400);
     Ok(add_cors_headers(response))
 }
 
@@ -338,8 +323,7 @@ mod tests {
     use super::*;
     use bsv_sdk::primitives::PrivateKey;
 
-    const TEST_KEY_HEX: &str =
-        "0000000000000000000000000000000000000000000000000000000000000001";
+    const TEST_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
     // ===========================================
     // Payment header constant tests

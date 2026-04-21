@@ -8,7 +8,6 @@ pub enum AuthCloudflareError {
     // ==================
     // Auth errors (match auth-express-middleware)
     // ==================
-
     /// Authentication is required but not provided.
     /// Express equivalent: `{ code: 'UNAUTHORIZED', message: 'Mutual-authentication failed!' }`
     #[error("Mutual-authentication failed!")]
@@ -25,7 +24,6 @@ pub enum AuthCloudflareError {
     // ==================
     // Payment errors (match payment-express-middleware exactly)
     // ==================
-
     /// Payment middleware was run before auth middleware.
     /// Express: `ERR_SERVER_MISCONFIGURED` / 500
     #[error("The payment middleware must be executed after the Auth middleware.")]
@@ -38,7 +36,9 @@ pub enum AuthCloudflareError {
 
     /// Payment is required to access this resource.
     /// Express: `ERR_PAYMENT_REQUIRED` / 402
-    #[error("A BSV payment is required to complete this request. Provide the X-BSV-Payment header.")]
+    #[error(
+        "A BSV payment is required to complete this request. Provide the X-BSV-Payment header."
+    )]
     PaymentRequired {
         /// Amount required in satoshis.
         satoshis: u64,
@@ -68,7 +68,6 @@ pub enum AuthCloudflareError {
     // ==================
     // Infrastructure errors
     // ==================
-
     /// Error interacting with Cloudflare KV storage.
     #[error("KV storage error: {0}")]
     KvError(String),
@@ -199,7 +198,10 @@ mod tests {
 
     #[test]
     fn test_kv_error_status_code() {
-        assert_eq!(AuthCloudflareError::KvError("test".into()).status_code(), 500);
+        assert_eq!(
+            AuthCloudflareError::KvError("test".into()).status_code(),
+            500
+        );
     }
 
     #[test]
@@ -216,7 +218,10 @@ mod tests {
 
     #[test]
     fn test_unauthorized_error_code() {
-        assert_eq!(AuthCloudflareError::Unauthorized.error_code(), "UNAUTHORIZED");
+        assert_eq!(
+            AuthCloudflareError::Unauthorized.error_code(),
+            "UNAUTHORIZED"
+        );
     }
 
     #[test]
@@ -305,7 +310,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["status"], "error");
         assert_eq!(parsed["code"], "UNAUTHORIZED");
-        assert_eq!(parsed["description"], "Mutual-authentication failed!");
+        // Middleware-layer errors use `message` (matches TS wire format).
+        assert_eq!(parsed["message"], "Mutual-authentication failed!");
+        // And explicitly NOT `description` — that's for handler-layer errors.
+        assert!(parsed.get("description").is_none());
+    }
+
+    #[test]
+    fn test_handler_layer_error_uses_description() {
+        let err = AuthCloudflareError::MalformedPayment("bad".into());
+        let json = err.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Handler-layer errors keep `description` (matches TS handler format).
+        assert!(parsed.get("description").is_some());
+        assert!(parsed.get("message").is_none());
     }
 
     #[test]
@@ -395,8 +413,14 @@ mod tests {
     fn test_all_payment_error_codes_match_express() {
         // These MUST match payment-express-middleware/src/index.ts exactly
         let test_cases = vec![
-            (AuthCloudflareError::ServerMisconfigured, "ERR_SERVER_MISCONFIGURED"),
-            (AuthCloudflareError::PaymentInternal("x".into()), "ERR_PAYMENT_INTERNAL"),
+            (
+                AuthCloudflareError::ServerMisconfigured,
+                "ERR_SERVER_MISCONFIGURED",
+            ),
+            (
+                AuthCloudflareError::PaymentInternal("x".into()),
+                "ERR_PAYMENT_INTERNAL",
+            ),
             (
                 AuthCloudflareError::PaymentRequired {
                     satoshis: 100,
@@ -404,9 +428,18 @@ mod tests {
                 },
                 "ERR_PAYMENT_REQUIRED",
             ),
-            (AuthCloudflareError::MalformedPayment("x".into()), "ERR_MALFORMED_PAYMENT"),
-            (AuthCloudflareError::InvalidDerivationPrefix, "ERR_INVALID_DERIVATION_PREFIX"),
-            (AuthCloudflareError::PaymentFailed("x".into()), "ERR_PAYMENT_FAILED"),
+            (
+                AuthCloudflareError::MalformedPayment("x".into()),
+                "ERR_MALFORMED_PAYMENT",
+            ),
+            (
+                AuthCloudflareError::InvalidDerivationPrefix,
+                "ERR_INVALID_DERIVATION_PREFIX",
+            ),
+            (
+                AuthCloudflareError::PaymentFailed("x".into()),
+                "ERR_PAYMENT_FAILED",
+            ),
         ];
         for (err, expected_code) in test_cases {
             assert_eq!(
@@ -498,12 +531,23 @@ impl AuthCloudflareError {
     }
 
     /// Converts this error to a JSON response body.
+    ///
+    /// Field-name choice mirrors the TS reference servers: the BRC-31
+    /// middleware layer (Unauthorized) uses `message`; handler-layer
+    /// errors use `description`. Verified against the live TS server
+    /// at messagebox.babbage.systems which returns
+    /// `{"status":"error","code":"UNAUTHORIZED","message":"Mutual-authentication failed!"}`
+    /// on any unauthed request.
     pub fn to_json(&self) -> String {
-        serde_json::json!({
-            "status": "error",
-            "code": self.error_code(),
-            "description": self.to_string()
-        })
-        .to_string()
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".into(), "error".into());
+        obj.insert("code".into(), self.error_code().into());
+        let field = if matches!(self, Self::Unauthorized) {
+            "message"
+        } else {
+            "description"
+        };
+        obj.insert(field.into(), self.to_string().into());
+        serde_json::Value::Object(obj).to_string()
     }
 }
