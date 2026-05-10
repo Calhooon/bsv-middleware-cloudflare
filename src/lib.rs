@@ -16,7 +16,7 @@
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use bsv_auth_cloudflare::{
+//! use bsv_middleware_cloudflare::{
 //!     middleware::{AuthMiddlewareOptions, PaymentMiddlewareOptions, process_auth, process_payment, AuthResult, PaymentResult},
 //!     utils::handle_cors_preflight,
 //! };

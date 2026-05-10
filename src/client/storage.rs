@@ -52,7 +52,7 @@ struct PeerSessionState {
 /// # Example
 ///
 /// ```rust,ignore
-/// use bsv_auth_cloudflare::client::WorkerStorageClient;
+/// use bsv_middleware_cloudflare::client::WorkerStorageClient;
 /// use bsv_sdk::wallet::ProtoWallet;
 /// use bsv_sdk::primitives::PrivateKey;
 ///

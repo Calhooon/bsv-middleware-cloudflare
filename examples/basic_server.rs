@@ -28,7 +28,7 @@
 //!
 //! 4. Deploy: `npm run deploy`
 
-use bsv_auth_cloudflare::{
+use bsv_middleware_cloudflare::{
     add_cors_headers, init_panic_hook,
     middleware::{
         auth::handle_cors_preflight, process_auth, process_payment, sign_json_response,
