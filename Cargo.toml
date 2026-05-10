@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-cloudflare"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "BSV BRC-103/104 authentication and BRC-29 payment middleware for Cloudflare Workers"
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Cloudflare Workers
-worker = "0.7"
+worker = "0.8"
 
 # BSV SDK
 bsv-sdk = { package = "bsv-rs", version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
