@@ -26,7 +26,7 @@
 //! ```
 
 use crate::error::{AuthCloudflareError, Result};
-use crate::storage::KvSessionStorage;
+use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::transport::{auth_headers, CloudflareTransport, HttpResponseData};
 use crate::types::{AuthContext, ErrorResponse, StoredSession};
 use bsv_sdk::auth::types::{AuthMessage, MessageType, RequestedCertificateSet, AUTH_PROTOCOL_ID};
@@ -117,16 +117,42 @@ const ORIGINATOR: &str = "bsv-auth-cloudflare";
 /// 2. Authenticated requests (with auth headers) → verifies signature, returns Authenticated
 /// 3. Unauthenticated requests → returns 401 or allows through if configured
 pub async fn process_auth(
-    mut req: Request,
+    req: Request,
     env: &Env,
     options: &AuthMiddlewareOptions,
 ) -> Result<AuthResult> {
-    // Get KV binding for sessions
+    // Backward-compatible wrapper: build the default Cloudflare KV-backed
+    // session storage from the `AUTH_SESSIONS` binding, then delegate to the
+    // storage-generic implementation.
     let kv = env.kv("AUTH_SESSIONS").map_err(|e| {
         AuthCloudflareError::ConfigError(format!("AUTH_SESSIONS KV not bound: {}", e))
     })?;
     let session_storage = KvSessionStorage::new(kv, "auth", options.session_ttl_seconds);
 
+    process_auth_with_storage(req, &session_storage, options).await
+}
+
+/// Process authentication for a Cloudflare Worker request using a caller-supplied
+/// [`SessionStorage`] backend.
+///
+/// This is the real implementation behind [`process_auth`]. Use it directly when
+/// you want to back BRC-103/104 sessions with a store other than the default
+/// Cloudflare KV namespace — for example a Durable Object SQLite database, which
+/// avoids the isolate-instability problems that arise when auth sessions live in
+/// KV / entrypoint isolates.
+///
+/// The BRC-103/104 wire format and signature verification are identical to
+/// [`process_auth`]; only the session backing store differs.
+///
+/// ## Flow:
+/// 1. Handshake requests (`/.well-known/auth`) → processes handshake, returns Response
+/// 2. Authenticated requests (with auth headers) → verifies signature, returns Authenticated
+/// 3. Unauthenticated requests → returns 401 or allows through if configured
+pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
+    mut req: Request,
+    session_storage: &S,
+    options: &AuthMiddlewareOptions,
+) -> Result<AuthResult> {
     // Create wallet from server private key
     let private_key = PrivateKey::from_hex(&options.server_private_key).map_err(|e| {
         AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
@@ -135,7 +161,7 @@ pub async fn process_auth(
 
     // Check if this is a handshake request
     if CloudflareTransport::is_handshake_request(&req) {
-        return handle_handshake_request(req, &wallet, &session_storage, options).await;
+        return handle_handshake_request(req, &wallet, session_storage, options).await;
     }
 
     // Check for auth headers
@@ -464,10 +490,10 @@ fn filter_signable_headers(headers: &[(String, String)]) -> Vec<(String, String)
 }
 
 /// Handle a handshake request to /.well-known/auth
-async fn handle_handshake_request(
+async fn handle_handshake_request<S: SessionStorage + ?Sized>(
     mut req: Request,
     wallet: &ProtoWallet,
-    session_storage: &KvSessionStorage,
+    session_storage: &S,
     options: &AuthMiddlewareOptions,
 ) -> Result<AuthResult> {
     // Parse the handshake message from body
@@ -503,10 +529,10 @@ async fn handle_handshake_request(
 /// 1. Creates session nonce
 /// 2. Creates session
 /// 3. Sends InitialResponse with signature
-async fn handle_initial_request(
+async fn handle_initial_request<S: SessionStorage + ?Sized>(
     message: AuthMessage,
     wallet: &ProtoWallet,
-    session_storage: &KvSessionStorage,
+    session_storage: &S,
     options: &AuthMiddlewareOptions,
 ) -> Result<AuthResult> {
     let peer_identity_key = message.identity_key.to_hex();
@@ -579,10 +605,10 @@ async fn handle_initial_request(
 /// 2. Validates certificates
 /// 3. Updates session
 /// 4. Calls callback
-async fn handle_certificate_response(
+async fn handle_certificate_response<S: SessionStorage + ?Sized>(
     message: AuthMessage,
     wallet: &ProtoWallet,
-    session_storage: &KvSessionStorage,
+    session_storage: &S,
     options: &AuthMiddlewareOptions,
 ) -> Result<AuthResult> {
     let peer_identity_key = message.identity_key.to_hex();
@@ -655,10 +681,10 @@ async fn handle_certificate_response(
 ///
 /// Matches Peer's `process_certificate_request`:
 /// Returns certificates from the server's wallet.
-async fn handle_certificate_request(
+async fn handle_certificate_request<S: SessionStorage + ?Sized>(
     message: AuthMessage,
     wallet: &ProtoWallet,
-    session_storage: &KvSessionStorage,
+    session_storage: &S,
     _options: &AuthMiddlewareOptions,
 ) -> Result<AuthResult> {
     let peer_identity_key = message.identity_key.to_hex();

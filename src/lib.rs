@@ -119,14 +119,14 @@ pub mod utils;
 pub use client::WorkerStorageClient;
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
-    add_cors_headers, process_auth, sign_json_response, sign_response, AuthMiddlewareOptions,
-    AuthResult, AuthSession,
+    add_cors_headers, process_auth, process_auth_with_storage, sign_json_response, sign_response,
+    AuthMiddlewareOptions, AuthResult, AuthSession,
 };
 pub use middleware::multipart::prepare_multipart_payment;
 pub use middleware::payment::{
     add_payment_headers, payment_headers, process_payment, PaymentMiddlewareOptions, PaymentResult,
 };
-pub use storage::{KvPaymentStorage, KvSessionStorage};
+pub use storage::{KvPaymentStorage, KvSessionStorage, SessionStorage};
 pub use transport::{auth_headers, CloudflareTransport, HttpRequestData, HttpResponseData};
 pub use types::{AuthContext, BsvPayment, PaymentContext};
 

@@ -1,7 +1,9 @@
 //! KV-backed session storage for BRC-103/104 authentication.
 
 use crate::error::{AuthCloudflareError, Result};
+use crate::storage::session_storage::SessionStorage;
 use crate::types::StoredSession;
+use async_trait::async_trait;
 use worker::kv::KvStore;
 
 /// Session manager backed by Cloudflare KV.
@@ -145,5 +147,30 @@ impl KvSessionStorage {
         let sessions = self.get_sessions_for_identity(identity_key_hex).await?;
         // Return the most recently updated session
         Ok(sessions.into_iter().max_by_key(|s| s.last_update))
+    }
+}
+
+/// `SessionStorage` impl delegates to the inherent KV methods, so existing
+/// consumers that call the inherent methods directly keep working unchanged
+/// while new consumers can program against the trait.
+#[async_trait(?Send)]
+impl SessionStorage for KvSessionStorage {
+    async fn get_session(&self, session_nonce: &str) -> Result<Option<StoredSession>> {
+        KvSessionStorage::get_session(self, session_nonce).await
+    }
+
+    async fn get_session_by_identity(
+        &self,
+        identity_key_hex: &str,
+    ) -> Result<Option<StoredSession>> {
+        KvSessionStorage::get_session_by_identity(self, identity_key_hex).await
+    }
+
+    async fn save_session(&self, session: &StoredSession) -> Result<()> {
+        KvSessionStorage::save_session(self, session).await
+    }
+
+    async fn update_session(&self, session: &StoredSession) -> Result<()> {
+        KvSessionStorage::update_session(self, session).await
     }
 }
