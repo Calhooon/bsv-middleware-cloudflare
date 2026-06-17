@@ -28,7 +28,7 @@
 use crate::error::{AuthCloudflareError, Result};
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::transport::{auth_headers, CloudflareTransport, HttpResponseData};
-use crate::types::{AuthContext, ErrorResponse, StoredSession};
+use crate::types::{current_time_ms, AuthContext, ErrorResponse, StoredSession};
 use bsv_sdk::auth::types::{AuthMessage, MessageType, RequestedCertificateSet, AUTH_PROTOCOL_ID};
 use bsv_sdk::auth::utils::create_nonce;
 use bsv_sdk::auth::VerifiableCertificate;
@@ -249,9 +249,26 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     //   2. processGeneralMessage throws → general message callbacks never fire
     //   3. AuthFetch Promise never resolves → 402 payment handling breaks
     //   4. Signature keyID mismatch (uses peer_nonce, client expects handshake nonce)
-    let mut updated_session = session.clone();
-    updated_session.touch();
-    session_storage.update_session(&updated_session).await?;
+    // Liveness touch — a sliding-window TTL refresh ONLY. The auth signature was
+    // already verified above, so this write is NOT part of authentication and
+    // must never fail an authenticated request. Two guards keep it from
+    // hammering one Cloudflare KV key past the ~1-write/sec/key limit (which
+    // returns 429 — previously surfacing as a 500 on every polled General
+    // request, e.g. message-box `/listMessages` backfill):
+    //   (a) LAZY — only refresh once past the half-TTL mark, so writes to a
+    //       session key are spaced ~ttl/2 apart (hours) regardless of request
+    //       rate, while the sliding window still never lapses under activity;
+    //   (b) BEST-EFFORT — a write failure (KV 429, transient KV error) is logged
+    //       and ignored; the session's existing TTL is still valid, so the
+    //       request proceeds authenticated.
+    let refresh_after_ms = options.session_ttl_seconds.saturating_mul(1000) / 2;
+    if current_time_ms().saturating_sub(session.last_update) >= refresh_after_ms {
+        let mut updated_session = session.clone();
+        updated_session.touch();
+        if let Err(e) = session_storage.update_session(&updated_session).await {
+            worker::console_warn!("BRC-31 session liveness touch skipped (non-fatal): {e:?}");
+        }
+    }
 
     // Build session info for response signing.
     // peer_nonce = the client's HANDSHAKE nonce (from session), not the per-message random nonce.
