@@ -6,8 +6,8 @@ Port of [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-m
 
 ## What it provides
 
-- **`process_auth`** — BRC-103/104 mutual identity handshake, session verification, certificate exchange. Returns the authenticated identity key, a reusable session handle, and the raw request body.
-- **`process_payment`** — BRC-29 payment verification. Emits `402 Payment Required` with derivation prefix, accepts `x-bsv-payment` header, internalizes via a remote wallet storage endpoint.
+- **`process_auth`** / **`process_auth_with_storage`** — BRC-103/104 mutual identity handshake, session verification, certificate exchange, and per-request replay protection (each `x-bsv-auth-nonce` is single-use per session). Returns the authenticated identity key, a reusable session handle, and the raw request body.
+- **`process_payment_with_storage`** — BRC-29 payment verification. Emits `402 Payment Required` with derivation prefix, accepts `x-bsv-payment` header, internalizes via a remote wallet storage endpoint, gates on the wallet's `accepted` flag, and enforces single-use derivation prefixes. (`process_payment` remains as a deprecated stateless variant.)
 - **`sign_json_response`** — signs outbound JSON responses so BRC-103/104 clients (e.g. `AuthFetch`) can verify server identity and message integrity. Equivalent to Express's `res.json` hijacking, but explicit.
 - **`WorkerStorageClient`** — WASM-compatible RPC client for a wallet storage server (e.g. `storage.babbage.systems`), used by `process_payment` and optional refund flows.
 - **Optional `refund` feature** — BRC-41 refund transaction builder for partial-refund scenarios (e.g. AI agents that pre-charge and refund on failure). Not present in the Express reference.
@@ -73,7 +73,7 @@ binding = "AUTH_SESSIONS"
 id = "<your-kv-id>"
 
 [[kv_namespaces]]
-binding = "PAYMENTS"           # only needed if you use process_payment
+binding = "PAYMENTS"           # only needed if you use the payment middleware
 id = "<your-kv-id>"
 ```
 
@@ -98,9 +98,14 @@ All error codes, HTTP statuses, and header names match the Express versions:
 
 Known divergences (architectural, not bugs):
 - **Response signing is explicit.** Callers invoke `sign_json_response` rather than relying on `res.json` interception.
-- **Sessions live in KV only.** Express lets you swap `SessionManager`; here the KV implementation is fixed.
+- **Pluggable storage via `SessionStorage`.** Express lets you swap `SessionManager`; here the equivalent seam is the `SessionStorage` trait (`process_auth_with_storage` / `process_payment_with_storage`), with `KvSessionStorage` as the default backend.
 - **No injectable logger.** Use `console_log!` / `console_error!` from the `worker` crate at call sites if needed.
 - **Payment internalizes via HTTP to a wallet storage server**, not a local `WalletInterface`. Required for Workers (no local wallet possible).
+
+Deliberate hardening divergences (the reference is weaker here; the-composer audit #30/#44):
+- **Auth replay protection.** The TS stack (`@bsv/sdk` `Peer.processGeneralMessage`) never records consumed per-request nonces, so a byte-identical signed request replays successfully there for the whole session TTL. This crate consumes each `(session nonce, x-bsv-auth-nonce)` pair and rejects duplicates with `401 ERR_REPLAYED_REQUEST`. See `middleware::auth` docs for the exact residual window under eventually-consistent KV.
+- **`accepted` gate.** `payment-express-middleware` calls `next()` even when `wallet.internalizeAction` returns `accepted: false`. Here a rejected payment returns `402` with a fresh challenge and never reaches the handler.
+- **Single-use payment derivation prefixes.** The reference's `verifyNonce` is a stateless HMAC; here each verified prefix is consumed (no expiry) via the `SessionStorage` nonce store, so a captured `X-BSV-Payment` header cannot be internalized twice.
 
 ## Consumers
 

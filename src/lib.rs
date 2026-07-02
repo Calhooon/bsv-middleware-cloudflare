@@ -10,6 +10,10 @@
 //!
 //! - **BRC-103/104 Mutual Authentication**: Cryptographic authentication using BSV keys
 //! - **BRC-29 Payment Verification**: Accept BSV payments for API access
+//! - **Replay Protection**: per-request auth nonces and payment derivation
+//!   prefixes are single-use via the pluggable [`SessionStorage`] nonce store
+//!   (a hardening divergence from the TS reference middleware — see
+//!   [`middleware::auth`] for the precise residual window under Cloudflare KV)
 //! - **Cloudflare KV Storage**: Session and payment storage in Cloudflare KV
 //! - **CORS Handling**: Built-in CORS support for browser clients
 //!
@@ -17,7 +21,8 @@
 //!
 //! ```rust,ignore
 //! use bsv_middleware_cloudflare::{
-//!     middleware::{AuthMiddlewareOptions, PaymentMiddlewareOptions, process_auth, process_payment, AuthResult, PaymentResult},
+//!     middleware::{AuthMiddlewareOptions, PaymentMiddlewareOptions, process_auth, process_payment_with_storage, AuthResult, PaymentResult},
+//!     KvSessionStorage,
 //!     utils::handle_cors_preflight,
 //! };
 //! use worker::*;
@@ -47,13 +52,16 @@
 //!         AuthResult::Response(response) => return Ok(response),
 //!     };
 //!
-//!     // Process payment (if needed)
+//!     // Process payment (if needed). The session storage doubles as the
+//!     // single-use nonce store that makes payment derivation prefixes
+//!     // one-shot (replay protection).
 //!     let payment_options = PaymentMiddlewareOptions::new(
 //!         server_key,
 //!         |_req| 100, // 100 satoshis per request
 //!     );
+//!     let session_storage = KvSessionStorage::new(env.kv("AUTH_SESSIONS")?, "auth", 3600);
 //!
-//!     let payment_result = process_payment(&req, &auth_context, &payment_options).await
+//!     let payment_result = process_payment_with_storage(&req, &auth_context, &payment_options, &session_storage).await
 //!         .map_err(|e| Error::from(e.to_string()))?;
 //!
 //!     match payment_result {
@@ -123,8 +131,11 @@ pub use middleware::auth::{
     AuthMiddlewareOptions, AuthResult, AuthSession,
 };
 pub use middleware::multipart::prepare_multipart_payment;
+#[allow(deprecated)] // re-exported for backward compatibility
+pub use middleware::payment::process_payment;
 pub use middleware::payment::{
-    add_payment_headers, payment_headers, process_payment, PaymentMiddlewareOptions, PaymentResult,
+    add_payment_headers, payment_headers, process_payment_with_storage, PaymentMiddlewareOptions,
+    PaymentResult, PAYMENT_NONCE_SCOPE,
 };
 pub use storage::{KvPaymentStorage, KvSessionStorage, SessionStorage};
 pub use transport::{auth_headers, CloudflareTransport, HttpRequestData, HttpResponseData};

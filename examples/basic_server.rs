@@ -31,9 +31,11 @@
 use bsv_middleware_cloudflare::{
     add_cors_headers, init_panic_hook,
     middleware::{
-        auth::handle_cors_preflight, process_auth, process_payment, sign_json_response,
-        AuthMiddlewareOptions, AuthResult, AuthSession, PaymentMiddlewareOptions, PaymentResult,
+        auth::handle_cors_preflight, process_auth, process_payment_with_storage,
+        sign_json_response, AuthMiddlewareOptions, AuthResult, AuthSession,
+        PaymentMiddlewareOptions, PaymentResult,
     },
+    storage::KvSessionStorage,
     types::AuthContext,
 };
 use serde_json::json;
@@ -90,7 +92,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Dispatch.
     match (req.method(), req.path().as_str()) {
         (Method::Post, "/protected") => handle_protected(&auth_context, &session).await,
-        (Method::Post, "/paid") => handle_paid(req, &auth_context, &session, &server_key).await,
+        (Method::Post, "/paid") => {
+            handle_paid(req, &env, &auth_context, &session, &server_key).await
+        }
         _ => {
             let body = json!({
                 "status": "error",
@@ -114,6 +118,7 @@ async fn handle_protected(auth: &AuthContext, session: &AuthSession) -> Result<R
 /// Auth + BRC-29 payment (100 sats flat).
 async fn handle_paid(
     req: Request,
+    env: &Env,
     auth: &AuthContext,
     session: &AuthSession,
     server_key: &str,
@@ -121,14 +126,26 @@ async fn handle_paid(
     let payment_options =
         PaymentMiddlewareOptions::new(server_key.to_string(), |_req: &Request| 100u64);
 
-    let payment_ctx = match process_payment(&req, auth, &payment_options)
-        .await
-        .map_err(|e| Error::from(e.to_string()))?
+    // The session storage doubles as the single-use nonce store: each
+    // payment derivation prefix is consumed on first use, so a replayed
+    // X-BSV-Payment header is rejected instead of internalized again.
+    let session_storage = KvSessionStorage::new(env.kv("AUTH_SESSIONS")?, "auth", 3600);
+
+    let payment_ctx = match process_payment_with_storage(
+        &req,
+        auth,
+        &payment_options,
+        &session_storage,
+    )
+    .await
+    .map_err(|e| Error::from(e.to_string()))?
     {
         PaymentResult::Free => None,
+        // `Verified` now implies the wallet ACCEPTED the payment
+        // (accepted == false returns `Failed` with a 402).
         PaymentResult::Verified(ctx) => Some(ctx),
         PaymentResult::Required(resp) => return Ok(resp), // 402 with derivation prefix
-        PaymentResult::Failed(resp) => return Ok(resp),   // 400 bad payment
+        PaymentResult::Failed(resp) => return Ok(resp),   // 400/402 bad or rejected payment
     };
 
     let body = json!({

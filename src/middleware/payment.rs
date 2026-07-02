@@ -15,6 +15,7 @@
 use crate::client::WorkerStorageClient;
 use crate::error::{AuthCloudflareError, Result};
 use crate::middleware::auth::add_cors_headers;
+use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::types::{AuthContext, BsvPayment, ErrorResponse, PaymentContext};
 use bsv_sdk::auth::utils::{create_nonce, verify_nonce};
 use bsv_sdk::primitives::{from_base64, PrivateKey};
@@ -42,6 +43,10 @@ pub mod payment_headers {
 const PAYMENT_VERSION: &str = "1.0";
 const ORIGINATOR: &str = "bsv-auth-cloudflare";
 
+/// Nonce scope under which consumed BRC-29 payment derivation prefixes are
+/// recorded in the [`SessionStorage`] nonce store.
+pub const PAYMENT_NONCE_SCOPE: &str = "payment-derivation-prefix";
+
 /// Options for payment middleware.
 ///
 /// Mirrors payment-express-middleware's `PaymentMiddlewareOptions`:
@@ -63,7 +68,7 @@ pub struct PaymentMiddlewareOptions<F> {
     /// Express equivalent: `calculateRequestPrice`
     pub calculate_price: F,
     /// URL of the storage server for payment internalization.
-    /// Defaults to `WorkerStorageClient::MAINNET_URL` ("https://storage.babbage.systems").
+    /// Defaults to `WorkerStorageClient::MAINNET_URL` (<https://storage.babbage.systems>).
     pub storage_url: String,
 }
 
@@ -106,14 +111,23 @@ pub enum PaymentResult {
     Failed(Response),
 }
 
-/// Process payment for a request.
+/// Process payment for a request **without** single-use nonce tracking.
 ///
-/// This is a 1:1 port of payment-express-middleware's `createPaymentMiddleware`.
+/// This is the original port of payment-express-middleware's
+/// `createPaymentMiddleware`, kept for backward compatibility. It now gates
+/// on the wallet's `accepted` flag (the-composer audit #44) but — like the TS
+/// reference — verifies the derivation prefix with a **stateless HMAC only**:
+/// nothing stops the same `X-BSV-Payment` header from being internalized
+/// again except the upstream wallet's own duplicate handling.
 ///
-/// **IMPORTANT**: Auth middleware MUST run before this. The `auth_context` parameter
-/// must come from successful authentication. If `auth_context` is not properly
-/// authenticated, this returns ERR_SERVER_MISCONFIGURED (matching Express behavior
-/// when `req.auth.identityKey` is missing).
+/// Use [`process_payment_with_storage`] instead, which additionally enforces
+/// single-use derivation prefixes through the pluggable [`SessionStorage`]
+/// nonce store.
+#[deprecated(
+    since = "0.3.0",
+    note = "stateless: payment derivation prefixes are not single-use (replay relies on the \
+            upstream wallet); use process_payment_with_storage"
+)]
 pub async fn process_payment<F>(
     req: &Request,
     auth_context: &AuthContext,
@@ -121,6 +135,68 @@ pub async fn process_payment<F>(
 ) -> Result<PaymentResult>
 where
     F: Fn(&Request) -> u64,
+{
+    process_payment_inner(req, auth_context, options, Option::<&KvSessionStorage>::None).await
+}
+
+/// Process payment for a request, with single-use derivation prefixes.
+///
+/// This is a port of payment-express-middleware's `createPaymentMiddleware`
+/// with two deliberate hardening divergences from the TS reference
+/// (`@bsv/payment-express-middleware` 1.2.3), per the-composer audit #44:
+///
+/// 1. **`accepted` gate.** The reference destructures `accepted` from
+///    `wallet.internalizeAction(...)` and calls `next()` regardless of its
+///    value (index.ts:100-124). Here, `accepted != true` returns a **402**
+///    ([`PaymentResult::Failed`]) carrying a fresh payment challenge —
+///    a rejected payment never reaches the handler.
+/// 2. **Single-use derivation prefix.** The reference's `verifyNonce` is a
+///    stateless HMAC check — a captured `X-BSV-Payment` header can be
+///    internalized repeatedly (bounded only by the upstream wallet's
+///    duplicate handling). Here, each verified prefix is consumed through
+///    [`SessionStorage::try_consume_nonce`] under [`PAYMENT_NONCE_SCOPE`]
+///    with **no expiry** (the HMAC itself never expires); a reused prefix is
+///    rejected with `400 ERR_INVALID_DERIVATION_PREFIX` before touching the
+///    wallet.
+///
+/// Consumption ordering (money path):
+/// - The prefix is consumed **before** `internalizeAction`, so concurrent
+///   duplicates cannot both reach the wallet (subject to the storage
+///   backend's consistency — see [`KvSessionStorage::try_consume_nonce`] for
+///   the KV residual window).
+/// - If `internalizeAction` fails with an **error**, the prefix is released
+///   (best-effort) so an honest client can retry the same real payment.
+/// - If the wallet returns **`accepted: false`** or the call succeeds, the
+///   prefix stays consumed; the client must obtain a fresh 402 challenge.
+///
+/// **IMPORTANT**: Auth middleware MUST run before this. The `auth_context`
+/// parameter must come from successful authentication. If `auth_context` is
+/// not properly authenticated, this returns ERR_SERVER_MISCONFIGURED
+/// (matching Express behavior when `req.auth.identityKey` is missing).
+pub async fn process_payment_with_storage<F, S>(
+    req: &Request,
+    auth_context: &AuthContext,
+    options: &PaymentMiddlewareOptions<F>,
+    session_storage: &S,
+) -> Result<PaymentResult>
+where
+    F: Fn(&Request) -> u64,
+    S: SessionStorage + ?Sized,
+{
+    process_payment_inner(req, auth_context, options, Some(session_storage)).await
+}
+
+/// Shared implementation. `nonce_store: None` = legacy stateless behavior
+/// (deprecated [`process_payment`]); `Some(_)` = single-use enforcement.
+async fn process_payment_inner<F, S>(
+    req: &Request,
+    auth_context: &AuthContext,
+    options: &PaymentMiddlewareOptions<F>,
+    nonce_store: Option<&S>,
+) -> Result<PaymentResult>
+where
+    F: Fn(&Request) -> u64,
+    S: SessionStorage + ?Sized,
 {
     // Step 1: Verify auth middleware ran first (matches Express check for req.auth.identityKey)
     if !auth_context.is_authenticated || auth_context.identity_key == "unknown" {
@@ -216,75 +292,97 @@ where
                 return Ok(PaymentResult::Failed(add_cors_headers(response)));
             }
 
-            // Step 7: Process payment via WorkerStorageClient.internalizeAction()
-            // This mirrors how the TS Express middleware calls wallet.internalizeAction(),
-            // where the wallet is a remote client (WalletClient) to storage.babbage.systems.
-            //
-            // Express equivalent:
-            //   const { accepted } = await wallet.internalizeAction({
-            //     tx: Utils.toArray(paymentData.transaction, 'base64'),
-            //     outputs: [{ paymentRemittance: { derivationPrefix, derivationSuffix, senderIdentityKey }, outputIndex: 0, protocol: 'wallet payment' }],
-            //     description: 'Payment for request'
-            //   })
+            // Decode the transaction BEFORE consuming the prefix — a
+            // malformed payload must not burn the client's derivation prefix.
             let tx_bytes = from_base64(&payment.transaction).map_err(|_| {
                 AuthCloudflareError::MalformedPayment("Invalid base64 transaction data".to_string())
             })?;
 
-            // Create storage client for this request.
-            // Creates a BRC-103/104 session with the storage server on first RPC call.
-            // Sequence: makeAvailable → findOrInsertUser → internalizeAction
-            // (matches wallet-toolbox StorageClient initialization pattern)
-            let storage_wallet = ProtoWallet::new(Some(
-                PrivateKey::from_hex(&options.server_private_key).map_err(|e| {
-                    AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
-                })?,
-            ));
-            let mut storage_client = WorkerStorageClient::new(storage_wallet, &options.storage_url);
+            // Step 6b (hardening divergence from the TS reference — audit #44):
+            // consume the derivation prefix BEFORE internalizing, so a
+            // captured X-BSV-Payment header cannot be internalized twice.
+            // No TTL: the HMAC prefix never expires, so its consumption
+            // record must not either. Storage errors fail closed (`?`).
+            if let Some(store) = nonce_store {
+                let fresh = store
+                    .try_consume_nonce(PAYMENT_NONCE_SCOPE, &payment.derivation_prefix, None)
+                    .await?;
+                if !fresh {
+                    // Wire code matches the reference's invalid-prefix error;
+                    // the description distinguishes reuse.
+                    let response = Response::from_json(&ErrorResponse::new(
+                        "ERR_INVALID_DERIVATION_PREFIX",
+                        "The X-BSV-Payment-Derivation-Prefix header is not valid (already used).",
+                    ))
+                    .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+                    .with_status(400);
+                    return Ok(PaymentResult::Failed(add_cors_headers(response)));
+                }
+            }
 
-            // Initialize connection and register user
-            storage_client.make_available().await?;
-            let server_identity = wallet.identity_key().to_hex();
-            let user_result: serde_json::Value =
-                storage_client.find_or_insert_user(&server_identity).await?;
-            let user_id = user_result.get("userId").and_then(|v| v.as_i64());
-
-            let auth_json = serde_json::json!({
-                "identityKey": server_identity,
-                "userId": user_id
-            });
-            let args_json = serde_json::json!({
-                "tx": tx_bytes,
-                "outputs": [{
-                    "outputIndex": 0,
-                    "protocol": "wallet payment",
-                    "paymentRemittance": {
-                        "derivationPrefix": payment.derivation_prefix,
-                        "derivationSuffix": payment.derivation_suffix,
-                        "senderIdentityKey": auth_context.identity_key
-                    },
-                    "insertionRemittance": null
-                }],
-                "description": "Payment for request"
-            });
-
-            let internalize_result: std::result::Result<serde_json::Value, _> = storage_client
-                .internalize_action(auth_json, args_json)
-                .await;
+            // Step 7: internalize the payment (see `internalize_payment`).
+            // The whole wallet-communication phase maps to the reference's
+            // try/catch around `wallet.internalizeAction(...)`.
+            let internalize_result =
+                internalize_payment(&wallet, options, auth_context, &payment, tx_bytes).await;
 
             match internalize_result {
                 Ok(result) => {
+                    // Gate on the wallet's `accepted` flag (hardening
+                    // divergence — audit #44). The TS reference
+                    // (payment-express-middleware 1.2.3, index.ts:100-124)
+                    // passes `accepted` through to `req.payment` and calls
+                    // `next()` even when the wallet rejected the payment.
+                    // Here a rejected payment returns 402 with a FRESH
+                    // challenge (the old prefix stays consumed).
+                    // A missing/non-boolean `accepted` field counts as
+                    // rejected — never fail open on the money path.
+                    if !internalize_accepted(&result) {
+                        let derivation_prefix = create_nonce(&wallet, None, ORIGINATOR).await?;
+                        let headers = {
+                            let h = Headers::new();
+                            let _ = h.set(payment_headers::VERSION, PAYMENT_VERSION);
+                            let _ = h.set(payment_headers::SATOSHIS_REQUIRED, &price.to_string());
+                            let _ = h.set(payment_headers::DERIVATION_PREFIX, &derivation_prefix);
+                            let _ = h.set(payment_headers::TRANSPORTS, "header,multipart");
+                            h
+                        };
+                        let response = Response::from_json(&ErrorResponse::new(
+                            "ERR_PAYMENT_FAILED",
+                            "The BSV payment was not accepted by the wallet. A fresh payment challenge is provided in the response headers.",
+                        ))
+                        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+                        .with_status(402)
+                        .with_headers(headers);
+                        return Ok(PaymentResult::Failed(add_cors_headers(response)));
+                    }
+
                     // Success - matches Express: req.payment = { satoshisPaid, accepted, tx }
-                    let accepted = result
-                        .get("accepted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
                     Ok(PaymentResult::Verified(PaymentContext {
                         satoshis_paid: price,
-                        accepted,
+                        accepted: true,
                         tx: Some(payment.transaction),
                     }))
                 }
                 Err(e) => {
+                    // The payment was NOT processed to acceptance — release
+                    // the consumed prefix (best-effort) so an honest client
+                    // can retry the same real payment after a transient
+                    // fault. If the failure was actually post-internalize
+                    // (response lost), the retry hits the upstream wallet's
+                    // own duplicate handling — same reliance as the TS
+                    // reference's only line of defense.
+                    if let Some(store) = nonce_store {
+                        if let Err(release_err) = store
+                            .release_nonce(PAYMENT_NONCE_SCOPE, &payment.derivation_prefix)
+                            .await
+                        {
+                            worker::console_warn!(
+                                "payment nonce release failed (prefix stays consumed; client must re-challenge): {release_err:?}"
+                            );
+                        }
+                    }
+
                     // Express: catch(err) => res.status(400).json({ code: err.code ?? 'ERR_PAYMENT_FAILED', description: err.message ?? 'Payment failed.' })
                     let response = Response::from_json(&ErrorResponse::new(
                         "ERR_PAYMENT_FAILED",
@@ -297,6 +395,76 @@ where
             }
         }
     }
+}
+
+/// Wallet-communication phase of payment processing.
+///
+/// Creates a BRC-103/104 session with the storage server on first RPC call.
+/// Sequence: makeAvailable → findOrInsertUser → internalizeAction (matches
+/// wallet-toolbox StorageClient initialization pattern). Any failure here is
+/// the equivalent of the TS reference's `catch` around
+/// `wallet.internalizeAction(...)` and maps to a 400 `ERR_PAYMENT_FAILED`
+/// (after releasing the consumed prefix).
+async fn internalize_payment<F>(
+    wallet: &ProtoWallet,
+    options: &PaymentMiddlewareOptions<F>,
+    auth_context: &AuthContext,
+    payment: &BsvPayment,
+    tx_bytes: Vec<u8>,
+) -> Result<serde_json::Value> {
+    let storage_wallet = ProtoWallet::new(Some(
+        PrivateKey::from_hex(&options.server_private_key).map_err(|e| {
+            AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
+        })?,
+    ));
+    let mut storage_client = WorkerStorageClient::new(storage_wallet, &options.storage_url);
+
+    // Initialize connection and register user
+    storage_client.make_available().await?;
+    let server_identity = wallet.identity_key().to_hex();
+    let user_result: serde_json::Value =
+        storage_client.find_or_insert_user(&server_identity).await?;
+    let user_id = user_result.get("userId").and_then(|v| v.as_i64());
+
+    let auth_json = serde_json::json!({
+        "identityKey": server_identity,
+        "userId": user_id
+    });
+    // Express equivalent:
+    //   const { accepted } = await wallet.internalizeAction({
+    //     tx: Utils.toArray(paymentData.transaction, 'base64'),
+    //     outputs: [{ paymentRemittance: { derivationPrefix, derivationSuffix, senderIdentityKey }, outputIndex: 0, protocol: 'wallet payment' }],
+    //     description: 'Payment for request'
+    //   })
+    let args_json = serde_json::json!({
+        "tx": tx_bytes,
+        "outputs": [{
+            "outputIndex": 0,
+            "protocol": "wallet payment",
+            "paymentRemittance": {
+                "derivationPrefix": payment.derivation_prefix,
+                "derivationSuffix": payment.derivation_suffix,
+                "senderIdentityKey": auth_context.identity_key
+            },
+            "insertionRemittance": null
+        }],
+        "description": "Payment for request"
+    });
+
+    storage_client.internalize_action(auth_json, args_json).await
+}
+
+/// Whether an `internalizeAction` response affirmatively accepted the payment.
+///
+/// Only a literal `"accepted": true` counts; missing or non-boolean values
+/// are treated as rejected (never fail open on the money path). The TS
+/// reference performs no such gate at all — see
+/// [`process_payment_with_storage`] for the divergence note.
+fn internalize_accepted(result: &serde_json::Value) -> bool {
+    result
+        .get("accepted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Add payment success headers to response.
@@ -428,6 +596,58 @@ mod tests {
             .await
             .unwrap();
         assert!(valid1 && valid2, "Both nonces should verify");
+    }
+
+    // ===========================================
+    // accepted-gate tests (audit #44)
+    // ===========================================
+    // The TS reference (payment-express-middleware 1.2.3) proceeds to next()
+    // regardless of `accepted`. We gate: only a literal `accepted: true`
+    // counts, and anything else is a rejected payment.
+
+    #[test]
+    fn test_internalize_accepted_true() {
+        let result = serde_json::json!({ "accepted": true, "satoshisPaid": 100 });
+        assert!(internalize_accepted(&result));
+    }
+
+    #[test]
+    fn test_internalize_accepted_false_is_rejected() {
+        let result = serde_json::json!({ "accepted": false });
+        assert!(
+            !internalize_accepted(&result),
+            "accepted=false must NOT be treated as success (audit #44)"
+        );
+    }
+
+    #[test]
+    fn test_internalize_accepted_missing_is_rejected() {
+        let result = serde_json::json!({ "satoshisPaid": 100 });
+        assert!(
+            !internalize_accepted(&result),
+            "missing accepted field must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_internalize_accepted_non_bool_is_rejected() {
+        for v in [
+            serde_json::json!({ "accepted": "true" }),
+            serde_json::json!({ "accepted": 1 }),
+            serde_json::json!({ "accepted": null }),
+        ] {
+            assert!(
+                !internalize_accepted(&v),
+                "non-boolean accepted must fail closed: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_payment_nonce_scope_constant() {
+        // Consumed derivation prefixes are recorded under this scope in the
+        // SessionStorage nonce store; changing it orphans consumption records.
+        assert_eq!(PAYMENT_NONCE_SCOPE, "payment-derivation-prefix");
     }
 
     // ===========================================

@@ -293,19 +293,17 @@ mod tests {
     #[test]
     fn test_parse_multipart_two_parts() {
         let boundary = "----BsvBoundary";
-        let body = format!(
-            "------BsvBoundary\r\n\
+        let body = "------BsvBoundary\r\n\
              Content-Disposition: form-data; name=\"x-bsv-payment\"\r\n\
              Content-Type: application/json\r\n\
              \r\n\
-             {{\"derivationPrefix\":\"abc\",\"derivationSuffix\":\"def\",\"transaction\":\"dHg=\"}}\r\n\
+             {\"derivationPrefix\":\"abc\",\"derivationSuffix\":\"def\",\"transaction\":\"dHg=\"}\r\n\
              ------BsvBoundary\r\n\
              Content-Disposition: form-data; name=\"body\"\r\n\
              Content-Type: application/json\r\n\
              \r\n\
-             {{\"prompt\":\"hello\"}}\r\n\
-             ------BsvBoundary--\r\n"
-        );
+             {\"prompt\":\"hello\"}\r\n\
+             ------BsvBoundary--\r\n";
 
         let parts = parse_multipart(body.as_bytes(), boundary).unwrap();
         assert_eq!(parts.len(), 2);

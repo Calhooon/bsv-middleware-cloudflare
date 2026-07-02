@@ -19,10 +19,11 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 │   ├── json_rpc.rs      # JSON-RPC 2.0 request/response types
 │   └── storage.rs       # WorkerStorageClient with BRC-103/104 auth
 ├── middleware/          # Request processing middleware
-│   ├── auth.rs          # BRC-103/104 authentication + response signing + CORS
-│   └── payment.rs       # BRC-29 payment verification and 402 responses
-├── storage/             # Cloudflare KV persistence
-│   ├── kv_session.rs    # Session storage with TTL
+│   ├── auth.rs          # BRC-103/104 authentication + replay protection + response signing + CORS
+│   └── payment.rs       # BRC-29 payment verification (accepted gate, single-use prefixes) and 402 responses
+├── storage/             # Pluggable persistence (default: Cloudflare KV)
+│   ├── session_storage.rs # SessionStorage trait: sessions + single-use nonce store
+│   ├── kv_session.rs    # Session storage with TTL + nonce consumption
 │   └── kv_payment.rs    # Payment storage with duplicate detection
 ├── transport/           # HTTP transport layer
 │   └── cloudflare.rs    # BRC-104 header handling + payload serialization
@@ -42,10 +43,11 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `client/json_rpc.rs` | JSON-RPC 2.0 types with tolerant deserialization (handles non-standard `{isError, name, message}` format from storage servers) |
 | `client/storage.rs` | `WorkerStorageClient` - WASM-compatible storage client with BRC-103/104 auth handshake |
 | `middleware/mod.rs` | Re-exports for auth and payment middleware |
-| `middleware/auth.rs` | BRC-103/104 authentication, `sign_response()`, `sign_json_response()`, inline CORS (`add_cors_headers`, `handle_cors_preflight`), handshake handling (InitialRequest, CertificateRequest, CertificateResponse). `process_auth` returns raw body bytes via `AuthResult::Authenticated { body }` for General messages. |
-| `middleware/payment.rs` | BRC-29 payment verification, 402 response generation, `payment_headers` module (incl. `TXID`), `payment_failed_response()` |
-| `storage/mod.rs` | Re-exports for KV storage implementations |
-| `storage/kv_session.rs` | `KvSessionStorage` for BRC-103/104 session persistence with identity index |
+| `middleware/auth.rs` | BRC-103/104 authentication (`process_auth` / `process_auth_with_storage`), per-request nonce replay protection (401 `ERR_REPLAYED_REQUEST` on reuse), `sign_response()`, `sign_json_response()`, inline CORS (`add_cors_headers`, `handle_cors_preflight`), handshake handling (InitialRequest, CertificateRequest, CertificateResponse). `process_auth` returns raw body bytes via `AuthResult::Authenticated { body }` for General messages. |
+| `middleware/payment.rs` | BRC-29 payment verification (`process_payment_with_storage` with `accepted` gate + single-use derivation prefixes; deprecated stateless `process_payment`), 402 response generation, `payment_headers` module (incl. `TXID`), `PAYMENT_NONCE_SCOPE`, `payment_failed_response()` |
+| `storage/mod.rs` | Re-exports for storage trait + KV implementations |
+| `storage/session_storage.rs` | `SessionStorage` trait: pluggable session persistence + single-use nonce consumption (`try_consume_nonce` / `release_nonce`) |
+| `storage/kv_session.rs` | `KvSessionStorage` for BRC-103/104 session persistence with identity index and nonce-consumption records (read-then-write; see residual window note) |
 | `storage/kv_payment.rs` | `KvPaymentStorage` for payment records with unspent/derivation tracking |
 | `transport/mod.rs` | Re-exports for transport layer |
 | `transport/cloudflare.rs` | `CloudflareTransport` for BRC-104 header extraction (incl. `content-type` media type), payload building, varint encoding. `extract_auth_message()` returns `(AuthMessage, Vec<u8>)` with raw body passthrough. |
@@ -58,8 +60,10 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 
 | Export | Description |
 |--------|-------------|
-| `process_auth` | Main authentication middleware function |
-| `process_payment` | Main payment middleware function |
+| `process_auth` | Main authentication middleware function (default KV storage from `AUTH_SESSIONS` binding) |
+| `process_auth_with_storage` | Authentication middleware with a caller-supplied `SessionStorage` backend |
+| `process_payment_with_storage` | Main payment middleware function: `accepted` gate + single-use derivation prefixes via `SessionStorage` |
+| `process_payment` | **Deprecated** stateless payment middleware (HMAC-only prefix check; no single-use enforcement) |
 | `sign_response` | Sign a response for BRC-103/104 interop (required for authenticated clients) |
 | `sign_json_response` | Sign a JSON response with body bytes included in signed payload (recommended over `sign_response`) |
 | `WorkerStorageClient` | Storage server RPC client with BRC-103/104 authentication (re-exported from `client`) |
@@ -73,7 +77,7 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `AuthResult` | Enum: `Authenticated { context, request, session, body }` or `Response(Response)`. `body` is the raw request body bytes (populated for General messages, empty for handshake/unauthenticated). |
 | `AuthSession` | Session info for signing responses: `server_private_key`, `session_nonce`, `peer_nonce`, `peer_identity_key`, `request_id` |
 | `PaymentMiddlewareOptions<F>` | Config: `server_private_key`, `calculate_price` function (`Fn(&Request) -> u64`), `storage_url` (defaults to mainnet). Constructors: `new()`, `with_storage_url()` |
-| `PaymentResult` | Enum: `Free`, `Required(Response)`, `Verified(PaymentContext)`, `Failed(Response)` |
+| `PaymentResult` | Enum: `Free`, `Required(Response)`, `Verified(PaymentContext)`, `Failed(Response)`. `Verified` implies the wallet returned `accepted: true`; a rejected payment yields `Failed` with a 402 + fresh challenge. |
 
 ### Context Types
 
@@ -86,7 +90,8 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 
 | Type | Description |
 |------|-------------|
-| `KvSessionStorage` | Session manager backed by Cloudflare KV with TTL expiration and identity index |
+| `SessionStorage` | Trait: pluggable session persistence + single-use nonce store (`try_consume_nonce(scope, nonce, ttl)` / `release_nonce`). Implement with atomic put-if-absent where the backend supports it (e.g. Durable Object SQLite). |
+| `KvSessionStorage` | Default `SessionStorage` backed by Cloudflare KV with TTL expiration, identity index, and nonce-consumption records |
 | `KvPaymentStorage` | Payment storage with duplicate detection, unspent tracking, and derivation prefix management |
 | `StoredSession` | Persisted session: `session_nonce`, `peer_identity_key`, `peer_nonce`, `is_authenticated`, `certificates_required`, `certificates_validated`, timestamps |
 | `StoredPayment` | Persisted payment: `txid`, `vout`, `satoshis`, `sender_identity_key`, derivation info, `spent` flag |
@@ -188,8 +193,8 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
 ```rust
 use bsv_middleware_cloudflare::{
-    process_auth, process_payment, sign_json_response,
-    AuthMiddlewareOptions, PaymentMiddlewareOptions,
+    process_auth, process_payment_with_storage, sign_json_response,
+    AuthMiddlewareOptions, KvSessionStorage, PaymentMiddlewareOptions,
     AuthResult, PaymentResult,
 };
 
@@ -202,18 +207,24 @@ let payment_options = PaymentMiddlewareOptions::new(
     },
 );
 
-// Note: process_payment takes (&Request, &AuthContext, &PaymentMiddlewareOptions)
-match process_payment(&req, &auth_context, &payment_options).await
+// The session storage doubles as the single-use nonce store that makes
+// payment derivation prefixes one-shot (replay protection).
+let session_storage = KvSessionStorage::new(env.kv("AUTH_SESSIONS")?, "auth", 3600);
+
+match process_payment_with_storage(&req, &auth_context, &payment_options, &session_storage).await
     .map_err(|e| Error::from(e.to_string()))?
 {
     PaymentResult::Free => { /* No payment needed */ }
     PaymentResult::Verified(payment_ctx) => {
+        // Wallet ACCEPTED the payment (accepted == true guaranteed).
         // payment_ctx.satoshis_paid, payment_ctx.tx
     }
     PaymentResult::Required(response) => return Ok(response), // 402
-    PaymentResult::Failed(response) => return Ok(response),   // 400
+    PaymentResult::Failed(response) => return Ok(response),   // 400 bad/replayed, 402 rejected
 }
 ```
+
+The deprecated `process_payment(&req, &auth_context, &payment_options)` still works but performs no single-use prefix tracking (stateless HMAC only, like the TS reference).
 
 ### Environment Wrapper
 
@@ -276,11 +287,15 @@ Key difference from Express: Express uses response hijacking (`res.send`/`res.js
 
 ### BRC-29 (Direct Payment)
 
-Payment flow:
+Payment flow (`process_payment_with_storage`):
 1. Client makes request without payment
 2. Server returns **402 Payment Required** with `derivation_prefix` and `satoshis_required`
 3. Client constructs payment transaction, sends with `x-bsv-payment` header (JSON)
-4. Server verifies derivation prefix via HMAC nonce, internalizes payment via `WorkerStorageClient::internalize_action()`, returns success
+4. Server verifies derivation prefix via HMAC nonce, **consumes it single-use** (`400 ERR_INVALID_DERIVATION_PREFIX` if already used), internalizes payment via `WorkerStorageClient::internalize_action()`, and **gates on `accepted: true`** (`402 ERR_PAYMENT_FAILED` with a fresh challenge if the wallet rejected), then returns success
+
+Consumption ordering on the money path: prefix consumed **before** internalize; released (best-effort) only if internalize **errors** (so an honest client can retry the same payment); kept consumed on success or `accepted: false`.
+
+The deprecated `process_payment` skips step 4's single-use consumption (stateless HMAC only, matching the TS reference's weakness) but still gates on `accepted`.
 
 Payment uses `ProtoWallet` for nonce creation/verification and `WorkerStorageClient` (connected to `storage.babbage.systems` by default) for transaction processing. The `storage_url` field on `PaymentMiddlewareOptions` controls the storage server endpoint.
 
@@ -305,6 +320,41 @@ Payment headers (in `middleware::payment::payment_headers`):
 - `x-bsv-payment-txid` - Transaction ID of the accepted payment (response)
 
 ## Critical Implementation Notes
+
+### Replay Protection (Hardening Divergence from the TS Reference)
+
+The TS reference stack has **no** replay protection: `@bsv/sdk`
+`Peer.processGeneralMessage` (checked at 1.10.3 and 2.0.13) verifies `yourNonce`
+via stateless HMAC and binds `message.nonce` into the signature keyID, but never
+records consumed nonces; `@bsv/payment-express-middleware` 1.2.3 likewise only
+HMAC-checks the derivation prefix and even calls `next()` when
+`internalizeAction` returns `accepted: false`. Per the-composer audit issues
+#30/#44, this crate diverges deliberately:
+
+- **Auth:** after signature verification, `(session_nonce, x-bsv-auth-nonce)` is
+  consumed via `SessionStorage::try_consume_nonce` with `ttl = session_ttl_seconds`;
+  reuse → `401 ERR_REPLAYED_REQUEST`. General messages without a per-request
+  nonce → `401 ERR_INVALID_AUTH`. Storage faults fail **closed**.
+- **Payment:** the derivation prefix is consumed (no expiry — the HMAC never
+  expires) under scope `PAYMENT_NONCE_SCOPE` *before* internalize; reuse →
+  `400 ERR_INVALID_DERIVATION_PREFIX`. `accepted != true` → `402
+  ERR_PAYMENT_FAILED` with a fresh challenge; prefix stays consumed. Released
+  best-effort only when internalize *errors*.
+
+**Residual replay window with the default `KvSessionStorage`** (Cloudflare KV
+has no atomic put-if-absent and is eventually consistent):
+1. Replays reaching the **same edge location** after the original write are
+   always rejected; concurrent in-flight duplicates there can race the
+   read-then-write (sub-second).
+2. Replays at **other edge locations** may succeed at most once per location
+   within the KV propagation window (≤ ~60 s of the original request).
+3. Auth nonce records expire after `session_ttl_seconds`; a session kept alive
+   longer by the sliding liveness refresh can accept a replay of a request
+   older than the session TTL. (Payment prefixes never expire — no window 3.)
+
+A strongly consistent `SessionStorage` (Durable Object SQLite,
+`INSERT OR IGNORE`) eliminates windows 1-2; retaining auth nonces for the
+session's whole life eliminates window 3.
 
 ### Nonce Handling (TS SDK Compatibility)
 
@@ -355,6 +405,8 @@ Error variants and their codes (matching Express middleware):
 
 Automatic `From` conversions: `bsv_sdk::Error` -> `SdkError`, `worker::Error` -> `KvError`, `serde_json::Error` -> `SerializationError`.
 
+Two wire-level codes are emitted directly as `ErrorResponse` bodies (no enum variant; not in the Express reference — hardening additions): `401 ERR_REPLAYED_REQUEST` (auth per-request nonce reuse) and `402 ERR_PAYMENT_FAILED` with fresh challenge headers (wallet returned `accepted: false`).
+
 ## Cloudflare Configuration
 
 ### Required KV Namespaces
@@ -388,6 +440,7 @@ wrangler secret put SERVER_PRIVATE_KEY
 
 - `{prefix}:session:{session_nonce}` - Session JSON with TTL
 - `{prefix}:identity:{identity_key}:{session_nonce}` - Index for identity lookups (value = session_nonce)
+- `{prefix}:nonce:{scope}:{nonce}` - Consumed single-use nonce records. Auth: `scope = session_nonce`, TTL = session TTL (min 60s, KV floor). Payment: `scope = payment-derivation-prefix`, no TTL.
 
 ### Payment Keys (KvPaymentStorage)
 

@@ -8,4 +8,9 @@ pub use auth::{
     process_auth, sign_json_response, sign_response, AuthMiddlewareOptions, AuthResult, AuthSession,
 };
 pub use multipart::prepare_multipart_payment;
-pub use payment::{payment_headers, process_payment, PaymentMiddlewareOptions, PaymentResult};
+#[allow(deprecated)] // re-exported for backward compatibility
+pub use payment::process_payment;
+pub use payment::{
+    payment_headers, process_payment_with_storage, PaymentMiddlewareOptions, PaymentResult,
+    PAYMENT_NONCE_SCOPE,
+};

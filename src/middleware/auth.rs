@@ -8,6 +8,34 @@
 //! - Instead, we provide `sign_response()` which users call before returning a response.
 //! - Express uses in-memory SessionManager. Workers use KV for persistence.
 //! - Express delegates all protocol logic to `Peer`. We implement it directly (same logic).
+//! - **Replay protection (hardening divergence):** the TS reference
+//!   (`@bsv/sdk` `Peer.processGeneralMessage`, verified through v2.0.13)
+//!   never records consumed per-request nonces, so a byte-identical signed
+//!   request replays successfully there for the whole session lifetime. This
+//!   crate consumes `(session_nonce, x-bsv-auth-nonce)` through
+//!   [`SessionStorage::try_consume_nonce`] after signature verification and
+//!   rejects duplicates with `401 ERR_REPLAYED_REQUEST`.
+//!
+//! ## Residual replay window (precise statement)
+//!
+//! With the default Cloudflare-KV-backed storage ([`KvSessionStorage`]):
+//! 1. A replay arriving at the **same Cloudflare location** after the
+//!    original nonce write completed is always rejected; concurrent
+//!    in-flight duplicates at that location can race the KV read-then-write
+//!    (sub-second window, no atomic put-if-absent in KV).
+//! 2. A replay arriving at a **different location** may succeed at most once
+//!    per location until the KV write propagates (≤ ~60 seconds after the
+//!    original request).
+//! 3. Nonce records expire after `session_ttl_seconds`. A session kept alive
+//!    past that by the sliding liveness refresh can therefore accept a
+//!    replay of a request **older than `session_ttl_seconds`** — i.e. replay
+//!    of a captured request is rejected for at least the full session TTL,
+//!    and forever unless the victim's session is still alive when the record
+//!    lapses.
+//!
+//! A strongly consistent `SessionStorage` implementation (Durable Object
+//! SQLite put-if-absent) eliminates windows 1 and 2 entirely; retaining
+//! nonce records for the whole session lifetime eliminates window 3.
 //!
 //! ## Usage:
 //! ```rust,ignore
@@ -239,6 +267,67 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         return Err(AuthCloudflareError::InvalidAuthentication(
             "Invalid message signature".into(),
         ));
+    }
+
+    // Replay protection (the-composer audit #30): consume the per-request
+    // nonce so a byte-identical replay of a signed request is rejected.
+    //
+    // Reference behavior: the TS stack (@bsv/auth-express-middleware 1.2.3 →
+    // @bsv/sdk Peer.processGeneralMessage, verified through v2.0.13) checks
+    // only that yourNonce is a server-created HMAC nonce (verifyNonce) and
+    // binds message.nonce into the signature keyID
+    // (`${message.nonce} ${peerSession.sessionNonce}`) — it never RECORDS a
+    // consumed nonce, so replays re-execute there too. This check is a
+    // deliberate hardening divergence from the reference.
+    //
+    // The per-request nonce (x-bsv-auth-nonce) is the right dedup key: it is
+    // key-derivation input for the signature, so an attacker cannot alter it
+    // without invalidating the signature. Scope = the server session nonce
+    // (unique per session), so identical client nonces across sessions don't
+    // collide.
+    //
+    // Placement: after signature verification (unauthenticated garbage must
+    // not write to the nonce store) and before ANY side effect (liveness
+    // touch, handler execution).
+    //
+    // TTL: the nonce record lives `session_ttl_seconds`. See the module docs
+    // for the exact residual-replay window this leaves under KV and under
+    // sliding session renewal.
+    let request_nonce = match auth_message.nonce.as_deref() {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            // Honest BRC-104 clients always send x-bsv-auth-nonce on General
+            // messages (SimplifiedFetchTransport sets it unconditionally).
+            // Without it replay protection is impossible — reject.
+            let response = Response::from_json(&ErrorResponse::new(
+                "ERR_INVALID_AUTH",
+                "General message is missing the per-request nonce (x-bsv-auth-nonce).",
+            ))
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+            .with_status(401);
+            return Ok(AuthResult::Response(add_cors_headers(response)));
+        }
+    };
+
+    // Fail closed on storage errors (`?`): a nonce-store outage must not
+    // silently disable replay protection. Each nonce key is unique, so this
+    // write cannot hit Cloudflare KV's ~1-write/sec/key limit the way the
+    // (shared-key) liveness touch could.
+    let nonce_fresh = session_storage
+        .try_consume_nonce(
+            &session.session_nonce,
+            request_nonce,
+            Some(options.session_ttl_seconds),
+        )
+        .await?;
+    if !nonce_fresh {
+        let response = Response::from_json(&ErrorResponse::new(
+            "ERR_REPLAYED_REQUEST",
+            "The request nonce has already been used (replay rejected).",
+        ))
+        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+        .with_status(401);
+        return Ok(AuthResult::Response(add_cors_headers(response)));
     }
 
     // Update session last activity (but NOT peer_nonce).

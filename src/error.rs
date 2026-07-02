@@ -110,6 +110,78 @@ impl From<serde_json::Error> for AuthCloudflareError {
 /// Result type alias for BSV Auth Cloudflare middleware.
 pub type Result<T> = std::result::Result<T, AuthCloudflareError>;
 
+impl AuthCloudflareError {
+    /// Returns the HTTP status code appropriate for this error.
+    pub fn status_code(&self) -> u16 {
+        match self {
+            // Auth errors
+            Self::Unauthorized => 401,
+            Self::InvalidAuthentication(_) => 401,
+            Self::SessionNotFound(_) => 401,
+            // Payment errors (matching Express exactly)
+            Self::ServerMisconfigured => 500,
+            Self::PaymentInternal(_) => 500,
+            Self::PaymentRequired { .. } => 402,
+            Self::MalformedPayment(_) => 400,
+            Self::InvalidDerivationPrefix => 400,
+            Self::PaymentFailed(_) => 400,
+            Self::InvalidPayment(_) => 400,
+            // Infrastructure errors
+            Self::KvError(_) => 500,
+            Self::SdkError(_) => 500,
+            Self::TransportError(_) => 500,
+            Self::ConfigError(_) => 500,
+            Self::SerializationError(_) => 400,
+        }
+    }
+
+    /// Returns a machine-readable error code for this error.
+    /// These match the Express middleware error codes exactly.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            // Auth errors (match auth-express-middleware)
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::InvalidAuthentication(_) => "ERR_INVALID_AUTH",
+            Self::SessionNotFound(_) => "ERR_SESSION_NOT_FOUND",
+            // Payment errors (match payment-express-middleware exactly)
+            Self::ServerMisconfigured => "ERR_SERVER_MISCONFIGURED",
+            Self::PaymentInternal(_) => "ERR_PAYMENT_INTERNAL",
+            Self::PaymentRequired { .. } => "ERR_PAYMENT_REQUIRED",
+            Self::MalformedPayment(_) => "ERR_MALFORMED_PAYMENT",
+            Self::InvalidDerivationPrefix => "ERR_INVALID_DERIVATION_PREFIX",
+            Self::PaymentFailed(_) => "ERR_PAYMENT_FAILED",
+            Self::InvalidPayment(_) => "ERR_INVALID_PAYMENT",
+            // Infrastructure errors
+            Self::KvError(_) => "ERR_STORAGE",
+            Self::SdkError(_) => "ERR_SDK",
+            Self::TransportError(_) => "ERR_TRANSPORT",
+            Self::ConfigError(_) => "ERR_CONFIG",
+            Self::SerializationError(_) => "ERR_SERIALIZATION",
+        }
+    }
+
+    /// Converts this error to a JSON response body.
+    ///
+    /// Field-name choice mirrors the TS reference servers: the BRC-31
+    /// middleware layer (Unauthorized) uses `message`; handler-layer
+    /// errors use `description`. Verified against the live TS server
+    /// at messagebox.babbage.systems which returns
+    /// `{"status":"error","code":"UNAUTHORIZED","message":"Mutual-authentication failed!"}`
+    /// on any unauthed request.
+    pub fn to_json(&self) -> String {
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".into(), "error".into());
+        obj.insert("code".into(), self.error_code().into());
+        let field = if matches!(self, Self::Unauthorized) {
+            "message"
+        } else {
+            "description"
+        };
+        obj.insert(field.into(), self.to_string().into());
+        serde_json::Value::Object(obj).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,77 +549,5 @@ mod tests {
                 err
             );
         }
-    }
-}
-
-impl AuthCloudflareError {
-    /// Returns the HTTP status code appropriate for this error.
-    pub fn status_code(&self) -> u16 {
-        match self {
-            // Auth errors
-            Self::Unauthorized => 401,
-            Self::InvalidAuthentication(_) => 401,
-            Self::SessionNotFound(_) => 401,
-            // Payment errors (matching Express exactly)
-            Self::ServerMisconfigured => 500,
-            Self::PaymentInternal(_) => 500,
-            Self::PaymentRequired { .. } => 402,
-            Self::MalformedPayment(_) => 400,
-            Self::InvalidDerivationPrefix => 400,
-            Self::PaymentFailed(_) => 400,
-            Self::InvalidPayment(_) => 400,
-            // Infrastructure errors
-            Self::KvError(_) => 500,
-            Self::SdkError(_) => 500,
-            Self::TransportError(_) => 500,
-            Self::ConfigError(_) => 500,
-            Self::SerializationError(_) => 400,
-        }
-    }
-
-    /// Returns a machine-readable error code for this error.
-    /// These match the Express middleware error codes exactly.
-    pub fn error_code(&self) -> &'static str {
-        match self {
-            // Auth errors (match auth-express-middleware)
-            Self::Unauthorized => "UNAUTHORIZED",
-            Self::InvalidAuthentication(_) => "ERR_INVALID_AUTH",
-            Self::SessionNotFound(_) => "ERR_SESSION_NOT_FOUND",
-            // Payment errors (match payment-express-middleware exactly)
-            Self::ServerMisconfigured => "ERR_SERVER_MISCONFIGURED",
-            Self::PaymentInternal(_) => "ERR_PAYMENT_INTERNAL",
-            Self::PaymentRequired { .. } => "ERR_PAYMENT_REQUIRED",
-            Self::MalformedPayment(_) => "ERR_MALFORMED_PAYMENT",
-            Self::InvalidDerivationPrefix => "ERR_INVALID_DERIVATION_PREFIX",
-            Self::PaymentFailed(_) => "ERR_PAYMENT_FAILED",
-            Self::InvalidPayment(_) => "ERR_INVALID_PAYMENT",
-            // Infrastructure errors
-            Self::KvError(_) => "ERR_STORAGE",
-            Self::SdkError(_) => "ERR_SDK",
-            Self::TransportError(_) => "ERR_TRANSPORT",
-            Self::ConfigError(_) => "ERR_CONFIG",
-            Self::SerializationError(_) => "ERR_SERIALIZATION",
-        }
-    }
-
-    /// Converts this error to a JSON response body.
-    ///
-    /// Field-name choice mirrors the TS reference servers: the BRC-31
-    /// middleware layer (Unauthorized) uses `message`; handler-layer
-    /// errors use `description`. Verified against the live TS server
-    /// at messagebox.babbage.systems which returns
-    /// `{"status":"error","code":"UNAUTHORIZED","message":"Mutual-authentication failed!"}`
-    /// on any unauthed request.
-    pub fn to_json(&self) -> String {
-        let mut obj = serde_json::Map::new();
-        obj.insert("status".into(), "error".into());
-        obj.insert("code".into(), self.error_code().into());
-        let field = if matches!(self, Self::Unauthorized) {
-            "message"
-        } else {
-            "description"
-        };
-        obj.insert(field.into(), self.to_string().into());
-        serde_json::Value::Object(obj).to_string()
     }
 }
