@@ -108,73 +108,118 @@ pub trait SessionStorage {
     async fn release_nonce(&self, scope: &str, nonce: &str) -> Result<()>;
 }
 
+/// In-memory [`SessionStorage`] test double, shared by the trait-contract
+/// tests below and the payment middleware's executed money-path tests
+/// (`middleware::payment` — the-composer #62).
+///
+/// `try_consume_nonce` here is genuinely atomic (single-threaded map
+/// insert), i.e. the semantics a Durable Object SQLite implementation
+/// provides in production. Fault injection (`fail_consume`/`fail_release`)
+/// exercises the fail-closed and release-failure branches.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::collections::{HashMap, HashSet};
+#[derive(Default)]
+pub(crate) struct MemorySessionStorage {
+    sessions: std::cell::RefCell<std::collections::HashMap<String, StoredSession>>,
+    nonces: std::cell::RefCell<std::collections::HashSet<String>>,
+    fail_consume: std::cell::Cell<bool>,
+    fail_release: std::cell::Cell<bool>,
+}
 
-    /// In-memory `SessionStorage` used to exercise the trait contract.
-    ///
-    /// `try_consume_nonce` here is genuinely atomic (single-threaded map
-    /// insert), i.e. the semantics a Durable Object SQLite implementation
-    /// provides in production.
-    #[derive(Default)]
-    struct MemorySessionStorage {
-        sessions: RefCell<HashMap<String, StoredSession>>,
-        nonces: RefCell<HashSet<String>>,
-    }
-
+#[cfg(test)]
+impl MemorySessionStorage {
     fn nonce_key(scope: &str, nonce: &str) -> String {
         format!("{}:{}", scope, nonce)
     }
 
-    #[async_trait(?Send)]
-    impl SessionStorage for MemorySessionStorage {
-        async fn get_session(&self, session_nonce: &str) -> Result<Option<StoredSession>> {
-            Ok(self.sessions.borrow().get(session_nonce).cloned())
-        }
-
-        async fn get_session_by_identity(
-            &self,
-            identity_key_hex: &str,
-        ) -> Result<Option<StoredSession>> {
-            Ok(self
-                .sessions
-                .borrow()
-                .values()
-                .filter(|s| s.peer_identity_key == identity_key_hex)
-                .max_by_key(|s| s.last_update)
-                .cloned())
-        }
-
-        async fn save_session(&self, session: &StoredSession) -> Result<()> {
-            self.sessions
-                .borrow_mut()
-                .insert(session.session_nonce.clone(), session.clone());
-            Ok(())
-        }
-
-        async fn update_session(&self, session: &StoredSession) -> Result<()> {
-            self.save_session(session).await
-        }
-
-        async fn try_consume_nonce(
-            &self,
-            scope: &str,
-            nonce: &str,
-            _ttl_seconds: Option<u64>,
-        ) -> Result<bool> {
-            // HashSet::insert returns true only when the value was absent —
-            // atomic put-if-absent.
-            Ok(self.nonces.borrow_mut().insert(nonce_key(scope, nonce)))
-        }
-
-        async fn release_nonce(&self, scope: &str, nonce: &str) -> Result<()> {
-            self.nonces.borrow_mut().remove(&nonce_key(scope, nonce));
-            Ok(())
-        }
+    /// Make `try_consume_nonce` fail with a storage error (fail-closed path).
+    pub(crate) fn fail_consume(&self, fail: bool) {
+        self.fail_consume.set(fail);
     }
+
+    /// Make `release_nonce` fail with a storage error (best-effort path).
+    pub(crate) fn fail_release(&self, fail: bool) {
+        self.fail_release.set(fail);
+    }
+
+    /// Whether `nonce` is currently recorded as consumed under `scope`.
+    pub(crate) fn is_consumed(&self, scope: &str, nonce: &str) -> bool {
+        self.nonces
+            .borrow()
+            .contains(&Self::nonce_key(scope, nonce))
+    }
+
+    /// Number of consumed-nonce records (all scopes).
+    pub(crate) fn consumed_count(&self) -> usize {
+        self.nonces.borrow().len()
+    }
+}
+
+#[cfg(test)]
+#[async_trait(?Send)]
+impl SessionStorage for MemorySessionStorage {
+    async fn get_session(&self, session_nonce: &str) -> Result<Option<StoredSession>> {
+        Ok(self.sessions.borrow().get(session_nonce).cloned())
+    }
+
+    async fn get_session_by_identity(
+        &self,
+        identity_key_hex: &str,
+    ) -> Result<Option<StoredSession>> {
+        Ok(self
+            .sessions
+            .borrow()
+            .values()
+            .filter(|s| s.peer_identity_key == identity_key_hex)
+            .max_by_key(|s| s.last_update)
+            .cloned())
+    }
+
+    async fn save_session(&self, session: &StoredSession) -> Result<()> {
+        self.sessions
+            .borrow_mut()
+            .insert(session.session_nonce.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn update_session(&self, session: &StoredSession) -> Result<()> {
+        self.save_session(session).await
+    }
+
+    async fn try_consume_nonce(
+        &self,
+        scope: &str,
+        nonce: &str,
+        _ttl_seconds: Option<u64>,
+    ) -> Result<bool> {
+        if self.fail_consume.get() {
+            return Err(crate::error::AuthCloudflareError::KvError(
+                "injected consume fault".to_string(),
+            ));
+        }
+        // HashSet::insert returns true only when the value was absent —
+        // atomic put-if-absent.
+        Ok(self
+            .nonces
+            .borrow_mut()
+            .insert(Self::nonce_key(scope, nonce)))
+    }
+
+    async fn release_nonce(&self, scope: &str, nonce: &str) -> Result<()> {
+        if self.fail_release.get() {
+            return Err(crate::error::AuthCloudflareError::KvError(
+                "injected release fault".to_string(),
+            ));
+        }
+        self.nonces
+            .borrow_mut()
+            .remove(&Self::nonce_key(scope, nonce));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     /// Compile-time check: the trait must stay object safe so middleware can
     /// take `&dyn SessionStorage`.
