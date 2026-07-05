@@ -11,4 +11,4 @@ pub mod json_rpc;
 mod storage;
 
 pub use json_rpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-pub use storage::WorkerStorageClient;
+pub use storage::{ClientSessionSnapshot, WorkerStorageClient, CLIENT_SESSION_SNAPSHOT_VERSION};

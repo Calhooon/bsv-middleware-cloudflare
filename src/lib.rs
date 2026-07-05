@@ -124,7 +124,7 @@ pub mod types;
 pub mod utils;
 
 // Re-exports for convenient access
-pub use client::WorkerStorageClient;
+pub use client::{ClientSessionSnapshot, WorkerStorageClient};
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
     add_cors_headers, process_auth, process_auth_with_storage, sign_json_response, sign_response,

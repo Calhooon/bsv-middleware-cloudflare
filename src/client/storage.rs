@@ -17,7 +17,9 @@ use bsv_sdk::wallet::{
 };
 use rand::RngCore;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use worker::kv::KvStore;
 
 /// BRC-104 header names.
 mod headers {
@@ -34,7 +36,6 @@ mod headers {
 const ORIGINATOR: &str = "bsv-wallet-toolbox";
 
 /// Session state after BRC-103/104 handshake.
-#[allow(dead_code)]
 struct PeerSessionState {
     /// Our session nonce (base64). Retained for session re-establishment.
     our_nonce: String,
@@ -42,6 +43,50 @@ struct PeerSessionState {
     peer_nonce: String,
     /// Server's identity key.
     server_identity_key: PublicKey,
+}
+
+/// Version of the [`ClientSessionSnapshot`] wire format. Bump on any
+/// incompatible change; [`WorkerStorageClient::resume_session`] rejects
+/// mismatched versions (callers then fall back to a fresh handshake).
+pub const CLIENT_SESSION_SNAPSHOT_VERSION: u32 = 1;
+
+/// A persistable snapshot of an established BRC-103/104 CLIENT session,
+/// mirroring the TS SDK's `PeerSession` (`sessionNonce` / `peerNonce` /
+/// `peerIdentityKey`).
+///
+/// # What this contains — and deliberately does NOT contain
+///
+/// Every field is **public** wire material: both session nonces were already
+/// transmitted in cleartext during the handshake (they are session
+/// *identifiers*, not secrets), and the server identity key is the server's
+/// public key. Message authenticity rests exclusively on the wallet's private
+/// key, from which a per-message signing key is BRC-42-derived at request
+/// time — the private key is never part of the session and never serialized.
+///
+/// Per-request state is likewise never persisted: each General message signs
+/// a **fresh 256-bit random nonce** and a fresh 256-bit random request ID
+/// (see `send_rpc_once`), so two isolates resuming the same snapshot
+/// concurrently cannot reuse a nonce — matching the TS SDK, where one
+/// long-lived `PeerSession` serves any number of concurrent requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientSessionSnapshot {
+    /// Snapshot format version (see [`CLIENT_SESSION_SNAPSHOT_VERSION`]).
+    #[serde(default)]
+    pub v: u32,
+    /// Our session nonce (base64) from the handshake InitialRequest.
+    pub our_nonce: String,
+    /// The server's session nonce (base64) from the InitialResponse. This is
+    /// the key the server uses to look its session up (`x-bsv-auth-your-nonce`).
+    pub peer_nonce: String,
+    /// The server's identity public key (compressed hex).
+    pub server_identity_key: String,
+}
+
+/// Where to persist/resume the client session (Cloudflare KV).
+struct KvSessionCache {
+    kv: KvStore,
+    key: String,
+    ttl_seconds: u64,
 }
 
 /// Worker-compatible storage client for `storage.babbage.systems`.
@@ -67,6 +112,11 @@ pub struct WorkerStorageClient {
     wallet: bsv_sdk::wallet::ProtoWallet,
     next_id: u64,
     session: Option<PeerSessionState>,
+    /// Optional KV persistence of the session across (stateless) isolates.
+    session_cache: Option<KvSessionCache>,
+    /// True while the current `session` was resumed from a snapshot rather
+    /// than established by a handshake in this instance.
+    session_resumed: bool,
 }
 
 impl WorkerStorageClient {
@@ -83,6 +133,8 @@ impl WorkerStorageClient {
             wallet,
             next_id: 1,
             session: None,
+            session_cache: None,
+            session_resumed: false,
         }
     }
 
@@ -99,6 +151,158 @@ impl WorkerStorageClient {
     /// Returns our identity key.
     fn identity_key(&self) -> PublicKey {
         self.wallet.identity_key()
+    }
+
+    // ========================================================================
+    // Session persistence (skip the 0.8–2.9 s handshake across isolates)
+    // ========================================================================
+
+    /// Persist/resume the BRC-103/104 session in Cloudflare KV under `key`.
+    ///
+    /// With this set, `ensure_session()` first tries to resume the snapshot
+    /// stored at `key`; only on miss/parse-failure does it perform the full
+    /// handshake (and then writes the fresh snapshot back, best-effort). If
+    /// the server's auth layer rejects a resumed session (expired server-side,
+    /// server KV wiped, server key rotated), `rpc_call` re-handshakes,
+    /// overwrites the snapshot, and retries the RPC exactly once — see
+    /// `is_auth_layer_rejection` for why that retry cannot double-execute.
+    ///
+    /// `ttl_seconds` must be comfortably below the server's session TTL
+    /// (`AuthMiddlewareOptions::session_ttl_seconds`, default 3600) so a
+    /// resumed session is always inside the server's window; KV clamps to a
+    /// 60 s minimum. Only public handshake material is stored — never a
+    /// private key (see [`ClientSessionSnapshot`]).
+    pub fn use_kv_session_cache(&mut self, kv: KvStore, key: String, ttl_seconds: u64) {
+        self.session_cache = Some(KvSessionCache {
+            kv,
+            key,
+            ttl_seconds,
+        });
+    }
+
+    /// True while the current session was resumed from a snapshot (KV cache
+    /// or `resume_session`) rather than handshaken by this instance. Useful
+    /// for logging warm vs cold auth paths.
+    pub fn session_was_resumed(&self) -> bool {
+        self.session_resumed
+    }
+
+    /// Exports the current session as a persistable snapshot (None if no
+    /// session has been established/resumed yet).
+    pub fn export_session(&self) -> Option<ClientSessionSnapshot> {
+        self.session.as_ref().map(|s| ClientSessionSnapshot {
+            v: CLIENT_SESSION_SNAPSHOT_VERSION,
+            our_nonce: s.our_nonce.clone(),
+            peer_nonce: s.peer_nonce.clone(),
+            server_identity_key: s.server_identity_key.to_hex(),
+        })
+    }
+
+    /// Resumes a previously exported session, skipping the handshake.
+    ///
+    /// Validation only checks the snapshot is well-formed (version, non-empty
+    /// nonces, parseable server key) — whether the server still honors the
+    /// session is discovered on the first RPC, where a rejection triggers the
+    /// fresh-handshake retry in `rpc_call`.
+    pub fn resume_session(&mut self, snapshot: ClientSessionSnapshot) -> Result<()> {
+        if snapshot.v != CLIENT_SESSION_SNAPSHOT_VERSION {
+            return Err(AuthCloudflareError::SerializationError(format!(
+                "session snapshot version {} != {}",
+                snapshot.v, CLIENT_SESSION_SNAPSHOT_VERSION
+            )));
+        }
+        if snapshot.our_nonce.is_empty() || snapshot.peer_nonce.is_empty() {
+            return Err(AuthCloudflareError::SerializationError(
+                "session snapshot has empty nonce".into(),
+            ));
+        }
+        let server_identity_key =
+            PublicKey::from_hex(&snapshot.server_identity_key).map_err(|e| {
+                AuthCloudflareError::SerializationError(format!(
+                    "session snapshot server key: {}",
+                    e
+                ))
+            })?;
+        self.session = Some(PeerSessionState {
+            our_nonce: snapshot.our_nonce,
+            peer_nonce: snapshot.peer_nonce,
+            server_identity_key,
+        });
+        self.session_resumed = true;
+        Ok(())
+    }
+
+    /// Best-effort resume from the configured KV cache. Any failure (no
+    /// cache configured, KV miss, KV error, parse/validation failure) simply
+    /// returns false and the caller falls back to a fresh handshake.
+    async fn try_resume_from_kv(&mut self) -> bool {
+        let (key, kv) = match &self.session_cache {
+            Some(c) => (c.key.clone(), &c.kv),
+            None => return false,
+        };
+        let text = match kv.get(&key).text().await {
+            Ok(Some(t)) => t,
+            _ => return false,
+        };
+        match serde_json::from_str::<ClientSessionSnapshot>(&text) {
+            Ok(snapshot) => self.resume_session(snapshot).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Best-effort persist of the current session to the configured KV cache.
+    /// Failures are logged and ignored — the session works either way; the
+    /// only cost of a failed write is a handshake on some future isolate.
+    async fn persist_session_to_kv(&self) {
+        let cache = match &self.session_cache {
+            Some(c) => c,
+            None => return,
+        };
+        let snapshot = match self.export_session() {
+            Some(s) => s,
+            None => return,
+        };
+        let json = match serde_json::to_string(&snapshot) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        match cache.kv.put(&cache.key, json) {
+            Ok(put) => {
+                // Cloudflare KV enforces a 60 s minimum TTL — clamp up.
+                if let Err(e) = put.expiration_ttl(cache.ttl_seconds.max(60)).execute().await {
+                    worker::console_warn!("client session KV persist skipped (non-fatal): {e:?}");
+                }
+            }
+            Err(e) => {
+                worker::console_warn!("client session KV persist skipped (non-fatal): {e:?}");
+            }
+        }
+    }
+
+    /// True when an HTTP response was produced by the SERVER'S AUTH LAYER
+    /// rejecting the request BEFORE the JSON-RPC handler ran — i.e. the RPC
+    /// definitively did NOT execute, so re-handshaking and resending is safe
+    /// even for non-idempotent methods.
+    ///
+    /// Grounding (bsv-middleware-cloudflare `process_auth`, which wallet-infra
+    /// wires in front of its JSON-RPC dispatch):
+    ///   * expired/unknown session → 401 `ERR_SESSION_NOT_FOUND`
+    ///   * replayed request nonce  → 401 `ERR_REPLAYED_REQUEST`
+    ///   * missing auth material   → 401 `UNAUTHORIZED` / `ERR_INVALID_AUTH`
+    ///   * signature mismatch (e.g. resumed session vs a rotated server key)
+    ///     → `Err(InvalidAuthentication)` which the worker surfaces as a 500
+    ///     whose body carries the Display string "Invalid authentication".
+    /// All of these occur strictly before dispatch. Handler-side failures
+    /// return signed JSON-RPC error bodies with status 200, or 5xx bodies
+    /// that do not carry the auth-layer strings — those are NOT retried.
+    fn is_auth_layer_rejection(status: u16, body: &str) -> bool {
+        if status == 401 || status == 403 {
+            return true;
+        }
+        status == 500
+            && (body.contains("Invalid authentication")
+                || body.contains("Session not found")
+                || body.contains("Mutual-authentication failed"))
     }
 
     /// Makes a POST request using worker::Fetch.
@@ -244,32 +448,42 @@ impl WorkerStorageClient {
             ));
         }
 
-        // Store session
+        // Store session (freshly handshaken, not resumed from a snapshot)
         self.session = Some(PeerSessionState {
             our_nonce: session_nonce,
             peer_nonce: server_nonce,
             server_identity_key: response_msg.identity_key,
         });
+        self.session_resumed = false;
 
         Ok(())
     }
 
-    /// Ensures we have an authenticated session, performing handshake if needed.
+    /// Ensures we have an authenticated session: in-memory first, then a
+    /// KV-cached snapshot (if configured), then the full handshake. A fresh
+    /// handshake persists its snapshot back to KV (best-effort) so subsequent
+    /// isolates skip the handshake entirely.
     async fn ensure_session(&mut self) -> Result<()> {
-        if self.session.is_none() {
-            self.perform_handshake().await?;
+        if self.session.is_some() {
+            return Ok(());
         }
+        if self.try_resume_from_kv().await {
+            return Ok(());
+        }
+        self.perform_handshake().await?;
+        self.session_resumed = false;
+        self.persist_session_to_kv().await;
         Ok(())
     }
 
     /// Makes an authenticated JSON-RPC call to the storage server.
     ///
-    /// 1. Ensures we have a BRC-103/104 session
-    /// 2. Builds JSON-RPC request
-    /// 3. Wraps in HttpRequest payload for signing
-    /// 4. Signs with BRC-42 key derivation
-    /// 5. Sends via `worker::Fetch` with BRC-104 auth headers
-    /// 6. Parses response and extracts result
+    /// 1. Ensures we have a BRC-103/104 session (resumed from KV when cached)
+    /// 2. Sends one freshly signed attempt (`send_rpc_once`)
+    /// 3. If the server's AUTH LAYER rejected it (stale/expired session —
+    ///    the RPC handler never ran, see `is_auth_layer_rejection`),
+    ///    re-handshakes, overwrites the KV snapshot, and retries exactly once
+    /// 4. Parses response and extracts result
     pub async fn rpc_call<T: DeserializeOwned>(
         &mut self,
         method: &str,
@@ -277,10 +491,77 @@ impl WorkerStorageClient {
     ) -> Result<T> {
         self.ensure_session().await?;
 
+        let (mut status, mut id, mut response_text) = self.send_rpc_once(method, &params).await?;
+
+        if Self::is_auth_layer_rejection(status, &response_text) {
+            // Correctness over speed: a stale resumed session (or a session
+            // that expired server-side mid-isolate) must never surface as a
+            // failed RPC. The rejection came from the auth middleware BEFORE
+            // dispatch, so the RPC did not execute — re-handshake, refresh
+            // the cache, and resend once (fresh id/nonce/request-id/signature).
+            self.session = None;
+            self.session_resumed = false;
+            self.perform_handshake().await?;
+            self.persist_session_to_kv().await;
+            let (s, i, t) = self.send_rpc_once(method, &params).await?;
+            status = s;
+            id = i;
+            response_text = t;
+        }
+
+        if !(200..300).contains(&status) {
+            return Err(AuthCloudflareError::TransportError(format!(
+                "Storage server returned {}: {}",
+                status, response_text
+            )));
+        }
+
+        // Parse JSON-RPC response
+        let rpc_resp: JsonRpcResponse = serde_json::from_str(&response_text).map_err(|e| {
+            AuthCloudflareError::SerializationError(format!(
+                "Failed to parse RPC response: {} - body: {}",
+                e, response_text
+            ))
+        })?;
+
+        // Check for JSON-RPC error
+        if let Some(error) = rpc_resp.error {
+            return Err(AuthCloudflareError::TransportError(format!(
+                "RPC error: {}",
+                error
+            )));
+        }
+
+        // Check ID match
+        if rpc_resp.id != id {
+            return Err(AuthCloudflareError::TransportError(format!(
+                "RPC response ID mismatch: expected {}, got {}",
+                id, rpc_resp.id
+            )));
+        }
+
+        // Deserialize result
+        let result_value = rpc_resp.result.unwrap_or(Value::Null);
+        serde_json::from_value(result_value)
+            .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))
+    }
+
+    /// Sends ONE signed JSON-RPC attempt over the current session and returns
+    /// `(http_status, jsonrpc_id, body_text)`. Every attempt is independently
+    /// safe: a fresh JSON-RPC id, a fresh 256-bit random request ID, a fresh
+    /// 256-bit random message nonce, and a fresh BRC-42-derived signature —
+    /// nothing per-request is ever reused, whether the session was resumed
+    /// or freshly handshaken.
+    ///
+    /// 1. Builds JSON-RPC request
+    /// 2. Wraps in HttpRequest payload for signing
+    /// 3. Signs with BRC-42 key derivation
+    /// 4. Sends via `worker::Fetch` with BRC-104 auth headers
+    async fn send_rpc_once(&mut self, method: &str, params: &[Value]) -> Result<(u16, u64, String)> {
         // Build JSON-RPC request
         let id = self.next_id;
         self.next_id += 1;
-        let rpc_req = JsonRpcRequest::new(id, method, params);
+        let rpc_req = JsonRpcRequest::new(id, method, params.to_vec());
         let rpc_body = serde_json::to_vec(&rpc_req)
             .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
         let rpc_body_str = String::from_utf8(rpc_body.clone())
@@ -311,7 +592,9 @@ impl WorkerStorageClient {
         msg.nonce = Some(to_base64(&random_bytes));
 
         // Reference the session fields we need before signing
-        let session = self.session.as_ref().unwrap();
+        let session = self.session.as_ref().ok_or_else(|| {
+            AuthCloudflareError::InvalidAuthentication("no session established".into())
+        })?;
         msg.your_nonce = Some(session.peer_nonce.clone());
         msg.payload = Some(payload);
 
@@ -370,41 +653,7 @@ impl WorkerStorageClient {
             AuthCloudflareError::TransportError(format!("Failed to read RPC response: {}", e))
         })?;
 
-        if !(200..300).contains(&status) {
-            return Err(AuthCloudflareError::TransportError(format!(
-                "Storage server returned {}: {}",
-                status, response_text
-            )));
-        }
-
-        // Parse JSON-RPC response
-        let rpc_resp: JsonRpcResponse = serde_json::from_str(&response_text).map_err(|e| {
-            AuthCloudflareError::SerializationError(format!(
-                "Failed to parse RPC response: {} - body: {}",
-                e, response_text
-            ))
-        })?;
-
-        // Check for JSON-RPC error
-        if let Some(error) = rpc_resp.error {
-            return Err(AuthCloudflareError::TransportError(format!(
-                "RPC error: {}",
-                error
-            )));
-        }
-
-        // Check ID match
-        if rpc_resp.id != id {
-            return Err(AuthCloudflareError::TransportError(format!(
-                "RPC response ID mismatch: expected {}, got {}",
-                id, rpc_resp.id
-            )));
-        }
-
-        // Deserialize result
-        let result_value = rpc_resp.result.unwrap_or(Value::Null);
-        serde_json::from_value(result_value)
-            .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))
+        Ok((status, id, response_text))
     }
 
     // ========================================================================
@@ -506,5 +755,123 @@ mod tests {
             bsv_sdk::wallet::ProtoWallet::new(Some(bsv_sdk::primitives::PrivateKey::random()));
         let client = WorkerStorageClient::new(wallet, "https://example.com/");
         assert_eq!(client.endpoint_url, "https://example.com");
+    }
+
+    // ===========================================
+    // Session snapshot (persist/resume) tests
+    // ===========================================
+
+    fn test_client() -> WorkerStorageClient {
+        let wallet =
+            bsv_sdk::wallet::ProtoWallet::new(Some(bsv_sdk::primitives::PrivateKey::random()));
+        WorkerStorageClient::new(wallet, "https://example.com")
+    }
+
+    fn test_snapshot() -> ClientSessionSnapshot {
+        ClientSessionSnapshot {
+            v: CLIENT_SESSION_SNAPSHOT_VERSION,
+            our_nonce: "b64-our-nonce".to_string(),
+            peer_nonce: "b64-peer-nonce".to_string(),
+            server_identity_key: bsv_sdk::primitives::PrivateKey::random()
+                .public_key()
+                .to_hex(),
+        }
+    }
+
+    #[test]
+    fn test_session_snapshot_save_load_roundtrip() {
+        let mut client = test_client();
+        assert!(client.export_session().is_none());
+        assert!(!client.session_was_resumed());
+
+        let snap = test_snapshot();
+        let server_key = snap.server_identity_key.clone();
+
+        // JSON round-trip — exactly what the KV cache stores and reloads.
+        let json = serde_json::to_string(&snap).unwrap();
+        let parsed: ClientSessionSnapshot = serde_json::from_str(&json).unwrap();
+        client.resume_session(parsed).unwrap();
+        assert!(client.session_was_resumed());
+
+        let exported = client.export_session().unwrap();
+        assert_eq!(exported.v, CLIENT_SESSION_SNAPSHOT_VERSION);
+        assert_eq!(exported.our_nonce, "b64-our-nonce");
+        assert_eq!(exported.peer_nonce, "b64-peer-nonce");
+        assert_eq!(exported.server_identity_key, server_key);
+    }
+
+    #[test]
+    fn test_session_snapshot_contains_no_private_material() {
+        // Guard: the persisted JSON must carry ONLY the four public fields.
+        // A private key must never be serializable from a snapshot.
+        let json = serde_json::to_value(test_snapshot()).unwrap();
+        let obj = json.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["our_nonce", "peer_nonce", "server_identity_key", "v"]
+        );
+    }
+
+    #[test]
+    fn test_resume_rejects_wrong_version() {
+        let mut client = test_client();
+        let mut snap = test_snapshot();
+        snap.v = CLIENT_SESSION_SNAPSHOT_VERSION + 1;
+        assert!(client.resume_session(snap).is_err());
+        assert!(client.export_session().is_none());
+        assert!(!client.session_was_resumed());
+    }
+
+    #[test]
+    fn test_resume_rejects_bad_server_key() {
+        let mut client = test_client();
+        let mut snap = test_snapshot();
+        snap.server_identity_key = "not-a-pubkey".to_string();
+        assert!(client.resume_session(snap).is_err());
+        assert!(client.export_session().is_none());
+    }
+
+    #[test]
+    fn test_resume_rejects_empty_nonces() {
+        let mut client = test_client();
+        let mut snap = test_snapshot();
+        snap.peer_nonce = String::new();
+        assert!(client.resume_session(snap).is_err());
+
+        let mut snap = test_snapshot();
+        snap.our_nonce = String::new();
+        assert!(client.resume_session(snap).is_err());
+    }
+
+    #[test]
+    fn test_auth_layer_rejection_classifier() {
+        // 401/403 = auth middleware rejection, always pre-dispatch.
+        assert!(WorkerStorageClient::is_auth_layer_rejection(401, ""));
+        assert!(WorkerStorageClient::is_auth_layer_rejection(
+            401,
+            r#"{"status":"error","code":"ERR_SESSION_NOT_FOUND","description":"No authenticated session found"}"#
+        ));
+        assert!(WorkerStorageClient::is_auth_layer_rejection(403, ""));
+
+        // 500 carrying process_auth Display strings = pre-dispatch too.
+        assert!(WorkerStorageClient::is_auth_layer_rejection(
+            500,
+            "Invalid authentication: Invalid message signature"
+        ));
+        assert!(WorkerStorageClient::is_auth_layer_rejection(
+            500,
+            "Session not found: 02abc"
+        ));
+
+        // Handler-side / other failures must NOT be retried.
+        assert!(!WorkerStorageClient::is_auth_layer_rejection(
+            500,
+            "D1_ERROR: database is locked"
+        ));
+        assert!(!WorkerStorageClient::is_auth_layer_rejection(400, "bad request"));
+        assert!(!WorkerStorageClient::is_auth_layer_rejection(200, "ok"));
+        assert!(!WorkerStorageClient::is_auth_layer_rejection(404, "not found"));
     }
 }
