@@ -134,7 +134,8 @@ pub use middleware::multipart::prepare_multipart_payment;
 #[allow(deprecated)] // re-exported for backward compatibility
 pub use middleware::payment::process_payment;
 pub use middleware::payment::{
-    add_payment_headers, payment_headers, process_payment_with_storage, PaymentMiddlewareOptions,
+    add_payment_headers, payment_headers, process_payment_with_storage, process_payment_with_storage_signed,
+    PaymentMiddlewareOptions,
     PaymentResult, PAYMENT_NONCE_SCOPE,
 };
 pub use storage::{KvPaymentStorage, KvSessionStorage, SessionStorage};

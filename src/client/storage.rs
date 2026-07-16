@@ -292,6 +292,7 @@ impl WorkerStorageClient {
     ///   * signature mismatch (e.g. resumed session vs a rotated server key)
     ///     → `Err(InvalidAuthentication)` which the worker surfaces as a 500
     ///     whose body carries the Display string "Invalid authentication".
+    ///
     /// All of these occur strictly before dispatch. Handler-side failures
     /// return signed JSON-RPC error bodies with status 200, or 5xx bodies
     /// that do not carry the auth-layer strings — those are NOT retried.

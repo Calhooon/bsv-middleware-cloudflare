@@ -14,7 +14,7 @@
 
 use crate::client::WorkerStorageClient;
 use crate::error::{AuthCloudflareError, Result};
-use crate::middleware::auth::add_cors_headers;
+use crate::middleware::auth::{add_cors_headers, sign_json_response, AuthSession};
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::types::{AuthContext, BsvPayment, ErrorResponse, PaymentContext};
 use bsv_sdk::auth::utils::{create_nonce, verify_nonce};
@@ -70,6 +70,12 @@ pub struct PaymentMiddlewareOptions<F> {
     /// URL of the storage server for payment internalization.
     /// Defaults to `WorkerStorageClient::MAINNET_URL` (<https://storage.babbage.systems>).
     pub storage_url: String,
+    /// BRC-100 labels attached to every payment internalize.
+    /// Real-wallet label permission is granted PER LABEL, which makes labels
+    /// load-bearing, not decoration — production servers use small frozen
+    /// vocabularies (e.g. "beacon read-fee"). `None` omits the key from the
+    /// wire entirely (bit-compatible with the pre-labels behavior).
+    pub labels: Option<Vec<String>>,
 }
 
 impl<F> PaymentMiddlewareOptions<F> {
@@ -79,6 +85,7 @@ impl<F> PaymentMiddlewareOptions<F> {
             server_private_key,
             calculate_price,
             storage_url: WorkerStorageClient::MAINNET_URL.to_string(),
+            labels: None,
         }
     }
 
@@ -92,7 +99,14 @@ impl<F> PaymentMiddlewareOptions<F> {
             server_private_key,
             calculate_price,
             storage_url,
+            labels: None,
         }
+    }
+
+    /// Attach BRC-100 labels to every payment internalize (builder-style).
+    pub fn with_labels(mut self, labels: Vec<String>) -> Self {
+        self.labels = Some(labels);
+        self
     }
 }
 
@@ -190,6 +204,47 @@ where
     S: SessionStorage + ?Sized,
 {
     process_payment_inner(req, auth_context, options, Some(session_storage)).await
+}
+
+/// [`process_payment_with_storage`] with BRC-104-signed responses.
+///
+/// Identical decision flow, but every response this middleware builds —
+/// the 402 challenges AND the failure responses — is signed against
+/// `session` via [`sign_json_response`], the shape AuthFetch-class clients
+/// expect. Production servers previously hand-rolled this composition
+/// caller-side; pass the [`AuthSession`] from `process_auth` and the crate
+/// carries it.
+pub async fn process_payment_with_storage_signed<F, S>(
+    req: &Request,
+    auth_context: &AuthContext,
+    options: &PaymentMiddlewareOptions<F>,
+    session_storage: &S,
+    session: &AuthSession,
+) -> Result<PaymentResult>
+where
+    F: Fn(&Request) -> u64,
+    S: SessionStorage + ?Sized,
+{
+    let payment_header = req.headers().get(payment_headers::PAYMENT).ok().flatten();
+    let decision = decide_payment(
+        auth_context,
+        || (options.calculate_price)(req),
+        payment_header,
+        &options.server_private_key,
+        Some(session_storage),
+        |derivation_prefix, derivation_suffix, tx_bytes| async move {
+            internalize_payment(
+                options,
+                auth_context,
+                &derivation_prefix,
+                &derivation_suffix,
+                tx_bytes,
+            )
+            .await
+        },
+    )
+    .await?;
+    decision_into_result_signed(decision, session)
 }
 
 /// Shared implementation. `nonce_store: None` = legacy stateless behavior
@@ -509,6 +564,95 @@ fn decision_into_result(decision: PaymentDecision) -> Result<PaymentResult> {
     }
 }
 
+/// [`decision_into_result`] with every built response BRC-104-signed
+/// against the caller's [`AuthSession`]. Free/Verified variants carry no
+/// response and pass through untouched.
+fn decision_into_result_signed(
+    decision: PaymentDecision,
+    session: &AuthSession,
+) -> Result<PaymentResult> {
+    let signed_failed = |status: u16, code: &str, description: &str| -> Result<PaymentResult> {
+        let response =
+            sign_json_response(&ErrorResponse::new(code, description), status, &[], session)?;
+        Ok(PaymentResult::Failed(response))
+    };
+    match decision {
+        PaymentDecision::Misconfigured => signed_failed(
+            500,
+            "ERR_SERVER_MISCONFIGURED",
+            "The payment middleware must be executed after the Auth middleware.",
+        ),
+        PaymentDecision::Free => Ok(PaymentResult::Free),
+        PaymentDecision::Challenge {
+            price,
+            derivation_prefix,
+        } => {
+            let body = serde_json::json!({
+                "status": "error",
+                "code": "ERR_PAYMENT_REQUIRED",
+                "satoshisRequired": price,
+                "description": "A BSV payment is required to complete this request. Provide the X-BSV-Payment header."
+            });
+            let response = sign_json_response(
+                &body,
+                402,
+                &challenge_header_pairs(price, &derivation_prefix),
+                session,
+            )?;
+            Ok(PaymentResult::Required(response))
+        }
+        PaymentDecision::MalformedHeader => signed_failed(
+            400,
+            "ERR_MALFORMED_PAYMENT",
+            "The X-BSV-Payment header is not valid JSON.",
+        ),
+        PaymentDecision::InvalidPrefix => signed_failed(
+            400,
+            "ERR_INVALID_DERIVATION_PREFIX",
+            "The X-BSV-Payment-Derivation-Prefix header is not valid.",
+        ),
+        PaymentDecision::ReplayedPrefix => signed_failed(
+            400,
+            "ERR_INVALID_DERIVATION_PREFIX",
+            "The X-BSV-Payment-Derivation-Prefix header is not valid (already used).",
+        ),
+        PaymentDecision::WalletRejected {
+            price,
+            fresh_prefix,
+        } => {
+            let response = sign_json_response(
+                &ErrorResponse::new(
+                    "ERR_PAYMENT_FAILED",
+                    "The BSV payment was not accepted by the wallet. A fresh payment challenge is provided in the response headers.",
+                ),
+                402,
+                &challenge_header_pairs(price, &fresh_prefix),
+                session,
+            )?;
+            Ok(PaymentResult::Failed(response))
+        }
+        PaymentDecision::InternalizeError { description } => {
+            signed_failed(400, "ERR_PAYMENT_FAILED", &description)
+        }
+        PaymentDecision::Verified { price, tx } => Ok(PaymentResult::Verified(PaymentContext {
+            satoshis_paid: price,
+            accepted: true,
+            tx: Some(tx),
+        })),
+    }
+}
+
+/// [`challenge_headers`] as owned pairs — the shape [`sign_json_response`]
+/// takes (and signs: `x-bsv-payment-*` headers are in the signable set).
+fn challenge_header_pairs(price: u64, derivation_prefix: &str) -> Vec<(String, String)> {
+    vec![
+        (payment_headers::VERSION.to_string(), PAYMENT_VERSION.to_string()),
+        (payment_headers::SATOSHIS_REQUIRED.to_string(), price.to_string()),
+        (payment_headers::DERIVATION_PREFIX.to_string(), derivation_prefix.to_string()),
+        (payment_headers::TRANSPORTS.to_string(), "header,multipart".to_string()),
+    ]
+}
+
 /// The BRC-29 payment-challenge header set (402 responses, both the
 /// no-payment challenge and the wallet-rejected fresh challenge).
 fn challenge_headers(price: u64, derivation_prefix: &str) -> Headers {
@@ -580,7 +724,31 @@ async fn internalize_payment<F>(
     //     outputs: [{ paymentRemittance: { derivationPrefix, derivationSuffix, senderIdentityKey }, outputIndex: 0, protocol: 'wallet payment' }],
     //     description: 'Payment for request'
     //   })
-    let args_json = serde_json::json!({
+    let args_json = internalize_args(
+        &tx_bytes,
+        derivation_prefix,
+        derivation_suffix,
+        &auth_context.identity_key,
+        options.labels.as_ref(),
+    );
+
+    storage_client
+        .internalize_action(auth_json, args_json)
+        .await
+}
+
+/// The `internalizeAction` args for a verified payment — pure so the wire
+/// shape (incl. the labels key) is unit-testable. Labels ride top-level
+/// (the shape wallet storage persists and `listActions({labels})` filters
+/// on); `None` omits the key entirely (bit-compatible pre-labels shape).
+fn internalize_args(
+    tx_bytes: &[u8],
+    derivation_prefix: &str,
+    derivation_suffix: &str,
+    sender_identity_key: &str,
+    labels: Option<&Vec<String>>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({
         "tx": tx_bytes,
         "outputs": [{
             "outputIndex": 0,
@@ -588,16 +756,16 @@ async fn internalize_payment<F>(
             "paymentRemittance": {
                 "derivationPrefix": derivation_prefix,
                 "derivationSuffix": derivation_suffix,
-                "senderIdentityKey": auth_context.identity_key
+                "senderIdentityKey": sender_identity_key
             },
             "insertionRemittance": null
         }],
         "description": "Payment for request"
     });
-
-    storage_client
-        .internalize_action(auth_json, args_json)
-        .await
+    if let Some(labels) = labels {
+        args["labels"] = serde_json::json!(labels);
+    }
+    args
 }
 
 /// Whether an `internalizeAction` response affirmatively accepted the payment.
@@ -638,6 +806,37 @@ mod tests {
     use bsv_sdk::primitives::PrivateKey;
 
     const TEST_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    // ===========================================
+    // Labels hook + internalize args wire shape
+    // ===========================================
+
+    #[test]
+    fn internalize_args_without_labels_omits_the_key_entirely() {
+        let args = internalize_args(&[1u8, 2, 3], "prefix-b64", "suffix-b64", "02abc", None);
+        assert!(args.get("labels").is_none(), "labels key must be absent, not null");
+        let pr = &args["outputs"][0]["paymentRemittance"];
+        assert_eq!(pr["derivationPrefix"], "prefix-b64");
+        assert_eq!(pr["derivationSuffix"], "suffix-b64");
+        assert_eq!(pr["senderIdentityKey"], "02abc");
+        assert_eq!(args["outputs"][0]["protocol"], "wallet payment");
+        assert_eq!(args["description"], "Payment for request");
+    }
+
+    #[test]
+    fn internalize_args_with_labels_rides_them_top_level() {
+        let labels = vec!["beacon read-fee".to_string()];
+        let args = internalize_args(&[1u8], "p", "s", "02abc", Some(&labels));
+        assert_eq!(args["labels"], serde_json::json!(["beacon read-fee"]));
+    }
+
+    #[test]
+    fn with_labels_builder_sets_labels_and_defaults_are_none() {
+        let opts = PaymentMiddlewareOptions::new("key".to_string(), |_req: &Request| 1u64);
+        assert!(opts.labels.is_none(), "labels default to None (pre-labels wire shape)");
+        let opts = opts.with_labels(vec!["beacon donation".to_string()]);
+        assert_eq!(opts.labels.as_deref(), Some(&["beacon donation".to_string()][..]));
+    }
 
     // ===========================================
     // Payment header constant tests
