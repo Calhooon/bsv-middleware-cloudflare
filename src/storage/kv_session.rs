@@ -6,6 +6,94 @@ use crate::types::StoredSession;
 use async_trait::async_trait;
 use worker::kv::KvStore;
 
+/// Attempts (1 initial + retries) for a KV op on the hot auth path before giving
+/// up. Bounded so a genuinely-down KV fails fast (≤ ~150 ms of added backoff)
+/// rather than hanging the request.
+const KV_ATTEMPTS: u32 = 3;
+
+/// Classify a KV failure as a *transient* infra blip that is safe to retry.
+///
+/// The auth hot path (`get_session`, `try_consume_nonce`) does a KV READ and,
+/// for the replay guard, a KV WRITE on **every** authenticated request. Under a
+/// request burst these intermittently fail with a transient fault — a generic
+/// "network connection lost" / "storage … reset" / "internal error", or a
+/// namespace/account throttle (429) — that succeeds on an immediate retry. This
+/// is the KV analogue of the D1 cold-start blip the consuming relay already
+/// retries around its `/listMessages` reads; without it a single transient KV
+/// fault surfaces as a fatal 500 on an idempotent poll (incident
+/// `INCIDENT-listmessages-500-2026-07-23`).
+///
+/// Deliberately conservative: it matches only infra/throttle markers, never a
+/// logical outcome. A "consumed" nonce is `Ok(false)` (never an `Err`) and a
+/// missing session is `Ok(None)`, so this classifier can never turn a real
+/// replay/absence into a retry.
+fn is_transient_kv_error(e: &AuthCloudflareError) -> bool {
+    let s = e.to_string().to_ascii_lowercase();
+    const TRANSIENT_MARKERS: [&str; 10] = [
+        "network connection lost",
+        "storage",
+        "reset",
+        "internal error",
+        "connection",
+        "timed out",
+        "429",
+        "too many requests",
+        "rate limit",
+        "please try again",
+    ];
+    TRANSIENT_MARKERS.iter().any(|m| s.contains(m))
+}
+
+/// Pure retry policy: given the zero-based `attempt` that just failed and its
+/// error, return `Some(backoff)` to retry, or `None` to give up and propagate.
+/// Extracted as a pure fn so the bounded-and-transient-only policy is
+/// unit-testable without a live KV or JS runtime.
+fn kv_retry_backoff(attempt: u32, err: &AuthCloudflareError) -> Option<std::time::Duration> {
+    if attempt + 1 >= KV_ATTEMPTS {
+        return None;
+    }
+    if !is_transient_kv_error(err) {
+        return None;
+    }
+    // 50 ms, 100 ms — a transient KV blip clears well within this, and total
+    // added latency on a genuine outage stays bounded (< 150 ms) before failing.
+    Some(std::time::Duration::from_millis(50u64 << attempt))
+}
+
+/// Back off between retries. On the Worker (wasm) this is a real `setTimeout`-
+/// backed `worker::Delay`; on the host test target it is a no-op (Delay needs a
+/// JS event loop), which lets the retry runner be driven under `#[tokio::test]`.
+#[cfg(target_arch = "wasm32")]
+async fn kv_backoff_sleep(d: std::time::Duration) {
+    worker::Delay::from(d).await;
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn kv_backoff_sleep(_d: std::time::Duration) {}
+
+/// Run an idempotent KV op `op` with a bounded, transient-only retry
+/// (`kv_retry_backoff`). Returns on the first success; retries a transient blip
+/// up to `KV_ATTEMPTS`; on a non-transient error (or once the bound is hit)
+/// propagates the original error unchanged.
+async fn with_kv_read_retry<T, F, Fut>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => match kv_retry_backoff(attempt, &e) {
+                Some(backoff) => {
+                    kv_backoff_sleep(backoff).await;
+                    attempt += 1;
+                }
+                None => return Err(e),
+            },
+        }
+    }
+}
+
 /// Session manager backed by Cloudflare KV.
 ///
 /// This stores session state for BRC-103/104 authenticated peers in Cloudflare KV,
@@ -51,12 +139,22 @@ impl KvSessionStorage {
     }
 
     /// Gets a session by its nonce.
+    ///
+    /// Bounded transient retry (`with_kv_read_retry`): a session lookup runs on
+    /// EVERY authenticated request, so a transient KV blip under a request burst
+    /// would otherwise surface as a fatal 500 on an idempotent read. Retrying an
+    /// idempotent GET only ever turns a blip into the correct answer — a missing
+    /// session stays `Ok(None)`, never an `Err`.
     pub async fn get_session(&self, session_nonce: &str) -> Result<Option<StoredSession>> {
         let key = self.session_key(session_nonce);
-        match self.kv.get(&key).json::<StoredSession>().await {
-            Ok(session) => Ok(session),
-            Err(e) => Err(AuthCloudflareError::KvError(e.to_string())),
-        }
+        with_kv_read_retry(|| async {
+            self.kv
+                .get(&key)
+                .json::<StoredSession>()
+                .await
+                .map_err(|e| AuthCloudflareError::KvError(e.to_string()))
+        })
+        .await
     }
 
     /// Saves a session to KV.
@@ -112,15 +210,20 @@ impl KvSessionStorage {
         &self,
         identity_key_hex: &str,
     ) -> Result<Vec<StoredSession>> {
-        // List all session nonces for this identity
+        // List all session nonces for this identity. Bounded transient retry:
+        // this is the identity-index read on the auth hot path (used when a
+        // General message omits `your_nonce`); an idempotent LIST that blips
+        // under burst must self-heal in-request, not 500.
         let prefix = format!("{}:identity:{}:", self.prefix, identity_key_hex);
-        let list = self
-            .kv
-            .list()
-            .prefix(prefix)
-            .execute()
-            .await
-            .map_err(|e| AuthCloudflareError::KvError(e.to_string()))?;
+        let list = with_kv_read_retry(|| async {
+            self.kv
+                .list()
+                .prefix(prefix.clone())
+                .execute()
+                .await
+                .map_err(|e| AuthCloudflareError::KvError(e.to_string()))
+        })
+        .await?;
 
         let mut sessions = Vec::new();
         for key in list.keys {
@@ -186,28 +289,44 @@ impl KvSessionStorage {
         let key = self.nonce_key(scope, nonce);
 
         // Read first: if the nonce is already recorded, this is a replay.
-        match self.kv.get(&key).text().await {
-            Ok(Some(_)) => return Ok(false),
-            Ok(None) => {}
-            // Fail closed: a storage fault must not silently disable replay
-            // protection.
-            Err(e) => return Err(AuthCloudflareError::KvError(e.to_string())),
+        //
+        // Bounded transient retry on BOTH the read and the write below: this
+        // runs on every authenticated request and is the KV op most exposed to
+        // a burst blip. Both halves are idempotent under retry — the GET is a
+        // pure read, and the PUT writes the same `"1"` sentinel every time — so
+        // a transient fault self-heals in-request instead of failing closed with
+        // a fatal 500. A genuine replay is still caught: it is `Ok(Some)` on the
+        // FIRST read (never an `Err`), so it never enters the retry branch, and
+        // a non-transient error still fails closed (propagated unchanged).
+        let existing = with_kv_read_retry(|| async {
+            self.kv
+                .get(&key)
+                .text()
+                .await
+                .map_err(|e| AuthCloudflareError::KvError(e.to_string()))
+        })
+        .await?;
+        if existing.is_some() {
+            return Ok(false);
         }
 
         // Record consumption. Cloudflare KV enforces a 60-second minimum
         // expiration TTL — clamp up, never down (retaining a nonce longer
         // than requested is safe; shorter is not).
-        let put = self
-            .kv
-            .put(&key, "1")
-            .map_err(|e| AuthCloudflareError::KvError(e.to_string()))?;
-        let put = match ttl_seconds {
-            Some(ttl) => put.expiration_ttl(ttl.max(60)),
-            None => put,
-        };
-        put.execute()
-            .await
-            .map_err(|e| AuthCloudflareError::KvError(e.to_string()))?;
+        with_kv_read_retry(|| async {
+            let put = self
+                .kv
+                .put(&key, "1")
+                .map_err(|e| AuthCloudflareError::KvError(e.to_string()))?;
+            let put = match ttl_seconds {
+                Some(ttl) => put.expiration_ttl(ttl.max(60)),
+                None => put,
+            };
+            put.execute()
+                .await
+                .map_err(|e| AuthCloudflareError::KvError(e.to_string()))
+        })
+        .await?;
 
         Ok(true)
     }
@@ -257,5 +376,100 @@ impl SessionStorage for KvSessionStorage {
 
     async fn release_nonce(&self, scope: &str, nonce: &str) -> Result<()> {
         KvSessionStorage::release_nonce(self, scope, nonce).await
+    }
+}
+
+#[cfg(test)]
+mod kv_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn transient() -> AuthCloudflareError {
+        AuthCloudflareError::KvError("KV GET failed: Network connection lost.".into())
+    }
+    fn throttle() -> AuthCloudflareError {
+        AuthCloudflareError::KvError("429 Too Many Requests".into())
+    }
+    // A non-transient error: a config/logic fault that must fail closed.
+    fn permanent() -> AuthCloudflareError {
+        AuthCloudflareError::ConfigError("bad key".into())
+    }
+
+    #[test]
+    fn classifier_matches_transient_and_throttle_only() {
+        assert!(is_transient_kv_error(&transient()));
+        assert!(is_transient_kv_error(&throttle()));
+        assert!(is_transient_kv_error(&AuthCloudflareError::KvError(
+            "storage caught an exception; object was reset".into()
+        )));
+        assert!(is_transient_kv_error(&AuthCloudflareError::KvError(
+            "internal error, please try again".into()
+        )));
+        // A logical config/auth fault is never retried.
+        assert!(!is_transient_kv_error(&permanent()));
+    }
+
+    #[test]
+    fn backoff_is_bounded_and_transient_only() {
+        assert_eq!(
+            kv_retry_backoff(0, &transient()),
+            Some(std::time::Duration::from_millis(50))
+        );
+        assert_eq!(
+            kv_retry_backoff(1, &throttle()),
+            Some(std::time::Duration::from_millis(100))
+        );
+        // Bound reached → give up (no unbounded loop).
+        assert_eq!(kv_retry_backoff(KV_ATTEMPTS - 1, &transient()), None);
+        // Non-transient → never retried, even on the first attempt (fail closed).
+        assert_eq!(kv_retry_backoff(0, &permanent()), None);
+    }
+
+    // Unit-level analogue of "a burst KV blip self-heals to success in-request".
+    #[tokio::test]
+    async fn read_recovers_after_one_transient_failure() {
+        let calls = Cell::new(0u32);
+        let out: Result<i64> = with_kv_read_retry(|| {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n == 1 {
+                    Err(transient())
+                } else {
+                    Ok(7_i64)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls.get(), 2, "failed once, succeeded on the retry");
+    }
+
+    #[tokio::test]
+    async fn read_gives_up_after_bound_on_persistent_transient() {
+        let calls = Cell::new(0u32);
+        let out: Result<i64> = with_kv_read_retry(|| {
+            calls.set(calls.get() + 1);
+            async move { Err::<i64, _>(transient()) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls.get(), KV_ATTEMPTS, "bounded, no unbounded loop");
+    }
+
+    #[tokio::test]
+    async fn read_does_not_retry_non_transient_error() {
+        let calls = Cell::new(0u32);
+        let out: Result<i64> = with_kv_read_retry(|| {
+            calls.set(calls.get() + 1);
+            async move { Err::<i64, _>(permanent()) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(
+            calls.get(),
+            1,
+            "fail closed immediately on a non-transient error"
+        );
     }
 }
