@@ -118,6 +118,23 @@ Known production consumers using BRC-103/104 auth + dynamic pricing + optional r
 
 Dual-licensed under MIT or Apache-2.0 at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
+## Session lane (0.3.4, opt-in)
+
+One BRC-103/104 handshake per origin, then a LANE: `process_auth_lane(req, &env, &options, "AUTH_SESSION_STORE")`
+serves calls that carry `x-low-session` (the lane id), `x-low-session-identity`, `x-low-session-n` (the client's
+counter) and `x-low-session-mac` (`HMAC-SHA256(K, n ‖ "METHOD path?query" ‖ 0x00 ‖ sha256(body))`) with ZERO wallet
+calls and one Durable Object round trip, and answers `LaneAuthResult::Laned { context, request, body, lane }`;
+everything else is `LaneAuthResult::Reference(AuthResult)`, the unchanged reference outcome. A handshake POST that
+carries the client's explicit ask (`x-low-lane-ask`) on a server with `options.session_lane = Some(..)` is answered
+with one extra `InitialResponse` field, `session {id, expiresAt, salt, ask}`, that a reference client ignores; both
+sides derive `K = HMAC-SHA256(salt, label ‖ id ‖ clientInitialNonce ‖ serverSessionNonce)`. Seal a laned answer with
+`seal_lane_response(&value, status, &lane)` (`x-low-session-n`, `x-low-session-mac`, `no-store`). Refusals are
+401 `{status:"error", code:"ERR_SESSION_REFUSED", reason}` (`unknown-session` / `expired` / `replay` / `bad-mac` /
+`malformed`; 503 `lane-unavailable` when the store cannot be asked). The KV backend keeps no lanes (never offers
+one, answers a laned call 503 `lane-unsupported`). The pure rules live in `middleware::session_lane`; the MAC
+vectors are `tests/fixtures/session_lane.vectors.json` (emitted by the module's own test, sha256-pinned; a client
+pins the same bytes). Designed for bsv-low (#441, register row D12: the relay's D10 lane generalized).
+
 ## Session storage backends
 
 - **KV (default)** — `process_auth(req, &env, &options)`: sessions and the per-request nonce replay guard in the `AUTH_SESSIONS` KV namespace (a read, and a read + write, per authenticated request).

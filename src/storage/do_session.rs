@@ -48,8 +48,9 @@
 //! the object and the client are thin shells over them.
 
 use crate::error::{AuthCloudflareError, Result};
+use crate::middleware::session_lane::{hex32, HttpCall, LaneRecord, Refusal, LANE_IDLE_MS};
 use crate::storage::kv_session::KvSessionStorage;
-use crate::storage::session_storage::SessionStorage;
+use crate::storage::session_storage::{LaneVerdict, LaneVerifyAsk, SessionStorage};
 use crate::types::{current_time_ms, StoredSession};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -69,12 +70,67 @@ pub struct SessionCell {
     pub expires_at_ms: u64,
     /// Consumed per-request nonces → their expiry (ms since the epoch).
     pub consumed: HashMap<String, u64>,
+    /// Session lane (0.3.4): an object keyed by a LANE id holds the lane here
+    /// and never a session; a session object never holds a lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneRecord>,
 }
 
 impl SessionCell {
     /// Whether the cell holds nothing live at `now_ms` (absent or expired).
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        self.session.is_none() || now_ms >= self.expires_at_ms
+        (self.session.is_none() && self.lane.is_none()) || now_ms >= self.expires_at_ms
+    }
+
+    /// Session lane: store a minted lane; the cell's window becomes the lane's.
+    pub fn lane_put(&mut self, lane: LaneRecord) {
+        self.expires_at_ms = lane.expires_at_ms;
+        self.lane = Some(lane);
+    }
+
+    /// Session lane: verify one laned call against the held lane
+    /// (`session_lane::LaneRecord::verify_http`; `idle_ms` refreshes the window
+    /// on success). An object without a lane, or whose lane's id or identity
+    /// differs from the caller's claim, answers `unknown-session` — the id is
+    /// the caller's word, the identity the store's.
+    pub fn lane_verify(&mut self, ask: &LaneVerifyAsk, now_ms: u64, idle_ms: u64) -> LaneVerdict {
+        let refused = |r: Refusal| LaneVerdict {
+            ok: false,
+            reason: Some(r.as_str().to_string()),
+            identity: None,
+            key: None,
+        };
+        let Some(lane) = self.lane.as_mut() else {
+            return refused(Refusal::UnknownSession);
+        };
+        if !lane.id.eq_ignore_ascii_case(&ask.id)
+            || !lane.identity.eq_ignore_ascii_case(&ask.identity)
+        {
+            return refused(Refusal::UnknownSession);
+        }
+        let Some(digest) = hex32(&ask.body_sha256) else {
+            return refused(Refusal::Malformed);
+        };
+        let call = HttpCall {
+            h: ask.h,
+            method: &ask.method,
+            path_and_query: &ask.path_and_query,
+            body_digest: &digest,
+            mac_hex: &ask.mac,
+        };
+        match lane.verify_http(&call, now_ms, idle_ms) {
+            Ok(()) => {
+                let (identity, key) = (lane.identity.clone(), lane.key.clone());
+                self.expires_at_ms = lane.expires_at_ms; // the object lives exactly as long as its lane
+                LaneVerdict {
+                    ok: true,
+                    reason: None,
+                    identity: Some(identity),
+                    key: Some(key),
+                }
+            }
+            Err(r) => refused(r),
+        }
     }
 
     /// The live session, or `None` when absent or expired.
@@ -179,6 +235,20 @@ pub struct NonceBody {
 }
 
 /// `POST /consume` answer.
+/// `PUT /lane` — the minted lane, stored under its id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LanePutBody {
+    pub lane: LaneRecord,
+}
+
+/// `POST /lane-verify` — one laned call to judge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaneVerifyBody {
+    pub ask: LaneVerifyAsk,
+    #[serde(default)]
+    pub idle_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConsumeAnswer {
     pub fresh: bool,
@@ -290,6 +360,31 @@ impl DurableObject for AuthSessionStore {
                 Ok(Response::empty()?.with_status(204))
             }
             (Method::Delete, "/session") => {
+                let _ = self.state.storage().delete_all().await;
+                Ok(Response::empty()?.with_status(204))
+            }
+            // Session lane (0.3.4): the object keyed by the LANE id.
+            (Method::Put, "/lane") => {
+                let body: LanePutBody = req.json().await?;
+                cell.lane_put(body.lane);
+                self.store(&cell)
+                    .await
+                    .map_err(|e| worker::Error::from(e.to_string()))?;
+                self.arm_gc(cell.expires_at_ms).await;
+                Ok(Response::empty()?.with_status(204))
+            }
+            (Method::Post, "/lane-verify") => {
+                let body: LaneVerifyBody = req.json().await?;
+                let verdict =
+                    cell.lane_verify(&body.ask, now, body.idle_ms.unwrap_or(LANE_IDLE_MS));
+                if verdict.ok {
+                    self.store(&cell)
+                        .await
+                        .map_err(|e| worker::Error::from(e.to_string()))?;
+                }
+                json_status(&verdict, 200)
+            }
+            (Method::Delete, "/lane") => {
                 let _ = self.state.storage().delete_all().await;
                 Ok(Response::empty()?.with_status(204))
             }
@@ -546,6 +641,42 @@ impl SessionStorage for DoSessionStorage {
             }
         }
     }
+
+    async fn lane_put(&self, lane: &LaneRecord) -> Result<bool> {
+        let body = serde_json::to_string(&LanePutBody { lane: lane.clone() })
+            .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+        let res = self
+            .call(&lane.id, Method::Put, "/lane", Some(body))
+            .await?;
+        if res.status_code() != 204 {
+            return Err(AuthCloudflareError::KvError(format!(
+                "auth-session-store lane put: status {}",
+                res.status_code()
+            )));
+        }
+        Ok(true)
+    }
+
+    async fn lane_verify(&self, ask: &LaneVerifyAsk) -> Result<Option<LaneVerdict>> {
+        let body = serde_json::to_string(&LaneVerifyBody {
+            ask: ask.clone(),
+            idle_ms: Some(LANE_IDLE_MS),
+        })
+        .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+        let mut res = self
+            .call(&ask.id, Method::Post, "/lane-verify", Some(body))
+            .await?;
+        if res.status_code() != 200 {
+            return Err(AuthCloudflareError::KvError(format!(
+                "auth-session-store lane verify: status {}",
+                res.status_code()
+            )));
+        }
+        let verdict: LaneVerdict = res.json().await.map_err(|e| {
+            AuthCloudflareError::KvError(format!("auth-session-store lane verify body: {e}"))
+        })?;
+        Ok(Some(verdict))
+    }
 }
 
 /// `now` for callers outside a Worker request (tests); the object itself reads
@@ -572,6 +703,114 @@ mod tests {
             created_at: 1,
             last_update: 1,
         }
+    }
+
+    fn lane(id: &str, identity: &str, key: &str, expires_at_ms: u64) -> LaneRecord {
+        LaneRecord {
+            id: id.to_string(),
+            key: key.to_string(),
+            identity: identity.to_string(),
+            expires_at_ms,
+            last_h: 0,
+            seen_mask: 0,
+        }
+    }
+
+    fn lane_ask(l: &LaneRecord, h: u64, method: &str, path: &str, body: &str) -> LaneVerifyAsk {
+        use crate::middleware::session_lane::{frame_mac, http_event};
+        let key = hex32(&l.key).unwrap();
+        LaneVerifyAsk {
+            id: l.id.clone(),
+            identity: l.identity.clone(),
+            h,
+            method: method.to_string(),
+            path_and_query: path.to_string(),
+            body_sha256: hex::encode(crate::middleware::session_lane::body_digest(
+                body.as_bytes(),
+            )),
+            mac: hex::encode(frame_mac(&key, h, &http_event(method, path), body)),
+        }
+    }
+
+    #[test]
+    fn a_lane_object_holds_no_session_serves_its_lane_and_lives_by_the_lanes_window() {
+        let key = "3189aaa50e7da56072898a9fb1c62af598b6d69f12c300f907b8c85b74d7dca4";
+        let id = "ab".repeat(32);
+        let identity = "02".repeat(33);
+        let mut c = SessionCell::default();
+        assert!(c.is_expired(1_000), "an empty cell is expired");
+        c.lane_put(lane(&id, &identity, key, 5_000_000));
+        assert!(!c.is_expired(1_000), "a lane keeps the object alive");
+        assert!(c.get(1_000).is_none(), "a lane object answers no session");
+        assert!(c.is_expired(5_000_000), "…until the lane's window ends");
+        let l = c.lane.clone().unwrap();
+        let ok = c.lane_verify(
+            &lane_ask(&l, 1, "GET", "/results?identity=02", ""),
+            1_000,
+            LANE_IDLE_MS,
+        );
+        assert!(ok.ok, "{ok:?}");
+        assert_eq!(ok.identity.as_deref(), Some(identity.as_str()));
+        assert_eq!(ok.key.as_deref(), Some(key));
+        assert_eq!(
+            c.expires_at_ms,
+            1_000 + LANE_IDLE_MS,
+            "a good call refreshes the object's window"
+        );
+        let replay = c.lane_verify(
+            &lane_ask(&l, 1, "GET", "/results?identity=02", ""),
+            1_000,
+            LANE_IDLE_MS,
+        );
+        assert_eq!(replay.reason.as_deref(), Some("replay"));
+        assert!(replay.key.is_none(), "a refusal never leaks the key");
+    }
+
+    #[test]
+    fn a_lane_verify_refuses_a_foreign_identity_a_foreign_id_a_missing_lane_and_a_malformed_digest()
+    {
+        let key = "3189aaa50e7da56072898a9fb1c62af598b6d69f12c300f907b8c85b74d7dca4";
+        let id = "ab".repeat(32);
+        let identity = "02".repeat(33);
+        let mut c = SessionCell::default();
+        let l = lane(&id, &identity, key, 5_000_000);
+        let none = c.lane_verify(&lane_ask(&l, 1, "GET", "/x", ""), 1_000, LANE_IDLE_MS);
+        assert_eq!(
+            none.reason.as_deref(),
+            Some("unknown-session"),
+            "no lane in the object"
+        );
+        c.lane_put(l.clone());
+        let mut foreign = lane_ask(&l, 2, "GET", "/x", "");
+        foreign.identity = "03".repeat(33);
+        assert_eq!(
+            c.lane_verify(&foreign, 1_000, LANE_IDLE_MS)
+                .reason
+                .as_deref(),
+            Some("unknown-session")
+        );
+        let mut other = lane_ask(&l, 2, "GET", "/x", "");
+        other.id = "cd".repeat(32);
+        assert_eq!(
+            c.lane_verify(&other, 1_000, LANE_IDLE_MS).reason.as_deref(),
+            Some("unknown-session")
+        );
+        let mut bad = lane_ask(&l, 2, "GET", "/x", "");
+        bad.body_sha256 = "zz".into();
+        assert_eq!(
+            c.lane_verify(&bad, 1_000, LANE_IDLE_MS).reason.as_deref(),
+            Some("malformed")
+        );
+        assert_eq!(c.lane.as_ref().unwrap().last_h, 0, "nothing accepted");
+        let good = lane_ask(&l, 2, "GET", "/x", "");
+        assert!(c.lane_verify(&good, 1_000, LANE_IDLE_MS).ok);
+        let session_json = serde_json::to_string(&c).unwrap();
+        assert!(
+            session_json.contains("\"lane\""),
+            "the lane persists in the cell"
+        );
+        let empty = serde_json::to_string(&SessionCell::default()).unwrap();
+        assert!(!empty.contains("lane"), "an old cell serializes as before");
     }
 
     #[test]

@@ -125,6 +125,49 @@ pub trait SessionStorage {
     ) -> Result<Option<(Option<StoredSession>, bool)>> {
         Ok(None)
     }
+
+    /// Session lane (0.3.4, `middleware::session_lane`): store a freshly
+    /// minted lane under its id. `Ok(false)` = this backend keeps no lanes
+    /// (the KV default): the handshake then offers none.
+    async fn lane_put(&self, _lane: &LaneRecord) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Session lane: verify one laned call against the stored lane (the
+    /// counter window, the MAC, the idle refresh), answering the verdict and,
+    /// on success, the lane's key so the caller can seal its answer.
+    /// `Ok(None)` = this backend keeps no lanes.
+    async fn lane_verify(&self, _ask: &LaneVerifyAsk) -> Result<Option<LaneVerdict>> {
+        Ok(None)
+    }
+}
+
+pub use crate::middleware::session_lane::LaneRecord;
+
+/// One laned call, as the door read it (the body already digested).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneVerifyAsk {
+    pub id: String,
+    pub identity: String,
+    pub h: u64,
+    pub method: String,
+    pub path_and_query: String,
+    pub body_sha256: String,
+    pub mac: String,
+}
+
+/// The store's answer to a `lane_verify`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneVerdict {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// In-memory [`SessionStorage`] test double, shared by the trait-contract

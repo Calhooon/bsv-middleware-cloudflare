@@ -9,4 +9,4 @@ pub mod session_storage;
 pub use do_session::{AuthSessionStore, DoSessionStorage};
 pub use kv_payment::KvPaymentStorage;
 pub use kv_session::KvSessionStorage;
-pub use session_storage::SessionStorage;
+pub use session_storage::{LaneVerdict, LaneVerifyAsk, SessionStorage};

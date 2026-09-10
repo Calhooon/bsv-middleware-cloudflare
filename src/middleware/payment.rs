@@ -646,10 +646,22 @@ fn decision_into_result_signed(
 /// takes (and signs: `x-bsv-payment-*` headers are in the signable set).
 fn challenge_header_pairs(price: u64, derivation_prefix: &str) -> Vec<(String, String)> {
     vec![
-        (payment_headers::VERSION.to_string(), PAYMENT_VERSION.to_string()),
-        (payment_headers::SATOSHIS_REQUIRED.to_string(), price.to_string()),
-        (payment_headers::DERIVATION_PREFIX.to_string(), derivation_prefix.to_string()),
-        (payment_headers::TRANSPORTS.to_string(), "header,multipart".to_string()),
+        (
+            payment_headers::VERSION.to_string(),
+            PAYMENT_VERSION.to_string(),
+        ),
+        (
+            payment_headers::SATOSHIS_REQUIRED.to_string(),
+            price.to_string(),
+        ),
+        (
+            payment_headers::DERIVATION_PREFIX.to_string(),
+            derivation_prefix.to_string(),
+        ),
+        (
+            payment_headers::TRANSPORTS.to_string(),
+            "header,multipart".to_string(),
+        ),
     ]
 }
 
@@ -814,7 +826,10 @@ mod tests {
     #[test]
     fn internalize_args_without_labels_omits_the_key_entirely() {
         let args = internalize_args(&[1u8, 2, 3], "prefix-b64", "suffix-b64", "02abc", None);
-        assert!(args.get("labels").is_none(), "labels key must be absent, not null");
+        assert!(
+            args.get("labels").is_none(),
+            "labels key must be absent, not null"
+        );
         let pr = &args["outputs"][0]["paymentRemittance"];
         assert_eq!(pr["derivationPrefix"], "prefix-b64");
         assert_eq!(pr["derivationSuffix"], "suffix-b64");
@@ -833,9 +848,15 @@ mod tests {
     #[test]
     fn with_labels_builder_sets_labels_and_defaults_are_none() {
         let opts = PaymentMiddlewareOptions::new("key".to_string(), |_req: &Request| 1u64);
-        assert!(opts.labels.is_none(), "labels default to None (pre-labels wire shape)");
+        assert!(
+            opts.labels.is_none(),
+            "labels default to None (pre-labels wire shape)"
+        );
         let opts = opts.with_labels(vec!["beacon donation".to_string()]);
-        assert_eq!(opts.labels.as_deref(), Some(&["beacon donation".to_string()][..]));
+        assert_eq!(
+            opts.labels.as_deref(),
+            Some(&["beacon donation".to_string()][..])
+        );
     }
 
     // ===========================================

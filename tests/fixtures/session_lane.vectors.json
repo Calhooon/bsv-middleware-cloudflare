@@ -1,0 +1,50 @@
+{
+  "ask": "a1b2c3d4e5f60718",
+  "clientNonce": "Y2xpZW50LW5vbmNlLWJhc2U2NA==",
+  "http": [
+    {
+      "body": "",
+      "h": 1,
+      "mac": "1dfcdf5674000631c09ce0d841bf4999c69f514af0f343283efa44c553c40bb9",
+      "method": "GET",
+      "path": "/results?identity=02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&limit=20",
+      "responseBody": "{\"identity\":\"02aa\",\"results\":[]}",
+      "responseMac": "a74f4306c89cc9f89db56ed3680e969b0b9c19ee2e61053dfc40031d41920178"
+    },
+    {
+      "body": "{\"scriptHex\":\"6a\"}",
+      "h": 2,
+      "mac": "8ae34e6464b4b1f853c7e13f2c2d23ca67f58d7e5f408021d92cbe80e8f95e86",
+      "method": "POST",
+      "path": "/record?kind=result&identity=02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "responseBody": "{\"filed\":true,\"txid\":\"filed:00\"}",
+      "responseMac": "2ec57411d5b60511ea0bf5ba780660ee1684f539a1f0b121be886640aae8c140"
+    },
+    {
+      "body": "",
+      "h": 3,
+      "mac": "301fd7cb225bbd1b8127999e40d3069205ee87db1e482fdaa3d0ddc9dc5b719d",
+      "method": "GET",
+      "path": "/cases?o=ab:0,cd:1",
+      "responseBody": "{\"cases\":[],\"unknown\":[]}",
+      "responseMac": "169b03cb0873d2e25ff496ed564291368c7e067ba8b590c8cd8c9fb00dbcbf84"
+    },
+    {
+      "body": "{\"v\":1}",
+      "h": 18446744073709551615,
+      "mac": "13ddc84d5b969d9438879ffc78de9b19c91efb135a0f65081067c5c02df053a8",
+      "method": "POST",
+      "path": "/proof?identity=02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "responseBody": "{\"ok\":true}",
+      "responseMac": "fb12785749c9e5a5b23c65c5d0fa30045e164bcb67620f3e7ef17c2e706d357e"
+    }
+  ],
+  "id": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc",
+  "identity": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idleMs": 3600000,
+  "key": "fea55886c05dac0d28a22417edef6a2f250ff9c20b807fe9dfb00017c283d7ef",
+  "label": "low-session-lane/v1",
+  "producer": "bsv-middleware-cloudflare src/middleware/session_lane.rs emit_session_lane_vectors (fixed inputs; regenerate, never retype)",
+  "salt": "e3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bc",
+  "serverNonce": "c2VydmVyLW5vbmNlLWJhc2U2NA=="
+}

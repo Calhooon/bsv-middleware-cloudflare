@@ -83,6 +83,11 @@ pub struct AuthMiddlewareOptions {
     #[allow(clippy::type_complexity)]
     pub on_certificates_received:
         Option<Box<dyn Fn(String, Vec<VerifiableCertificate>) + Send + Sync>>,
+    /// Session lane (0.3.4, `middleware::session_lane`): when set, a handshake
+    /// that carries the client's explicit ask (`x-low-lane-ask`) is answered
+    /// with a lane offer, and `process_auth_lane*` serves laned calls. `None`
+    /// (the default) = the reference behaviour byte-for-byte.
+    pub session_lane: Option<SessionLaneOptions>,
 }
 
 impl Default for AuthMiddlewareOptions {
@@ -93,8 +98,55 @@ impl Default for AuthMiddlewareOptions {
             certificates_to_request: None,
             session_ttl_seconds: 3600,
             on_certificates_received: None,
+            session_lane: None,
         }
     }
+}
+
+/// The session lane's knobs (`AuthMiddlewareOptions::session_lane`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaneOptions {
+    /// The domain separator inside `K`'s derivation; every server on one label
+    /// shares the vectors. Default `session_lane::DEFAULT_LABEL`.
+    pub label: Vec<u8>,
+    /// The idle window a verified call refreshes. Default `session_lane::LANE_IDLE_MS`.
+    pub idle_ms: u64,
+}
+
+impl Default for SessionLaneOptions {
+    fn default() -> Self {
+        Self {
+            label: lane::DEFAULT_LABEL.to_vec(),
+            idle_ms: lane::LANE_IDLE_MS,
+        }
+    }
+}
+
+/// A verified laned call: what the door needs to bind the caller and to seal
+/// its answer (`seal_lane_response`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneAuth {
+    pub id: String,
+    /// The lane's identity (66 hex, lowercase) — the handshake's peer.
+    pub identity: String,
+    /// `K`, hex — the answer is sealed under it.
+    pub key: String,
+    /// The request's counter — the answer carries the same `h`.
+    pub h: u64,
+}
+
+/// `process_auth_lane*`'s answer. `Reference` wraps the unchanged reference
+/// outcome (a handshake reply, a BRC-104 verified request, a refusal) so an
+/// adopter's existing `match` on [`AuthResult`] keeps working.
+pub enum LaneAuthResult {
+    /// The request rode the lane: verified by the store, the body captured.
+    Laned {
+        context: AuthContext,
+        request: Request,
+        body: Vec<u8>,
+        lane: LaneAuth,
+    },
+    Reference(AuthResult),
 }
 
 /// Session info needed for signing responses.
@@ -135,6 +187,9 @@ pub enum AuthResult {
 }
 
 const ORIGINATOR: &str = "bsv-auth-cloudflare";
+
+use crate::middleware::session_lane as lane;
+use crate::storage::session_storage::LaneVerifyAsk;
 
 /// Process authentication for a Cloudflare Worker request.
 ///
@@ -204,7 +259,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
 
     // Check if this is a handshake request
     if CloudflareTransport::is_handshake_request(&req) {
-        return handle_handshake_request(req, &wallet, session_storage, options).await;
+        return handle_handshake_request(req, &wallet, session_storage, options, None).await;
     }
 
     // Check for auth headers
@@ -641,6 +696,7 @@ async fn handle_handshake_request<S: SessionStorage + ?Sized>(
     wallet: &ProtoWallet,
     session_storage: &S,
     options: &AuthMiddlewareOptions,
+    lane_ask: Option<&str>,
 ) -> Result<AuthResult> {
     // Parse the handshake message from body
     let body = req
@@ -654,7 +710,7 @@ async fn handle_handshake_request<S: SessionStorage + ?Sized>(
 
     match message.message_type {
         MessageType::InitialRequest => {
-            handle_initial_request(message, wallet, session_storage, options).await
+            handle_initial_request(message, wallet, session_storage, options, lane_ask).await
         }
         MessageType::CertificateResponse => {
             handle_certificate_response(message, wallet, session_storage, options).await
@@ -680,6 +736,7 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
     wallet: &ProtoWallet,
     session_storage: &S,
     options: &AuthMiddlewareOptions,
+    lane_ask: Option<&str>,
 ) -> Result<AuthResult> {
     let peer_identity_key = message.identity_key.to_hex();
 
@@ -737,11 +794,290 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
         let _ = headers.set(key, value);
     }
 
-    let response = Response::from_json(&response_msg)
-        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-        .with_headers(headers);
-
+    // Session lane (0.3.4): ONLY an explicit ask on a lane-enabled server
+    // mints; the offer rides the InitialResponse as one extra field the
+    // reference client ignores. K is derived from the salt, the id and the
+    // handshake's own nonces (the peer's initial nonce, our session nonce).
+    let offer = match (
+        options.session_lane.as_ref(),
+        lane_ask,
+        response_msg.your_nonce.as_deref(),
+    ) {
+        (Some(lane_opts), Some(ask), Some(client_nonce)) => {
+            mint_lane_offer(
+                session_storage,
+                lane_opts,
+                &peer_identity_key,
+                client_nonce,
+                &session_nonce,
+                ask,
+            )
+            .await
+        }
+        _ => None,
+    };
+    let response = match offer {
+        Some(offer) => {
+            let mut value = serde_json::to_value(&response_msg)
+                .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert(
+                    "session".to_string(),
+                    serde_json::to_value(&offer)
+                        .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?,
+                );
+            }
+            add_lane_cors_headers(
+                Response::from_json(&value)
+                    .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+                    .with_headers(headers),
+            )
+        }
+        None => Response::from_json(&response_msg)
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+            .with_headers(headers),
+    };
     Ok(AuthResult::Response(add_cors_headers(response)))
+}
+
+/// Mint a lane for a proven handshake and store it; `None` when the store
+/// keeps no lanes or the mint could not be stored (the reference reply stands:
+/// a lane is never owed).
+async fn mint_lane_offer<S: SessionStorage + ?Sized>(
+    session_storage: &S,
+    lane_opts: &SessionLaneOptions,
+    peer_identity_key: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    ask: &str,
+) -> Option<lane::LaneOffer> {
+    let mut random = [0u8; 64];
+    if let Err(e) = getrandom::getrandom(&mut random) {
+        worker::console_warn!("session lane: no randomness ({e}); the reference reply stands");
+        return None;
+    }
+    let (record, offer) = lane::LaneRecord::mint(
+        &lane_opts.label,
+        &lane::Handshake {
+            identity: peer_identity_key,
+            client_nonce,
+            server_nonce,
+        },
+        &random,
+        current_time_ms(),
+        lane_opts.idle_ms,
+        ask,
+    );
+    match session_storage.lane_put(&record).await {
+        Ok(true) => Some(offer),
+        Ok(false) => None,
+        Err(e) => {
+            worker::console_warn!(
+                "session lane: the store refused the mint ({e:?}); the reference reply stands"
+            );
+            None
+        }
+    }
+}
+
+/// `process_auth_lane` over the Durable Object session backend: a laned
+/// request (the `x-low-session*` headers) is verified by the lane's object and
+/// answered `Laned`; a handshake carrying `x-low-lane-ask` is answered with an
+/// offer; everything else takes [`process_auth_do`]'s path unchanged.
+pub async fn process_auth_lane(
+    req: Request,
+    env: &Env,
+    options: &AuthMiddlewareOptions,
+    do_binding: &str,
+) -> Result<LaneAuthResult> {
+    let storage =
+        crate::storage::DoSessionStorage::from_env(env, do_binding, options.session_ttl_seconds)?;
+    process_auth_lane_with_storage(req, &storage, options).await
+}
+
+/// [`process_auth_lane`] over a caller-supplied store. A store that keeps no
+/// lanes (the KV default) answers a laned call 503 `lane-unsupported` (the
+/// client falls back to the reference path) and never offers one.
+pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
+    mut req: Request,
+    session_storage: &S,
+    options: &AuthMiddlewareOptions,
+) -> Result<LaneAuthResult> {
+    let (parsed, ask_header) = {
+        let headers = req.headers();
+        let get = |name: &str| headers.get(name).ok().flatten();
+        (
+            lane::parse_lane_headers(
+                get(lane::SESSION_HEADER).as_deref(),
+                get(lane::SESSION_IDENTITY_HEADER).as_deref(),
+                get(lane::SESSION_COUNTER_HEADER).as_deref(),
+                get(lane::SESSION_MAC_HEADER).as_deref(),
+            ),
+            get(lane::LANE_ASK_HEADER),
+        )
+    };
+    let laned = match parsed {
+        Err(r) => {
+            return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                lane_refusal_response(r.as_str(), 401)?,
+            )))
+        }
+        Ok(None) => None,
+        Ok(Some(l)) => Some(l),
+    };
+    if let Some(lr) = laned {
+        let method = req.method().as_ref().to_ascii_uppercase();
+        let url = req
+            .url()
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?;
+        let path_and_query = lane::path_and_query(url.path(), url.query());
+        let body = req
+            .bytes()
+            .await
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?;
+        let ask = LaneVerifyAsk {
+            id: lr.id.clone(),
+            identity: lr.identity.clone(),
+            h: lr.h,
+            method,
+            path_and_query,
+            body_sha256: hex::encode(lane::body_digest(&body)),
+            mac: lr.mac.clone(),
+        };
+        let verdict = match session_storage.lane_verify(&ask).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                    lane_refusal_response("lane-unsupported", 503)?,
+                )))
+            }
+            Err(e) => {
+                worker::console_warn!("session lane: the store could not be asked ({e:?})");
+                return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                    lane_refusal_response("lane-unavailable", 503)?,
+                )));
+            }
+        };
+        if !verdict.ok {
+            return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                lane_refusal_response(verdict.reason.as_deref().unwrap_or("unknown-session"), 401)?,
+            )));
+        }
+        let identity = verdict.identity.unwrap_or(lr.identity).to_ascii_lowercase();
+        let key = verdict.key.unwrap_or_default();
+        return Ok(LaneAuthResult::Laned {
+            context: AuthContext::authenticated(identity.clone()),
+            request: req,
+            body,
+            lane: LaneAuth {
+                id: lr.id,
+                identity,
+                key,
+                h: lr.h,
+            },
+        });
+    }
+    if CloudflareTransport::is_handshake_request(&req) {
+        let private_key = PrivateKey::from_hex(&options.server_private_key).map_err(|e| {
+            AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
+        })?;
+        let wallet = ProtoWallet::new(Some(private_key));
+        let ask = lane::parse_ask(ask_header.as_deref());
+        return Ok(LaneAuthResult::Reference(
+            handle_handshake_request(req, &wallet, session_storage, options, ask.as_deref())
+                .await?,
+        ));
+    }
+    Ok(LaneAuthResult::Reference(
+        process_auth_with_storage(req, session_storage, options).await?,
+    ))
+}
+
+/// The lane's refusal: 401 `ERR_SESSION_REFUSED {reason}` (503 when the store
+/// could not be asked: the client falls back rather than reads "refused").
+fn lane_refusal_response(reason: &str, status: u16) -> Result<Response> {
+    let body = serde_json::json!({
+        "status": "error",
+        "code": lane::HTTP_REFUSED_CODE,
+        "reason": reason,
+        "description": format!("session lane refused: {reason}"),
+    });
+    let resp = Response::from_json(&body)
+        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+        .with_status(status);
+    let _ = resp.headers().set("Cache-Control", "no-store");
+    Ok(add_lane_cors_headers(add_cors_headers(resp)))
+}
+
+/// Seal a laned answer: the body as JSON text, `x-low-session-n` = the request's
+/// `h`, `x-low-session-mac` over it under `K`, `no-store`, the CORS lists.
+pub fn seal_lane_response<T: Serialize>(
+    data: &T,
+    status: u16,
+    auth: &LaneAuth,
+) -> Result<Response> {
+    let text = serde_json::to_string(data)
+        .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+    seal_lane_response_text(text, status, auth)
+}
+
+/// [`seal_lane_response`] for a body already serialized: the exact bytes sent
+/// are the bytes MAC'd.
+pub fn seal_lane_response_text(text: String, status: u16, auth: &LaneAuth) -> Result<Response> {
+    let mac = lane::response_mac(&auth.key, auth.h, &text).ok_or_else(|| {
+        AuthCloudflareError::ConfigError("session lane: the key is not hex".into())
+    })?;
+    let resp = Response::from_bytes(text.into_bytes())
+        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+        .with_status(status);
+    let headers = resp.headers();
+    let _ = headers.set("Content-Type", "application/json");
+    let _ = headers.set("Cache-Control", "no-store");
+    let _ = headers.set(lane::SESSION_COUNTER_HEADER, &auth.h.to_string());
+    let _ = headers.set(lane::SESSION_MAC_HEADER, &mac);
+    Ok(add_lane_cors_headers(add_cors_headers(resp)))
+}
+
+/// Append the lane's headers to the reference CORS lists (allowed on the
+/// request, exposed on the answer). Idempotent.
+pub fn add_lane_cors_headers(response: Response) -> Response {
+    let headers = response.headers();
+    let allow = headers
+        .get("Access-Control-Allow-Headers")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !allow.contains(lane::SESSION_HEADER) {
+        let _ = headers.set(
+            "Access-Control-Allow-Headers",
+            &format!(
+                "{}, {}, {}, {}, {}, {}",
+                allow,
+                lane::SESSION_HEADER,
+                lane::SESSION_IDENTITY_HEADER,
+                lane::SESSION_COUNTER_HEADER,
+                lane::SESSION_MAC_HEADER,
+                lane::LANE_ASK_HEADER
+            ),
+        );
+    }
+    let expose = headers
+        .get("Access-Control-Expose-Headers")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !expose.contains(lane::SESSION_MAC_HEADER) {
+        let _ = headers.set(
+            "Access-Control-Expose-Headers",
+            &format!(
+                "{}, {}, {}",
+                expose,
+                lane::SESSION_COUNTER_HEADER,
+                lane::SESSION_MAC_HEADER
+            ),
+        );
+    }
+    response
 }
 
 /// Handle a CertificateResponse message.
