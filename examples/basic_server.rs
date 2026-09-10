@@ -131,22 +131,18 @@ async fn handle_paid(
     // X-BSV-Payment header is rejected instead of internalized again.
     let session_storage = KvSessionStorage::new(env.kv("AUTH_SESSIONS")?, "auth", 3600);
 
-    let payment_ctx = match process_payment_with_storage(
-        &req,
-        auth,
-        &payment_options,
-        &session_storage,
-    )
-    .await
-    .map_err(|e| Error::from(e.to_string()))?
-    {
-        PaymentResult::Free => None,
-        // `Verified` now implies the wallet ACCEPTED the payment
-        // (accepted == false returns `Failed` with a 402).
-        PaymentResult::Verified(ctx) => Some(ctx),
-        PaymentResult::Required(resp) => return Ok(resp), // 402 with derivation prefix
-        PaymentResult::Failed(resp) => return Ok(resp),   // 400/402 bad or rejected payment
-    };
+    let payment_ctx =
+        match process_payment_with_storage(&req, auth, &payment_options, &session_storage)
+            .await
+            .map_err(|e| Error::from(e.to_string()))?
+        {
+            PaymentResult::Free => None,
+            // `Verified` now implies the wallet ACCEPTED the payment
+            // (accepted == false returns `Failed` with a 402).
+            PaymentResult::Verified(ctx) => Some(ctx),
+            PaymentResult::Required(resp) => return Ok(resp), // 402 with derivation prefix
+            PaymentResult::Failed(resp) => return Ok(resp),   // 400/402 bad or rejected payment
+        };
 
     let body = json!({
         "message": "Paid endpoint.",
