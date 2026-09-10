@@ -128,9 +128,9 @@ pub use client::{ClientSessionSnapshot, WorkerStorageClient};
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
     add_cors_headers, add_lane_cors_headers, process_auth, process_auth_do, process_auth_lane,
-    process_auth_lane_with_storage, process_auth_with_storage, seal_lane_response,
-    sign_json_response, sign_response, AuthMiddlewareOptions, AuthResult, AuthSession, LaneAuth,
-    LaneAuthResult, SessionLaneOptions,
+    process_auth_lane_with_storage, process_auth_with_storage, request_presents_lane,
+    seal_lane_response, seal_lane_response_text, sign_json_response, sign_response,
+    AuthMiddlewareOptions, AuthResult, AuthSession, LaneAuth, LaneAuthResult, SessionLaneOptions,
 };
 pub use middleware::multipart::prepare_multipart_payment;
 #[allow(deprecated)] // re-exported for backward compatibility

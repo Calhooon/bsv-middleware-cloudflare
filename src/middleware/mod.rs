@@ -7,8 +7,9 @@ pub mod session_lane;
 
 pub use auth::{
     add_lane_cors_headers, process_auth, process_auth_do, process_auth_lane,
-    process_auth_lane_with_storage, seal_lane_response, sign_json_response, sign_response,
-    AuthMiddlewareOptions, AuthResult, AuthSession, LaneAuth, LaneAuthResult, SessionLaneOptions,
+    process_auth_lane_with_storage, request_presents_lane, seal_lane_response, sign_json_response,
+    sign_response, AuthMiddlewareOptions, AuthResult, AuthSession, LaneAuth, LaneAuthResult,
+    SessionLaneOptions,
 };
 pub use multipart::prepare_multipart_payment;
 #[allow(deprecated)] // re-exported for backward compatibility

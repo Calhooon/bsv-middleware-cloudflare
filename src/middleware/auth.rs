@@ -993,6 +993,18 @@ pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
     ))
 }
 
+/// Whether a request presents the lane (the `x-low-session` header) — the
+/// adopter's front door counts it as an auth ATTEMPT (never silently anonymous)
+/// without reading a header itself.
+pub fn request_presents_lane(req: &Request) -> bool {
+    req.headers()
+        .get(lane::SESSION_HEADER)
+        .ok()
+        .flatten()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// The lane's refusal: 401 `ERR_SESSION_REFUSED {reason}` (503 when the store
 /// could not be asked: the client falls back rather than reads "refused").
 fn lane_refusal_response(reason: &str, status: u16) -> Result<Response> {
