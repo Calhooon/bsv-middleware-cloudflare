@@ -160,6 +160,21 @@ pub async fn process_auth(
     process_auth_with_storage(req, &session_storage, options).await
 }
 
+/// `process_auth` over the Durable Object session backend (bsv-low W-D): the
+/// session record and the replay guard live in one object per session nonce
+/// (`AuthSessionStore`, bound as `do_binding`), KV the cold path. See
+/// `storage::do_session`.
+pub async fn process_auth_do(
+    req: Request,
+    env: &Env,
+    options: &AuthMiddlewareOptions,
+    do_binding: &str,
+) -> Result<AuthResult> {
+    let storage =
+        crate::storage::DoSessionStorage::from_env(env, do_binding, options.session_ttl_seconds)?;
+    process_auth_with_storage(req, &storage, options).await
+}
+
 /// Process authentication for a Cloudflare Worker request using a caller-supplied
 /// [`SessionStorage`] backend.
 ///

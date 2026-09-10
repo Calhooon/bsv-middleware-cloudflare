@@ -114,3 +114,7 @@ Payment: `x-bsv-payment`, `x-bsv-payment-version`, `x-bsv-payment-satoshis-requi
 | BSV SDK (used for auth, wallet, transaction) | `~/bsv/bsv-rs/` (crates.io: `bsv-rs = "0.3"`) |
 | Consumer example | `~/bsv/rust-message-box/` |
 | Agent consumers | `~/bsv/agents/{banana-agent,claude-agent,...}` |
+
+## The Durable Object session backend (0.3.3)
+
+`storage/do_session.rs`: one `AuthSessionStore` object per session nonce holds the session record and the consumed per-request nonces (an atomic put-if-absent, no KV write per request); KV stays the cold path (the identity index, a KV-minted session migrated on first sight, the payment scope). Adopt with `process_auth_do(req, &env, &options, "AUTH_SESSION_STORE")`, a DO binding + migration in the worker's wrangler, and `pub use bsv_middleware_cloudflare::AuthSessionStore;` in the worker crate. The pure `SessionCell` and `route_scope` are unit-pinned.

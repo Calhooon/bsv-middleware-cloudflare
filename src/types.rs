@@ -87,7 +87,7 @@ impl ErrorResponse {
 /// Session data stored in KV.
 ///
 /// This represents the server-side session state for a BRC-103/104 authenticated peer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredSession {
     /// The session nonce (server's nonce).

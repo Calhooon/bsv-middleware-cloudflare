@@ -117,3 +117,20 @@ Known production consumers using BRC-103/104 auth + dynamic pricing + optional r
 ## License
 
 Dual-licensed under MIT or Apache-2.0 at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+## Session storage backends
+
+- **KV (default)** — `process_auth(req, &env, &options)`: sessions and the per-request nonce replay guard in the `AUTH_SESSIONS` KV namespace (a read, and a read + write, per authenticated request).
+- **Durable Objects (0.3.3, opt-in)** — `process_auth_do(req, &env, &options, "AUTH_SESSION_STORE")`: one `AuthSessionStore` object per session nonce holds the session record and the consumed nonces, so a request costs two same-colo object round trips and no KV write; KV stays the cold path (the identity → session index written at the handshake, a KV-minted session migrated on first sight, the BRC-29 payment nonce scope). Bind the class and add a migration:
+
+```toml
+[[durable_objects.bindings]]
+name = "AUTH_SESSION_STORE"
+class_name = "AuthSessionStore"
+
+[[migrations]]
+tag = "vN-auth-session-store"
+new_classes = ["AuthSessionStore"]
+```
+
+and export the class from the worker crate: `pub use bsv_middleware_cloudflare::AuthSessionStore;`. Any other store implements `SessionStorage` and goes through `process_auth_with_storage`.

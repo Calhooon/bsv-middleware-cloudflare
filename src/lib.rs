@@ -127,17 +127,18 @@ pub mod utils;
 pub use client::{ClientSessionSnapshot, WorkerStorageClient};
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
-    add_cors_headers, process_auth, process_auth_with_storage, sign_json_response, sign_response,
-    AuthMiddlewareOptions, AuthResult, AuthSession,
+    add_cors_headers, process_auth, process_auth_do, process_auth_with_storage, sign_json_response,
+    sign_response, AuthMiddlewareOptions, AuthResult, AuthSession,
 };
 pub use middleware::multipart::prepare_multipart_payment;
 #[allow(deprecated)] // re-exported for backward compatibility
 pub use middleware::payment::process_payment;
 pub use middleware::payment::{
-    add_payment_headers, payment_headers, process_payment_with_storage, process_payment_with_storage_signed,
-    PaymentMiddlewareOptions,
-    PaymentResult, PAYMENT_NONCE_SCOPE,
+    add_payment_headers, payment_headers, process_payment_with_storage,
+    process_payment_with_storage_signed, PaymentMiddlewareOptions, PaymentResult,
+    PAYMENT_NONCE_SCOPE,
 };
+pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
 pub use storage::{KvPaymentStorage, KvSessionStorage, SessionStorage};
 pub use transport::{auth_headers, CloudflareTransport, HttpRequestData, HttpResponseData};
 pub use types::{AuthContext, BsvPayment, PaymentContext};
