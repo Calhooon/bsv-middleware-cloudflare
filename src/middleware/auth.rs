@@ -249,8 +249,28 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         .as_ref()
         .or(auth_message.nonce.as_ref());
 
+    // bsv-low W-D: a backend that answers "is this session live?" and "has
+    // this request nonce been seen?" from ONE place (the Durable Object
+    // backend) answers both in one round trip here; every other backend says
+    // "unsupported" and takes the two-step path below, unchanged. The nonce
+    // is then consumed before the signature check — harmless (an
+    // unverifiable request's nonce is nobody else's) and never weaker.
+    let request_nonce_opt = auth_message.nonce.as_deref().filter(|n| !n.is_empty());
+    let mut combined_fresh: Option<bool> = None;
     let session = if let Some(nonce) = session_nonce {
-        session_storage.get_session(nonce).await?
+        match request_nonce_opt {
+            Some(rn) => match session_storage
+                .get_session_and_consume(nonce, rn, Some(options.session_ttl_seconds))
+                .await?
+            {
+                Some((s, fresh)) => {
+                    combined_fresh = Some(fresh);
+                    s
+                }
+                None => session_storage.get_session(nonce).await?,
+            },
+            None => session_storage.get_session(nonce).await?,
+        }
     } else {
         session_storage
             .get_session_by_identity(&identity_key_hex)
@@ -328,13 +348,18 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     // silently disable replay protection. Each nonce key is unique, so this
     // write cannot hit Cloudflare KV's ~1-write/sec/key limit the way the
     // (shared-key) liveness touch could.
-    let nonce_fresh = session_storage
-        .try_consume_nonce(
-            &session.session_nonce,
-            request_nonce,
-            Some(options.session_ttl_seconds),
-        )
-        .await?;
+    let nonce_fresh = match combined_fresh {
+        Some(fresh) => fresh, // consumed in the one-round-trip read above (W-D)
+        None => {
+            session_storage
+                .try_consume_nonce(
+                    &session.session_nonce,
+                    request_nonce,
+                    Some(options.session_ttl_seconds),
+                )
+                .await?
+        }
+    };
     if !nonce_fresh {
         let response = Response::from_json(&ErrorResponse::new(
             "ERR_REPLAYED_REQUEST",

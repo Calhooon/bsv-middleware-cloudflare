@@ -124,6 +124,23 @@ impl SessionCell {
     pub fn prune(&mut self, now_ms: u64) {
         self.consumed.retain(|_, exp| *exp > now_ms);
     }
+
+    /// The hot path in one step: the live session (if any) AND the
+    /// put-if-absent of the request nonce. An absent or expired cell consumes
+    /// NOTHING (`(None, false)`): a nonce is only ever burnt against a live
+    /// session. Returns whether the nonce was fresh.
+    pub fn get_and_consume(
+        &mut self,
+        nonce: &str,
+        ttl_seconds: Option<u64>,
+        now_ms: u64,
+    ) -> (Option<StoredSession>, bool) {
+        if self.is_expired(now_ms) {
+            return (None, false);
+        }
+        let fresh = self.consume(nonce, ttl_seconds, now_ms);
+        (self.session.clone(), fresh)
+    }
 }
 
 /// Where a nonce scope's put-if-absent lives.
@@ -164,6 +181,13 @@ pub struct NonceBody {
 /// `POST /consume` answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConsumeAnswer {
+    pub fresh: bool,
+}
+
+/// `POST /session-consume` answer: the hot path's two questions in one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionConsumeAnswer {
+    pub session: Option<StoredSession>,
     pub fresh: bool,
 }
 
@@ -236,6 +260,16 @@ impl DurableObject for AuthSessionStore {
                     .map_err(|e| worker::Error::from(e.to_string()))?;
                 self.arm_gc(cell.expires_at_ms).await;
                 Ok(Response::empty()?.with_status(204))
+            }
+            (Method::Post, "/session-consume") => {
+                let body: NonceBody = req.json().await?;
+                let (session, fresh) = cell.get_and_consume(&body.nonce, body.ttl_seconds, now);
+                if fresh {
+                    self.store(&cell)
+                        .await
+                        .map_err(|e| worker::Error::from(e.to_string()))?;
+                }
+                json_status(&SessionConsumeAnswer { session, fresh }, 200)
             }
             (Method::Post, "/consume") => {
                 let body: NonceBody = req.json().await?;
@@ -447,6 +481,50 @@ impl SessionStorage for DoSessionStorage {
         }
     }
 
+    async fn get_session_and_consume(
+        &self,
+        session_nonce: &str,
+        request_nonce: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<Option<(Option<StoredSession>, bool)>> {
+        let body = serde_json::to_string(&NonceBody {
+            nonce: request_nonce.to_string(),
+            ttl_seconds,
+        })?;
+        let mut resp = self
+            .call(session_nonce, Method::Post, "/session-consume", Some(body))
+            .await?;
+        if resp.status_code() != 200 {
+            return Err(AuthCloudflareError::KvError(format!(
+                "auth-session-store session-consume answered {}",
+                resp.status_code()
+            )));
+        }
+        let answer: SessionConsumeAnswer = resp.json().await.map_err(|e| {
+            AuthCloudflareError::KvError(format!("auth-session-store session-consume body: {e}"))
+        })?;
+        if answer.session.is_some() {
+            return Ok(Some((answer.session, answer.fresh)));
+        }
+        // The cold path (a KV-minted session): migrate it, then consume
+        // against its object — two more round trips, once per such session.
+        match self.kv.get_session(session_nonce).await? {
+            Some(s) => {
+                if let Err(e) = self.do_put(&s).await {
+                    console_warn!(
+                        "auth-session-store: migrating a KV session failed (non-fatal): {e:?}"
+                    );
+                    return Ok(None); // unsupported for this call: the two-step path decides
+                }
+                let fresh = self
+                    .try_consume_nonce(session_nonce, request_nonce, ttl_seconds)
+                    .await?;
+                Ok(Some((Some(s), fresh)))
+            }
+            None => Ok(Some((None, false))),
+        }
+    }
+
     async fn release_nonce(&self, scope: &str, nonce: &str) -> Result<()> {
         match route_scope(scope) {
             ScopeRoute::Kv => self.kv.release_nonce(scope, nonce).await,
@@ -553,6 +631,40 @@ mod tests {
             5_000 + 3_600_000,
             "the update extended the life"
         );
+    }
+
+    /// The one-round-trip hot path: a live session answers (Some, fresh) then
+    /// (Some, replayed); an absent or expired cell answers (None, false) and
+    /// burns NOTHING.
+    #[test]
+    fn get_and_consume_answers_both_questions_and_burns_nothing_on_a_dead_cell() {
+        let mut c = SessionCell::default();
+        assert_eq!(c.get_and_consume("r1", Some(60), 5), (None, false));
+        assert!(c.consumed.is_empty(), "nothing burnt on an absent cell");
+        c.save(session("n1"), 3_600, 0);
+        let (s, fresh) = c.get_and_consume("r1", Some(60), 5);
+        assert_eq!(s.as_ref().map(|s| s.session_nonce.as_str()), Some("n1"));
+        assert!(fresh);
+        let (s, fresh) = c.get_and_consume("r1", Some(60), 6);
+        assert!(s.is_some());
+        assert!(
+            !fresh,
+            "the replay is refused with the session still served"
+        );
+        let (s, fresh) = c.get_and_consume("r2", Some(60), 3_600_000);
+        assert_eq!(
+            (s, fresh),
+            (None, false),
+            "expired: nothing served, nothing burnt"
+        );
+        assert!(!c.consumed.contains_key("r2"));
+        let answer = SessionConsumeAnswer {
+            session: Some(session("n1")),
+            fresh: true,
+        };
+        let back: SessionConsumeAnswer =
+            serde_json::from_str(&serde_json::to_string(&answer).unwrap()).unwrap();
+        assert_eq!(back, answer);
     }
 
     #[test]

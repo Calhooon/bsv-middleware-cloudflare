@@ -106,6 +106,25 @@ pub trait SessionStorage {
     /// grants replay value — a released nonce still has to pass full
     /// verification and wallet internalization again to be of any use.
     async fn release_nonce(&self, scope: &str, nonce: &str) -> Result<()>;
+
+    /// The hot path's two questions — "is this session live?" and "has this
+    /// request nonce been seen?" — in ONE storage round trip, for a backend
+    /// that can answer both from one place (the Durable Object backend,
+    /// bsv-low W-D). The default says "not supported" (`None`) and the
+    /// middleware falls back to `get_session` then `try_consume_nonce`, in
+    /// that order, so a backend that does not override this is byte-for-byte
+    /// unchanged. An override consumes the request nonce BEFORE the signature
+    /// is verified: harmless (an unverifiable request's nonce is nobody
+    /// else's) and it never weakens the replay refusal. `Some((None, _))` =
+    /// no such live session (nothing consumed).
+    async fn get_session_and_consume(
+        &self,
+        _session_nonce: &str,
+        _request_nonce: &str,
+        _ttl_seconds: Option<u64>,
+    ) -> Result<Option<(Option<StoredSession>, bool)>> {
+        Ok(None)
+    }
 }
 
 /// In-memory [`SessionStorage`] test double, shared by the trait-contract
@@ -220,6 +239,21 @@ impl SessionStorage for MemorySessionStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bsv-low W-D: a backend that does not override the combined hot-path
+    /// call answers "not supported", and the middleware keeps its two-step
+    /// order (`get_session`, then `try_consume_nonce`) for it.
+    #[test]
+    fn the_combined_hot_path_call_is_unsupported_by_default() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let store = MemorySessionStorage::default();
+        let r = rt
+            .block_on(store.get_session_and_consume("s", "r", Some(60)))
+            .unwrap();
+        assert!(r.is_none());
+    }
 
     /// Compile-time check: the trait must stay object safe so middleware can
     /// take `&dyn SessionStorage`.
