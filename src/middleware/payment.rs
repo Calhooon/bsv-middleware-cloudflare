@@ -935,8 +935,11 @@ mod tests {
 
         let nonce = create_nonce(&wallet, None, ORIGINATOR).await.unwrap();
 
-        // Tamper with the nonce
-        let tampered = format!("x{}", &nonce[1..]);
+        // Tamper with the nonce — with a byte that DIFFERS from the original's
+        // first (a fixed "x" equalled the original one run in sixty-four: the
+        // 2026-09-14 flake, "zero flakiness is a bug").
+        let first = nonce.as_bytes()[0] as char;
+        let tampered = format!("{}{}", if first == 'x' { 'y' } else { 'x' }, &nonce[1..]);
 
         let valid = verify_nonce(&tampered, &wallet, None, ORIGINATOR)
             .await

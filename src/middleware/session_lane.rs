@@ -3,7 +3,9 @@
 //!
 //! One BRC-103/104 handshake per origin and tab, then a LANE: when the
 //! handshake POST carries the client's explicit ask (`x-low-lane-ask`), the
-//! `InitialResponse` additionally carries `session {id, expiresAt, salt, ask}`
+//! answer to the client's FIRST BRC-104-signed general message carries the offer
+//! header (`x-bsv-lane-offer`, base64 JSON `{id, expiresAt, salt, ask}`; the
+//! `InitialResponse` never offers — the initialRequest is unsigned)
 //! (one field a reference client ignores). Both sides derive one secret `K`
 //! from the salt, the id and the handshake's own nonces (the request's
 //! `initialNonce`, the response's `nonce`); `K` never crosses the wire. Every
@@ -42,6 +44,19 @@ pub const SESSION_COUNTER_HEADER: &str = "x-low-session-n";
 pub const SESSION_MAC_HEADER: &str = "x-low-session-mac";
 /// The handshake POST's explicit ask (D10: only an explicit ask mints).
 pub const LANE_ASK_HEADER: &str = "x-low-lane-ask";
+/// The OFFER's carrier: a header on the answer to the client's FIRST
+/// BRC-104-SIGNED general message that carried the ask — base64 of the
+/// offer's JSON. Named in the `x-bsv-` namespace (not `x-bsv-auth-`) on
+/// purpose: the reference signs exactly those response headers, so the
+/// offer rides under the server's identity signature and the client's own
+/// verification covers it. The handshake's `InitialResponse` never offers:
+/// the initialRequest is unsigned, its identity a claim (the 2026-09-14 gate
+/// HIGH-1); a lane binds a PROVEN identity only.
+pub const LANE_OFFER_HEADER: &str = "x-bsv-lane-offer";
+/// A lane's absolute lifetime from its mint, refreshes or not (the idle
+/// window is the short bound; this is the long one: a stolen K + id is
+/// worthless past it whatever the traffic).
+pub const LANE_MAX_LIFETIME_MS: u64 = 12 * 60 * 60 * 1000;
 /// The event name a sealed answer is MAC'd under.
 pub const HTTP_RESPONSE_EVENT: &str = "response";
 /// The refusal's `code` (401), `reason` carries the word.
@@ -64,6 +79,10 @@ pub struct LaneRecord {
     /// Bit `k` set ⇔ `last_h - k` was accepted (k < 64).
     #[serde(default)]
     pub seen_mask: u64,
+    /// When the lane was minted (ms); the absolute lifetime counts from here.
+    /// A record without one (pre-lifetime) reads as minted at 0: expired.
+    #[serde(default)]
+    pub minted_at_ms: u64,
 }
 
 /// What the `InitialResponse` carries when the client asked.
@@ -242,6 +261,7 @@ impl LaneRecord {
             expires_at_ms,
             last_h: 0,
             seen_mask: 0,
+            minted_at_ms: now_ms,
         };
         let offer = LaneOffer {
             id: record.id.clone(),
@@ -266,7 +286,9 @@ impl LaneRecord {
         idle_ms: u64,
     ) -> Result<(), Refusal> {
         let h = call.h;
-        if now_ms > self.expires_at_ms {
+        if now_ms > self.expires_at_ms
+            || now_ms > self.minted_at_ms.saturating_add(LANE_MAX_LIFETIME_MS)
+        {
             return Err(Refusal::Expired);
         }
         if h == 0 || !self.counter_is_fresh(h) {
@@ -374,6 +396,27 @@ pub fn parse_ask(header: Option<&str>) -> Option<String> {
         return None;
     }
     Some(a.to_string())
+}
+
+/// The offer as its header carries it: base64 (standard, padded) of the JSON.
+pub fn offer_header_value(offer: &LaneOffer) -> String {
+    let json = serde_json::to_string(offer).unwrap_or_default();
+    bsv_sdk::primitives::to_base64(json.as_bytes())
+}
+
+/// The inverse of [`offer_header_value`]; `None` for anything malformed.
+pub fn parse_offer_header(value: Option<&str>) -> Option<LaneOffer> {
+    let raw = value?.trim();
+    if raw.is_empty() || raw.len() > 1024 {
+        return None;
+    }
+    let bytes = bsv_sdk::primitives::from_base64(raw).ok()?;
+    let offer: LaneOffer = serde_json::from_slice(&bytes).ok()?;
+    let hex64 = |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex64(&offer.id) || !hex64(&offer.salt) || offer.ask.is_empty() {
+        return None;
+    }
+    Some(offer)
 }
 
 #[cfg(test)]
@@ -819,6 +862,97 @@ mod tests {
     /// above and copy the file to bsv-low unchanged.
     #[test]
     #[ignore = "writes tests/fixtures/session_lane.vectors.json on purpose"]
+    /// The absolute lifetime (the 2026-09-14 gate LOW-5): refreshes keep the
+    /// idle window moving, but 12 h after the mint every call is `expired`
+    /// whatever the traffic; a record without a mint stamp is expired at once.
+    #[test]
+    fn a_lane_dies_at_its_absolute_lifetime_whatever_the_idle_refreshes() {
+        let (mut lane, _offer) = minted();
+        let key = hex32(&lane.key).unwrap();
+        let digest = body_digest(b"");
+        let call = |h: u64, now: u64, k: &[u8; 32]| {
+            let e = http_event("GET", "/x");
+            let mac = hex::encode(frame_mac_over_digest(k, h, &e, &digest));
+            (mac, now)
+        };
+        // Refreshed every minute up to just under the lifetime: fine.
+        let mut h = 1;
+        let mut now = 1_000;
+        while now + 60_000 < 1_000 + LANE_MAX_LIFETIME_MS {
+            let (mac, _) = call(h, now, &key);
+            lane.verify_http(
+                &HttpCall {
+                    h,
+                    method: "GET",
+                    path_and_query: "/x",
+                    body_digest: &digest,
+                    mac_hex: &mac,
+                },
+                now,
+                LANE_IDLE_MS,
+            )
+            .expect("inside the lifetime");
+            h += 1;
+            now += 60_000;
+        }
+        // One minute past the lifetime, with the idle window still fresh: expired.
+        let now = 1_000 + LANE_MAX_LIFETIME_MS + 60_000;
+        let (mac, _) = call(h, now, &key);
+        assert_eq!(
+            lane.verify_http(
+                &HttpCall {
+                    h,
+                    method: "GET",
+                    path_and_query: "/x",
+                    body_digest: &digest,
+                    mac_hex: &mac
+                },
+                now,
+                LANE_IDLE_MS
+            ),
+            Err(Refusal::Expired)
+        );
+        // A record without a mint stamp (pre-lifetime) reads as minted at 0: expired.
+        let (mut old, _) = minted();
+        old.minted_at_ms = 0;
+        let (mac, _) = call(1, 1_000, &key);
+        assert_eq!(
+            old.verify_http(
+                &HttpCall {
+                    h: 1,
+                    method: "GET",
+                    path_and_query: "/x",
+                    body_digest: &digest,
+                    mac_hex: &mac
+                },
+                1_000 + LANE_MAX_LIFETIME_MS + 1,
+                LANE_IDLE_MS
+            ),
+            Err(Refusal::Expired)
+        );
+    }
+
+    /// The offer's carrier: a signable `x-bsv-` header, base64 JSON, round-tripped;
+    /// junk refused; the handshake's response field is gone from the protocol.
+    #[test]
+    fn the_offer_rides_a_signable_header_and_round_trips() {
+        assert!(
+            LANE_OFFER_HEADER.starts_with("x-bsv-")
+                && !LANE_OFFER_HEADER.starts_with("x-bsv-auth-")
+        );
+        let (_, offer) = minted();
+        let value = offer_header_value(&offer);
+        assert!(!value.contains('{'), "base64, never raw JSON");
+        assert_eq!(parse_offer_header(Some(&value)), Some(offer.clone()));
+        assert_eq!(parse_offer_header(None), None);
+        assert_eq!(parse_offer_header(Some("")), None);
+        assert_eq!(parse_offer_header(Some("not base64!!")), None);
+        let short =
+            bsv_sdk::primitives::to_base64(br#"{"id":"ab","expiresAt":1,"salt":"cd","ask":"a"}"#);
+        assert_eq!(parse_offer_header(Some(&short)), None);
+        assert_eq!(parse_offer_header(Some(&"A".repeat(2000))), None);
+    }
+
     fn emit_session_lane_vectors() {
         let (lane, offer) = minted();
         let key = hex32(&lane.key).unwrap();

@@ -191,7 +191,12 @@ impl SessionCell {
         ttl_seconds: Option<u64>,
         now_ms: u64,
     ) -> (Option<StoredSession>, bool) {
-        if self.is_expired(now_ms) {
+        // A LANE object (keyed by a lane id) holds no session: a general
+        // message whose `your-nonce` names a lane id must consume NOTHING here
+        // (the 2026-09-14 gate LOW-4: every such request grew the lane object's
+        // consumed map toward the value cap, turning the victim's laned calls
+        // 503). Only a live SESSION burns a nonce.
+        if self.session.is_none() || self.is_expired(now_ms) {
             return (None, false);
         }
         let fresh = self.consume(nonce, ttl_seconds, now_ms);
@@ -713,7 +718,32 @@ mod tests {
             expires_at_ms,
             last_h: 0,
             seen_mask: 0,
+            minted_at_ms: 1_000,
         }
+    }
+
+    /// The 2026-09-14 gate LOW-4: an object holding a LANE (no session) must
+    /// consume no per-request nonce — a general message naming a lane id as
+    /// its `your-nonce` used to grow the lane object toward the value cap.
+    #[test]
+    fn a_lane_object_consumes_no_session_nonce() {
+        let mut c = SessionCell::default();
+        c.lane_put(lane(
+            &"ab".repeat(32),
+            &"02".repeat(33),
+            &"cd".repeat(32),
+            5_000_000,
+        ));
+        assert!(!c.is_expired(1_000));
+        let (session, fresh) = c.get_and_consume("some-nonce", None, 1_000);
+        assert!(session.is_none());
+        assert!(!fresh, "nothing is burnt against a lane");
+        assert!(
+            c.consumed.is_empty(),
+            "the lane object stays empty of nonces"
+        );
+        let (_, again) = c.get_and_consume("some-nonce", None, 1_000);
+        assert!(!again);
     }
 
     fn lane_ask(l: &LaneRecord, h: u64, method: &str, path: &str, body: &str) -> LaneVerifyAsk {

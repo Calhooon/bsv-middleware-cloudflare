@@ -146,6 +146,16 @@ pub enum LaneAuthResult {
         body: Vec<u8>,
         lane: LaneAuth,
     },
+    /// The reference outcome (`Authenticated`, always) PLUS a freshly minted
+    /// lane offer the adopter must attach to its SIGNED answer as the
+    /// `session_lane::LANE_OFFER_HEADER` extra header (a signable `x-bsv-`
+    /// header: the reference signs it, the client's verification covers it).
+    /// Minted only for a BRC-104-authenticated general message that carried
+    /// the ask, under the VERIFIED identity — never on the handshake.
+    Offered {
+        auth: AuthResult,
+        offer: lane::LaneOffer,
+    },
     Reference(AuthResult),
 }
 
@@ -259,7 +269,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
 
     // Check if this is a handshake request
     if CloudflareTransport::is_handshake_request(&req) {
-        return handle_handshake_request(req, &wallet, session_storage, options, None).await;
+        return handle_handshake_request(req, &wallet, session_storage, options).await;
     }
 
     // Check for auth headers
@@ -696,7 +706,6 @@ async fn handle_handshake_request<S: SessionStorage + ?Sized>(
     wallet: &ProtoWallet,
     session_storage: &S,
     options: &AuthMiddlewareOptions,
-    lane_ask: Option<&str>,
 ) -> Result<AuthResult> {
     // Parse the handshake message from body
     let body = req
@@ -710,7 +719,7 @@ async fn handle_handshake_request<S: SessionStorage + ?Sized>(
 
     match message.message_type {
         MessageType::InitialRequest => {
-            handle_initial_request(message, wallet, session_storage, options, lane_ask).await
+            handle_initial_request(message, wallet, session_storage, options).await
         }
         MessageType::CertificateResponse => {
             handle_certificate_response(message, wallet, session_storage, options).await
@@ -736,7 +745,6 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
     wallet: &ProtoWallet,
     session_storage: &S,
     options: &AuthMiddlewareOptions,
-    lane_ask: Option<&str>,
 ) -> Result<AuthResult> {
     let peer_identity_key = message.identity_key.to_hex();
 
@@ -794,49 +802,14 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
         let _ = headers.set(key, value);
     }
 
-    // Session lane (0.3.4): ONLY an explicit ask on a lane-enabled server
-    // mints; the offer rides the InitialResponse as one extra field the
-    // reference client ignores. K is derived from the salt, the id and the
-    // handshake's own nonces (the peer's initial nonce, our session nonce).
-    let offer = match (
-        options.session_lane.as_ref(),
-        lane_ask,
-        response_msg.your_nonce.as_deref(),
-    ) {
-        (Some(lane_opts), Some(ask), Some(client_nonce)) => {
-            mint_lane_offer(
-                session_storage,
-                lane_opts,
-                &peer_identity_key,
-                client_nonce,
-                &session_nonce,
-                ask,
-            )
-            .await
-        }
-        _ => None,
-    };
-    let response = match offer {
-        Some(offer) => {
-            let mut value = serde_json::to_value(&response_msg)
-                .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
-            if let serde_json::Value::Object(ref mut map) = value {
-                map.insert(
-                    "session".to_string(),
-                    serde_json::to_value(&offer)
-                        .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?,
-                );
-            }
-            add_lane_cors_headers(
-                Response::from_json(&value)
-                    .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-                    .with_headers(headers),
-            )
-        }
-        None => Response::from_json(&response_msg)
-            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-            .with_headers(headers),
-    };
+    // Session lane (0.3.4): the InitialResponse NEVER offers a lane. The
+    // initialRequest is unsigned — its identity is a claim (the 2026-09-14
+    // gate HIGH-1: a stranger could mint a lane under any identity) — so the
+    // offer rides the answer to the client's FIRST BRC-104-SIGNED general
+    // message instead (`process_auth_lane_with_storage`, `LaneAuthResult::Offered`).
+    let response = Response::from_json(&response_msg)
+        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+        .with_headers(headers);
     Ok(AuthResult::Response(add_cors_headers(response)))
 }
 
@@ -882,8 +855,9 @@ async fn mint_lane_offer<S: SessionStorage + ?Sized>(
 
 /// `process_auth_lane` over the Durable Object session backend: a laned
 /// request (the `x-low-session*` headers) is verified by the lane's object and
-/// answered `Laned`; a handshake carrying `x-low-lane-ask` is answered with an
-/// offer; everything else takes [`process_auth_do`]'s path unchanged.
+/// answered `Laned`; an AUTHENTICATED general message carrying `x-low-lane-ask`
+/// earns an offer (`Offered`, attached by the adopter to its signed answer);
+/// everything else takes [`process_auth_do`]'s path unchanged.
 pub async fn process_auth_lane(
     req: Request,
     env: &Env,
@@ -903,7 +877,7 @@ pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
     session_storage: &S,
     options: &AuthMiddlewareOptions,
 ) -> Result<LaneAuthResult> {
-    let (parsed, ask_header) = {
+    let (parsed, ask_header, client_nonce_header) = {
         let headers = req.headers();
         let get = |name: &str| headers.get(name).ok().flatten();
         (
@@ -914,6 +888,9 @@ pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
                 get(lane::SESSION_MAC_HEADER).as_deref(),
             ),
             get(lane::LANE_ASK_HEADER),
+            // The asking general message's OWN nonce (the reference verifies
+            // it inside the signed payload): the client-side half of K.
+            get(auth_headers::NONCE).filter(|n| !n.trim().is_empty()),
         )
     };
     let laned = match parsed {
@@ -982,15 +959,41 @@ pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
             AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
         })?;
         let wallet = ProtoWallet::new(Some(private_key));
-        let ask = lane::parse_ask(ask_header.as_deref());
         return Ok(LaneAuthResult::Reference(
-            handle_handshake_request(req, &wallet, session_storage, options, ask.as_deref())
-                .await?,
+            handle_handshake_request(req, &wallet, session_storage, options).await?,
         ));
     }
-    Ok(LaneAuthResult::Reference(
-        process_auth_with_storage(req, session_storage, options).await?,
-    ))
+    // The reference path judges the general message (the BRC-104 signature
+    // over the payload, the session, the per-request nonce). Only a request it
+    // AUTHENTICATED can earn a lane: the ask + the request's own nonce + the
+    // session's server nonce mint one under the VERIFIED identity, and the
+    // offer rides the adopter's signed answer (`x-bsv-lane-offer`).
+    let auth = process_auth_with_storage(req, session_storage, options).await?;
+    let ask = lane::parse_ask(ask_header.as_deref());
+    if let (Some(lane_opts), Some(ask), Some(client_nonce)) =
+        (options.session_lane.as_ref(), ask, client_nonce_header)
+    {
+        if let AuthResult::Authenticated {
+            context, session, ..
+        } = &auth
+        {
+            if let Some(session) = session {
+                if let Some(offer) = mint_lane_offer(
+                    session_storage,
+                    lane_opts,
+                    &context.identity_key,
+                    &client_nonce,
+                    &session.session_nonce,
+                    &ask,
+                )
+                .await
+                {
+                    return Ok(LaneAuthResult::Offered { auth, offer });
+                }
+            }
+        }
+    }
+    Ok(LaneAuthResult::Reference(auth))
 }
 
 /// Whether a request presents the lane (the `x-low-session` header) — the
@@ -1384,6 +1387,52 @@ mod tests {
     // ===========================================
     // Message signing and verification tests
     // ===========================================
+
+    /// The 2026-09-14 gate HIGH-1, pinned at the source: the handshake path
+    /// (`handle_initial_request`, the unsigned initialRequest) contains NO mint,
+    /// and the only mint site sits inside the `AuthResult::Authenticated` arm
+    /// of `process_auth_lane_with_storage` — a lane binds a PROVEN identity.
+    #[test]
+    fn the_lane_mints_only_for_an_authenticated_general_message_never_on_the_handshake() {
+        // The crate's own source up to its tests (this pin's own literals excluded).
+        let whole = include_str!("auth.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        let initial = &src[src.find("async fn handle_initial_request").unwrap()
+            ..src.find("/// Mint a lane for a proven").unwrap()];
+        assert!(
+            !initial.contains("mint_lane_offer("),
+            "the handshake path must not mint"
+        );
+        assert!(
+            initial.contains("NEVER offers a lane"),
+            "the handshake path states why"
+        );
+        let lane_fn = &src[src
+            .find("pub async fn process_auth_lane_with_storage")
+            .unwrap()
+            ..src.find("pub fn request_presents_lane").unwrap()];
+        assert_eq!(
+            lane_fn.matches("mint_lane_offer(").count(),
+            1,
+            "exactly one mint site"
+        );
+        let mint_at = lane_fn.find("mint_lane_offer(").unwrap();
+        let auth_arm = lane_fn.find("if let AuthResult::Authenticated {").unwrap();
+        assert!(
+            auth_arm < mint_at,
+            "the mint sits inside the Authenticated arm"
+        );
+        assert!(
+            lane_fn[..mint_at]
+                .contains("process_auth_with_storage(req, session_storage, options).await?"),
+            "the reference path judges the message BEFORE any mint"
+        );
+        assert_eq!(
+            src.matches("mint_lane_offer(").count(),
+            1,
+            "exactly one CALL site (the definition carries generics before its paren)"
+        );
+    }
 
     #[test]
     fn test_sign_and_verify_initial_response() {
