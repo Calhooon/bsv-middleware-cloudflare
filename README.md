@@ -124,10 +124,13 @@ One BRC-103/104 handshake per origin, then a LANE: `process_auth_lane(req, &env,
 serves calls that carry `x-low-session` (the lane id), `x-low-session-identity`, `x-low-session-n` (the client's
 counter) and `x-low-session-mac` (`HMAC-SHA256(K, n ‖ "METHOD path?query" ‖ 0x00 ‖ sha256(body))`) with ZERO wallet
 calls and one Durable Object round trip, and answers `LaneAuthResult::Laned { context, request, body, lane }`;
-everything else is `LaneAuthResult::Reference(AuthResult)`, the unchanged reference outcome. A handshake POST that
-carries the client's explicit ask (`x-low-lane-ask`) on a server with `options.session_lane = Some(..)` is answered
-with one extra `InitialResponse` field, `session {id, expiresAt, salt, ask}`, that a reference client ignores; both
-sides derive `K = HMAC-SHA256(salt, label ‖ id ‖ clientInitialNonce ‖ serverSessionNonce)`. Seal a laned answer with
+everything else is `LaneAuthResult::Reference(AuthResult)` or `LaneAuthResult::Offered { auth, offer }`, the unchanged
+reference outcome. The client's FIRST BRC-104-signed general message carrying the explicit ask (`x-low-lane-ask`) on a
+server with `options.session_lane = Some(..)` is answered `Offered`: the server attaches the offer to that message's
+SIGNED reply as the `x-bsv-lane-offer` header (base64 JSON `{id, expiresAt, salt, ask}`, a header a reference client
+ignores, exposed cross-origin); the unsigned handshake never mints. Both sides derive
+`K = HMAC-SHA256(salt, label ‖ id ‖ clientMessageNonce ‖ serverSessionNonce)` from that message's own `x-bsv-auth-nonce`
+and the server's session nonce. Seal a laned answer with
 `seal_lane_response(&value, status, &lane)` (`x-low-session-n`, `x-low-session-mac`, `no-store`). Refusals are
 401 `{status:"error", code:"ERR_SESSION_REFUSED", reason}` (`unknown-session` / `expired` / `replay` / `bad-mac` /
 `malformed`; 503 `lane-unavailable` when the store cannot be asked). The KV backend keeps no lanes (never offers

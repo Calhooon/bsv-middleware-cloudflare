@@ -83,9 +83,10 @@ pub struct AuthMiddlewareOptions {
     #[allow(clippy::type_complexity)]
     pub on_certificates_received:
         Option<Box<dyn Fn(String, Vec<VerifiableCertificate>) + Send + Sync>>,
-    /// Session lane (0.3.4, `middleware::session_lane`): when set, a handshake
-    /// that carries the client's explicit ask (`x-low-lane-ask`) is answered
-    /// with a lane offer, and `process_auth_lane*` serves laned calls. `None`
+    /// Session lane (0.3.4, `middleware::session_lane`): when set, the client's
+    /// FIRST BRC-104-signed general message carrying the explicit ask
+    /// (`x-low-lane-ask`) is answered with a lane offer (the unsigned handshake
+    /// never mints), and `process_auth_lane*` serves laned calls. `None`
     /// (the default) = the reference behaviour byte-for-byte.
     pub session_lane: Option<SessionLaneOptions>,
 }
@@ -358,6 +359,20 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     if !session.is_authenticated {
         return Err(AuthCloudflareError::InvalidAuthentication(
             "Session not authenticated".into(),
+        ));
+    }
+
+    // The signed identity IS the session's: a general message naming another
+    // identity over this session is refused by name before its signature is
+    // judged (the reference verifies with `peerSession.peerIdentityKey`; the
+    // header is a claim — the 2026-09-14 delta-verify NEW-1).
+    if !auth_message
+        .identity_key
+        .to_hex()
+        .eq_ignore_ascii_case(&session.peer_identity_key)
+    {
+        return Err(AuthCloudflareError::InvalidAuthentication(
+            "Message identity key is not the session's".into(),
         ));
     }
 
@@ -1085,10 +1100,11 @@ pub fn add_lane_cors_headers(response: Response) -> Response {
         let _ = headers.set(
             "Access-Control-Expose-Headers",
             &format!(
-                "{}, {}, {}",
+                "{}, {}, {}, {}",
                 expose,
                 lane::SESSION_COUNTER_HEADER,
-                lane::SESSION_MAC_HEADER
+                lane::SESSION_MAC_HEADER,
+                lane::LANE_OFFER_HEADER
             ),
         );
     }
@@ -1275,7 +1291,12 @@ fn sign_message(
 /// Matches Peer's `verify_message_signature`:
 /// - Uses the message's signing_data() as the data
 /// - Key ID: "{nonce} {server_session_nonce}"
-/// - Counterparty: message sender's identity key
+/// - Counterparty: the SESSION's peer identity (`peerSession.peerIdentityKey`
+///   in the reference), never the message header's. The header is a claim;
+///   with the header as the counterparty ANY wallet's honest signature
+///   verified under a session another identity's unsigned initialRequest
+///   opened, and the context reported that identity (the 2026-09-14
+///   delta-verify NEW-1).
 fn verify_message_signature(
     wallet: &ProtoWallet,
     message: &AuthMessage,
@@ -1288,6 +1309,10 @@ fn verify_message_signature(
 
     let data = message.signing_data();
     let key_id = message.get_key_id(Some(session.session_nonce.as_str()));
+    let Ok(session_identity) = bsv_sdk::primitives::PublicKey::from_hex(&session.peer_identity_key)
+    else {
+        return Ok(false); // a session whose identity is not a key verifies nothing
+    };
 
     let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
 
@@ -1297,7 +1322,7 @@ fn verify_message_signature(
         signature: signature.clone(),
         protocol_id: protocol,
         key_id,
-        counterparty: Some(Counterparty::Other(message.identity_key.clone())),
+        counterparty: Some(Counterparty::Other(session_identity)),
         for_self: None,
     });
 
@@ -1345,14 +1370,20 @@ pub fn add_cors_headers(response: Response) -> Response {
     let _ = headers.set(
         "Access-Control-Expose-Headers",
         &format!(
-            "{}, {}, {}, {}, {}, {}, {}, x-bsv-payment-satoshis-paid, x-bsv-payment-version, x-bsv-payment-satoshis-required, x-bsv-payment-derivation-prefix, x-bsv-payment-txid",
+            "{}, {}, {}, {}, {}, {}, {}, x-bsv-payment-satoshis-paid, x-bsv-payment-version, x-bsv-payment-satoshis-required, x-bsv-payment-derivation-prefix, x-bsv-payment-txid, {}",
             auth_headers::VERSION,
             auth_headers::IDENTITY_KEY,
             auth_headers::NONCE,
             auth_headers::YOUR_NONCE,
             auth_headers::SIGNATURE,
             auth_headers::MESSAGE_TYPE,
-            auth_headers::REQUEST_ID
+            auth_headers::REQUEST_ID,
+            // The lane offer rides a SIGNED response header; a cross-origin
+            // fetch only sees EXPOSED headers, and the SDK rebuilds the signed
+            // payload from what it sees — unexposed, the offer is invisible AND
+            // the answer's signature never verifies (the 2026-09-14
+            // delta-verify NEW-2).
+            lane::LANE_OFFER_HEADER
         ),
     );
 
@@ -1932,5 +1963,103 @@ mod tests {
             &payload[body_offset + 1..body_offset + 1 + json_bytes.len()],
             json_bytes.as_slice()
         );
+    }
+
+    /// The 2026-09-14 delta-verify NEW-1: a general message is verified against
+    /// the SESSION's identity (the reference's `peerSession.peerIdentityKey`),
+    /// never the header's. Before this pin the header identity was the
+    /// counterparty, so ANY wallet's honest signature verified under a session
+    /// another identity's UNSIGNED initialRequest opened, and the context
+    /// reported the victim.
+    #[test]
+    fn a_general_message_is_verified_against_the_session_s_identity_not_the_header_s() {
+        let server_wallet = test_wallet(SERVER_KEY_HEX);
+        let server_pk = test_key(SERVER_KEY_HEX);
+        let victim_pk = test_key(CLIENT_KEY_HEX);
+        let attacker_hex = "0000000000000000000000000000000000000000000000000000000000000003";
+        let attacker_wallet = test_wallet(attacker_hex);
+        let attacker_pk = test_key(attacker_hex);
+
+        // The attacker names ITS OWN key in the header, rides the victim's
+        // session nonce and signs honestly for its own key.
+        let mut msg = AuthMessage::new(MessageType::General, attacker_pk.clone());
+        msg.nonce = Some("attacker-nonce".to_string());
+        msg.your_nonce = Some("victim-session-nonce".to_string());
+        msg.payload = Some(vec![9, 9, 9]);
+        let attacker_view = StoredSession {
+            session_nonce: "attacker-nonce".to_string(),
+            peer_identity_key: server_pk.to_hex(),
+            peer_nonce: Some("victim-session-nonce".to_string()),
+            is_authenticated: true,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 0,
+            last_update: 0,
+        };
+        sign_message(&attacker_wallet, &mut msg, &attacker_view).unwrap();
+
+        // The server's session: opened by an unsigned initialRequest CLAIMING the victim.
+        let victim_session = StoredSession {
+            session_nonce: "victim-session-nonce".to_string(),
+            peer_identity_key: victim_pk.to_hex(),
+            peer_nonce: Some("attacker-nonce".to_string()),
+            is_authenticated: true,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 0,
+            last_update: 0,
+        };
+        assert!(
+            !verify_message_signature(&server_wallet, &msg, &victim_session).unwrap(),
+            "another key's signature over a session claiming the victim must NOT verify"
+        );
+        // The honest control: the same message over the session ITS identity opened.
+        let own_session = StoredSession {
+            peer_identity_key: attacker_pk.to_hex(),
+            ..victim_session.clone()
+        };
+        assert!(verify_message_signature(&server_wallet, &msg, &own_session).unwrap());
+        // A session whose identity is not a key verifies nothing (never a panic).
+        let junk = StoredSession {
+            peer_identity_key: "not-a-key".to_string(),
+            ..victim_session
+        };
+        assert!(!verify_message_signature(&server_wallet, &msg, &junk).unwrap());
+    }
+
+    /// Structural: the general path refuses a header identity that is not the
+    /// session's BEFORE the signature is judged, and the verify's counterparty
+    /// is the session's identity (NEW-1); the lane offer header is EXPOSED by
+    /// both CORS emitters (NEW-2: a cross-origin fetch sees exposed headers
+    /// only, and the SDK rebuilds the signed payload from what it sees).
+    #[test]
+    fn the_general_path_binds_the_identity_and_the_offer_header_is_exposed() {
+        let whole = include_str!("auth.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        let general = &src[src.find("pub async fn process_auth_with_storage").unwrap()..];
+        let bind = general
+            .find(".eq_ignore_ascii_case(&session.peer_identity_key)")
+            .expect("the identity binding");
+        let verify = general
+            .find("verify_message_signature(&wallet, &auth_message, &session)")
+            .expect("the verify call");
+        assert!(bind < verify, "the binding precedes the signature check");
+        let verify_fn = &src[src.find("fn verify_message_signature(").unwrap()..];
+        let verify_fn = &verify_fn[..verify_fn.find("\n}\n").unwrap()];
+        assert!(
+            verify_fn.contains("PublicKey::from_hex(&session.peer_identity_key)")
+                && verify_fn.contains("Counterparty::Other(session_identity)")
+                && !verify_fn.contains("message.identity_key"),
+            "the counterparty is the session's identity, never the header's"
+        );
+        for emitter in ["pub fn add_cors_headers(", "pub fn add_lane_cors_headers("] {
+            let body = &src[src.find(emitter).unwrap()..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            let expose = body.find("Access-Control-Expose-Headers").expect(emitter);
+            assert!(
+                body[expose..].contains("lane::LANE_OFFER_HEADER"),
+                "{emitter} exposes the lane offer header"
+            );
+        }
     }
 }

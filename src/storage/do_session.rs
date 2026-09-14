@@ -60,6 +60,9 @@ use worker::*;
 /// A consumed nonce outlives its request by at least this long when the
 /// caller passes no TTL (the KV backend's floor is the same 60 s).
 pub const NONCE_MIN_TTL_SECONDS: u64 = 60;
+/// The most nonces one session cell remembers (≈ 64 KiB of a 128 KiB value at
+/// 44-char nonces); beyond it the earliest-expiring generation is evicted.
+pub const CONSUMED_CAP: usize = 1_024;
 
 /// The pure state one `AuthSessionStore` holds for ONE session nonce.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -143,18 +146,34 @@ impl SessionCell {
     }
 
     /// Save (or update) the session and extend its life by `ttl_seconds` from
-    /// `now_ms`. The consumed set is KEPT: an update is the same session.
+    /// `now_ms`. The consumed set is KEPT: an update is the same session, and
+    /// every remembered nonce lives at least as long as the session now does
+    /// (NEW-3, see `consume`).
     pub fn save(&mut self, session: StoredSession, ttl_seconds: u64, now_ms: u64) {
         self.session = Some(session);
         self.expires_at_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+        let life = self.expires_at_ms;
+        for exp in self.consumed.values_mut() {
+            if *exp < life {
+                *exp = life;
+            }
+        }
         self.prune(now_ms);
     }
 
     /// Atomic put-if-absent of a per-request nonce: `true` the first time,
     /// `false` on a replay. A consumed nonce is remembered for `ttl_seconds`
-    /// (floored at `NONCE_MIN_TTL_SECONDS`); expired ones are pruned first, so
-    /// a nonce whose memory lapsed is fresh again — exactly the KV backend's
-    /// TTL semantics, without the write.
+    /// (floored at `NONCE_MIN_TTL_SECONDS`) AND for the session's remaining
+    /// life — `save` (the sliding touch) extends every remembered nonce with
+    /// the session, so a captured signed request never outlives the memory of
+    /// its nonce while its session still answers (the 2026-09-14 delta-verify
+    /// NEW-3; the KV backend keeps a plain TTL per nonce — a stated divergence
+    /// between the two backends, the KV one's residual is the reference's).
+    /// Bounded: past `CONSUMED_CAP` nonces the earliest-expiring generation is
+    /// evicted (a replay of a request older than that many requests within one
+    /// live session is the residual, and the cell stays under the Durable
+    /// Object's 128 KiB value cap). Expired ones are pruned first, so a nonce
+    /// whose memory lapsed is fresh again.
     pub fn consume(&mut self, nonce: &str, ttl_seconds: Option<u64>, now_ms: u64) -> bool {
         self.prune(now_ms);
         if self.consumed.contains_key(nonce) {
@@ -163,11 +182,28 @@ impl SessionCell {
         let ttl = ttl_seconds
             .unwrap_or(NONCE_MIN_TTL_SECONDS)
             .max(NONCE_MIN_TTL_SECONDS);
-        self.consumed.insert(
-            nonce.to_string(),
-            now_ms.saturating_add(ttl.saturating_mul(1000)),
-        );
+        let until = now_ms
+            .saturating_add(ttl.saturating_mul(1000))
+            .max(self.expires_at_ms);
+        self.consumed.insert(nonce.to_string(), until);
+        self.evict_past_cap();
         true
+    }
+
+    /// Keep the consumed set under `CONSUMED_CAP`: the earliest-expiring
+    /// entries go first (the oldest generation under the session-life rule).
+    fn evict_past_cap(&mut self) {
+        while self.consumed.len() > CONSUMED_CAP {
+            let Some(oldest) = self
+                .consumed
+                .iter()
+                .min_by_key(|(n, exp)| (**exp, (*n).clone()))
+                .map(|(n, _)| n.clone())
+            else {
+                break;
+            };
+            self.consumed.remove(&oldest);
+        }
     }
 
     /// Forget a consumed nonce (the payment path's release on a failed
@@ -863,21 +899,87 @@ mod tests {
     }
 
     #[test]
-    fn consume_is_a_put_if_absent_with_the_kv_backend_s_ttl_semantics() {
+    fn consume_is_a_put_if_absent_remembered_for_the_session_s_life() {
+        // No session (the two-step `/consume` path): the KV backend's TTL
+        // semantics, floored at 60 s.
         let mut c = SessionCell::default();
-        c.save(session("n1"), 3_600, 0);
-        assert!(c.consume("r1", Some(3_600), 10));
-        assert!(!c.consume("r1", Some(3_600), 11), "a replay is refused");
         assert!(c.consume("r2", None, 12));
-        // The floor: a consumed nonce is remembered for at least 60 s.
         assert!(!c.consume("r2", None, 12 + 59_999));
         assert!(
             c.consume("r2", None, 12 + 60_000),
             "its memory lapsed: fresh again"
         );
-        // The caller's TTL, when longer, is honoured.
-        assert!(!c.consume("r1", Some(3_600), 10 + 3_599_999));
-        assert!(c.consume("r1", Some(3_600), 10 + 3_600_000));
+        // A live session: the nonce is remembered for the LONGER of the TTL
+        // and the session's remaining life (NEW-3).
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 3_600, 0);
+        assert!(c.consume("r1", Some(60), 10));
+        assert!(!c.consume("r1", Some(60), 11), "a replay is refused");
+        assert!(
+            !c.consume("r1", Some(60), 10 + 60_000),
+            "the TTL lapsed but the session lives: still refused"
+        );
+        assert!(
+            !c.consume("r1", Some(60), 3_599_999),
+            "remembered to the session's last millisecond"
+        );
+        assert!(
+            c.consume("r1", Some(60), 3_600_000),
+            "the session died with it"
+        );
+        // The caller's TTL, when LONGER than the session's life, is honoured.
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 60, 0);
+        assert!(c.consume("r3", Some(3_600), 10));
+        assert!(!c.consume("r3", Some(3_600), 10 + 3_599_999));
+        assert!(c.consume("r3", Some(3_600), 10 + 3_600_000));
+    }
+
+    /// NEW-3: the session slides on its lazy touch; a nonce consumed before
+    /// the touch used to lapse while the session still answered (a captured
+    /// signed request replayed, and with a lane ask minted a lane under the
+    /// victim). The touch now extends every remembered nonce with the session.
+    #[test]
+    fn a_touch_extends_every_remembered_nonce_with_the_session() {
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 3_600, 0);
+        assert!(c.consume("r1", Some(3_600), 1_000));
+        let mut touched = session("n1");
+        touched.last_update = 3_000_000;
+        c.save(touched, 3_600, 3_000_000); // the session now lives to 6_600_000
+        assert!(
+            !c.consume("r1", Some(3_600), 3_601_000),
+            "past the nonce's own TTL, the session live: refused"
+        );
+        assert!(
+            !c.consume("r1", Some(3_600), 6_599_999),
+            "refused to the session's last millisecond"
+        );
+        assert_eq!(c.consumed.get("r1"), Some(&6_600_000));
+        assert!(c.consume("r1", Some(3_600), 6_600_000));
+    }
+
+    /// The bound: past `CONSUMED_CAP` nonces the earliest-expiring go first;
+    /// a busy session never grows its cell past the value cap into a 503.
+    #[test]
+    fn the_consumed_set_is_bounded_and_evicts_the_earliest_expiring() {
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 3_600, 0);
+        for i in 0..CONSUMED_CAP {
+            assert!(c.consume(&format!("r{i}"), Some(7_200), i as u64));
+        }
+        assert_eq!(c.consumed.len(), CONSUMED_CAP);
+        assert!(c.consume("late", Some(7_200), 10_000));
+        assert_eq!(c.consumed.len(), CONSUMED_CAP, "one in, one out");
+        assert!(
+            !c.consumed.contains_key("r0"),
+            "the earliest-expiring nonce was evicted"
+        );
+        assert!(c.consumed.contains_key("r1") && c.consumed.contains_key("late"));
+        assert!(
+            c.consume("r0", Some(7_200), 10_001),
+            "evicted = fresh again (the stated residual)"
+        );
     }
 
     #[test]

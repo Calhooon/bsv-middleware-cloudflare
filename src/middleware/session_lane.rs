@@ -1,14 +1,14 @@
 //! THE SESSION LANE (0.3.4; bsv-low #441 — the relay's register row D10
 //! generalized to HTTP-only servers).
 //!
-//! One BRC-103/104 handshake per origin and tab, then a LANE: when the
-//! handshake POST carries the client's explicit ask (`x-low-lane-ask`), the
-//! answer to the client's FIRST BRC-104-signed general message carries the offer
-//! header (`x-bsv-lane-offer`, base64 JSON `{id, expiresAt, salt, ask}`; the
-//! `InitialResponse` never offers — the initialRequest is unsigned)
-//! (one field a reference client ignores). Both sides derive one secret `K`
-//! from the salt, the id and the handshake's own nonces (the request's
-//! `initialNonce`, the response's `nonce`); `K` never crosses the wire. Every
+//! One BRC-103/104 handshake per origin and tab, then a LANE: when the client's
+//! FIRST BRC-104-signed general message carries the explicit ask
+//! (`x-low-lane-ask`), its SIGNED answer carries the offer header
+//! (`x-bsv-lane-offer`, base64 JSON `{id, expiresAt, salt, ask}`, a header a
+//! reference client ignores; the `InitialResponse` never offers — the
+//! initialRequest is unsigned). Both sides derive one secret `K` from the
+//! salt, the id, that message's own nonce (`x-bsv-auth-nonce`) and the
+//! server's session nonce; `K` never crosses the wire. Every
 //! later call carries `x-low-session` (the id), `x-low-session-identity`,
 //! `x-low-session-n` (the client's counter `h`) and `x-low-session-mac` =
 //! `HMAC-SHA256(K, h_le8 ‖ "METHOD path?query" ‖ 0x00 ‖ sha256(body))`; the
@@ -42,7 +42,8 @@ pub const SESSION_HEADER: &str = "x-low-session";
 pub const SESSION_IDENTITY_HEADER: &str = "x-low-session-identity";
 pub const SESSION_COUNTER_HEADER: &str = "x-low-session-n";
 pub const SESSION_MAC_HEADER: &str = "x-low-session-mac";
-/// The handshake POST's explicit ask (D10: only an explicit ask mints).
+/// The client's explicit ask, a header on its FIRST BRC-104-signed general
+/// message (D10: only an explicit ask mints; the unsigned handshake never does).
 pub const LANE_ASK_HEADER: &str = "x-low-lane-ask";
 /// The OFFER's carrier: a header on the answer to the client's FIRST
 /// BRC-104-SIGNED general message that carried the ask — base64 of the
@@ -85,7 +86,7 @@ pub struct LaneRecord {
     pub minted_at_ms: u64,
 }
 
-/// What the `InitialResponse` carries when the client asked.
+/// What the SIGNED answer to the first general message carries when it asked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneOffer {
     pub id: String,
@@ -212,8 +213,9 @@ fn is_hex_of(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// What a proven handshake contributes to a lane: the peer's identity and the
-/// two session nonces (the peer's initial nonce, the server's session nonce).
+/// What the VERIFIED general message contributes to a lane: the session's
+/// identity, the message's own nonce (`x-bsv-auth-nonce`) and the server's
+/// session nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake<'a> {
     pub identity: &'a str,
@@ -272,8 +274,11 @@ impl LaneRecord {
         (record, offer)
     }
 
+    /// Within the idle window AND the absolute lifetime (the same two bars
+    /// `verify_http` judges).
     pub fn is_live(&self, now_ms: u64) -> bool {
         now_ms <= self.expires_at_ms
+            && now_ms < self.minted_at_ms.saturating_add(LANE_MAX_LIFETIME_MS)
     }
 
     /// Verify one laned call: the window, the MAC over the method, the path
