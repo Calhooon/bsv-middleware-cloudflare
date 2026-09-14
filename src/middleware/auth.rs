@@ -974,22 +974,22 @@ pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
         (options.session_lane.as_ref(), ask, client_nonce_header)
     {
         if let AuthResult::Authenticated {
-            context, session, ..
+            context,
+            session: Some(session),
+            ..
         } = &auth
         {
-            if let Some(session) = session {
-                if let Some(offer) = mint_lane_offer(
-                    session_storage,
-                    lane_opts,
-                    &context.identity_key,
-                    &client_nonce,
-                    &session.session_nonce,
-                    &ask,
-                )
-                .await
-                {
-                    return Ok(LaneAuthResult::Offered { auth, offer });
-                }
+            if let Some(offer) = mint_lane_offer(
+                session_storage,
+                lane_opts,
+                &context.identity_key,
+                &client_nonce,
+                &session.session_nonce,
+                &ask,
+            )
+            .await
+            {
+                return Ok(LaneAuthResult::Offered { auth, offer });
             }
         }
     }

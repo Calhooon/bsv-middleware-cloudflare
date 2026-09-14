@@ -857,11 +857,6 @@ mod tests {
         );
     }
 
-    /// `cargo test session_lane::tests::emit_session_lane_vectors -- --ignored`
-    /// rewrites the artifact from the fixed inputs; then update the sha256 pin
-    /// above and copy the file to bsv-low unchanged.
-    #[test]
-    #[ignore = "writes tests/fixtures/session_lane.vectors.json on purpose"]
     /// The absolute lifetime (the 2026-09-14 gate LOW-5): refreshes keep the
     /// idle window moving, but 12 h after the mint every call is `expired`
     /// whatever the traffic; a record without a mint stamp is expired at once.
@@ -953,6 +948,11 @@ mod tests {
         assert_eq!(parse_offer_header(Some(&"A".repeat(2000))), None);
     }
 
+    /// `cargo test session_lane::tests::emit_session_lane_vectors -- --ignored`
+    /// rewrites the artifact from the fixed inputs; then update the sha256 pin
+    /// above and copy the file to bsv-low unchanged.
+    #[test]
+    #[ignore = "writes tests/fixtures/session_lane.vectors.json on purpose"]
     fn emit_session_lane_vectors() {
         let (lane, offer) = minted();
         let key = hex32(&lane.key).unwrap();
