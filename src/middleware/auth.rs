@@ -868,6 +868,33 @@ async fn mint_lane_offer<S: SessionStorage + ?Sized>(
     }
 }
 
+/// bsv-low #443 step 4 (2026-09-14): mint a lane for an identity a first-party
+/// AUTHORITY has proven (the relay's hub mirror, asked by the door through its
+/// service binding) — the same `LaneRecord::mint` as the signed-read mint, the
+/// same label, idle window and lifetime; only the proof differs, and the door
+/// owns that proof. `client_nonce` is the client's fresh nonce from the attest
+/// body, `server_nonce` the door's fresh nonce it answers alongside the offer
+/// (the client derives K from both exactly as for a signed-read mint). `None`
+/// when the store keeps no lanes or the mint could not be stored.
+pub async fn mint_attested_lane<S: SessionStorage + ?Sized>(
+    session_storage: &S,
+    lane_opts: &SessionLaneOptions,
+    proven_identity_key: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    ask: &str,
+) -> Option<lane::LaneOffer> {
+    mint_lane_offer(
+        session_storage,
+        lane_opts,
+        proven_identity_key,
+        client_nonce,
+        server_nonce,
+        ask,
+    )
+    .await
+}
+
 /// `process_auth_lane` over the Durable Object session backend: a laned
 /// request (the `x-low-session*` headers) is verified by the lane's object and
 /// answered `Laned`; an AUTHENTICATED general message carrying `x-low-lane-ask`
@@ -1460,8 +1487,14 @@ mod tests {
         );
         assert_eq!(
             src.matches("mint_lane_offer(").count(),
-            1,
-            "exactly one CALL site (the definition carries generics before its paren)"
+            2,
+            "exactly two CALL sites: the Authenticated arm and the #443 step-4 attested wrapper (the definition carries generics before its paren)"
+        );
+        let wrapper = &src[src.find("pub async fn mint_attested_lane").unwrap()..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
+        assert!(
+            wrapper.contains("mint_lane_offer(") && !wrapper.contains("process_auth"),
+            "the attested wrapper mints only; the door owns the proof"
         );
     }
 
