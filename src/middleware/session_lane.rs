@@ -1094,21 +1094,19 @@ pub fn prepare_attest(
     let outer: AttestBody =
         serde_json::from_str(body_text).map_err(|_| AttestRefusal::Malformed)?;
     let hex_ok = |v: &str, n: usize| v.len() == n && v.bytes().all(|b| b.is_ascii_hexdigit());
-    if !hex_ok(&outer.lane.id, 64)
-        || !(outer.lane.identity.len() == 66 && hex_ok(&outer.lane.identity, 66))
-        || !hex_ok(&outer.lane.mac, 64)
-        || outer.attest_json.is_empty()
-        || outer.attest_json.len() > ATTEST_JSON_MAX
-    {
+    let lane_ok = hex_ok(&outer.lane.id, 64)
+        && hex_ok(&outer.lane.identity, 66)
+        && hex_ok(&outer.lane.mac, 64)
+        && !outer.attest_json.is_empty()
+        && outer.attest_json.len() <= ATTEST_JSON_MAX;
+    if !lane_ok {
         return Err(AttestRefusal::Malformed);
     }
     let inner: AttestInner =
         serde_json::from_str(&outer.attest_json).map_err(|_| AttestRefusal::Malformed)?;
-    if inner.ask.len() != 16
-        || !hex_ok(&inner.ask, 16)
-        || !hex_ok(&inner.client_nonce, 64)
-        || inner.origin.len() > 256
-    {
+    let inner_ok =
+        hex_ok(&inner.ask, 16) && hex_ok(&inner.client_nonce, 64) && inner.origin.len() <= 256;
+    if !inner_ok {
         return Err(AttestRefusal::Malformed);
     }
     if !inner
