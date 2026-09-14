@@ -1001,3 +1001,218 @@ mod tests {
         std::fs::write(path, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
     }
 }
+
+// ── bsv-low #443 step 4 (2026-09-14): the ATTESTED mint ─────────────────────
+//
+// A first-party door (the app-layer, the tower) mints a lane for an identity
+// the RELAY's hub mirror proved, instead of a signed read: the client presents
+// its hub-lane credentials in the BODY of `POST /lane/attest` (never the
+// `x-low-session*` headers: the door's own lane verify would judge those
+// against ITS store and refuse), the door asks the relay through its service
+// binding (`POST /session/attest`, the hub's verify body verbatim), and on
+// `ok` mints with `mint_attested_lane`. The MAC'd text is `attestJson` exactly
+// as the client transmitted it (no canonicalisation, the relay lane's own
+// rule); the door hashes that text and parses it. PURE here; the relay call
+// and the mint are the door's.
+
+/// The attest body's bounds (every string bounded; the JSON text bounded).
+pub const ATTEST_JSON_MAX: usize = 1024;
+/// The path the MAC covers (the door's route; the relay verifies the same text).
+pub const ATTEST_PATH: &str = "/lane/attest";
+
+/// The outer body of `POST /lane/attest`: the hub-lane credentials and the
+/// MAC'd inner text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestBody {
+    pub lane: AttestLane,
+    /// The inner JSON TEXT the client MAC'd (`{"origin","ask","clientNonce"}`).
+    #[serde(rename = "attestJson")]
+    pub attest_json: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestLane {
+    pub id: String,
+    pub identity: String,
+    pub h: u64,
+    pub mac: String,
+}
+/// The inner text, parsed AFTER it was hashed verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestInner {
+    pub origin: String,
+    pub ask: String,
+    #[serde(rename = "clientNonce")]
+    pub client_nonce: String,
+}
+/// What the door forwards to the relay (`POST /session/attest`): the hub's
+/// verify body verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestHubBody {
+    pub id: String,
+    pub identity: String,
+    pub h: u64,
+    pub method: String,
+    pub path: String,
+    #[serde(rename = "bodySha256")]
+    pub body_sha256: String,
+    pub mac: String,
+}
+/// The door's answer on a mint: the offer plus the door's fresh server nonce
+/// (the client derives K from the offer, its `clientNonce` and this).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestAnswer {
+    pub session: LaneOffer,
+    #[serde(rename = "serverNonce")]
+    pub server_nonce: String,
+}
+
+/// Why an attest body is refused before the relay is asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestRefusal {
+    Malformed,
+    /// The inner text names another door.
+    WrongOrigin,
+}
+impl AttestRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttestRefusal::Malformed => "malformed",
+            AttestRefusal::WrongOrigin => "wrong-origin",
+        }
+    }
+}
+
+/// Parse and bound the outer body, hash the inner text VERBATIM, parse it,
+/// bind it to `this_origin`, and produce the hub verify body. PURE.
+pub fn prepare_attest(
+    body_text: &str,
+    this_origin: &str,
+) -> std::result::Result<(AttestHubBody, AttestInner), AttestRefusal> {
+    if body_text.len() > 4096 {
+        return Err(AttestRefusal::Malformed);
+    }
+    let outer: AttestBody =
+        serde_json::from_str(body_text).map_err(|_| AttestRefusal::Malformed)?;
+    let hex_ok = |v: &str, n: usize| v.len() == n && v.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex_ok(&outer.lane.id, 64)
+        || !(outer.lane.identity.len() == 66 && hex_ok(&outer.lane.identity, 66))
+        || !hex_ok(&outer.lane.mac, 64)
+        || outer.attest_json.is_empty()
+        || outer.attest_json.len() > ATTEST_JSON_MAX
+    {
+        return Err(AttestRefusal::Malformed);
+    }
+    let inner: AttestInner =
+        serde_json::from_str(&outer.attest_json).map_err(|_| AttestRefusal::Malformed)?;
+    if inner.ask.len() != 16
+        || !hex_ok(&inner.ask, 16)
+        || !hex_ok(&inner.client_nonce, 64)
+        || inner.origin.len() > 256
+    {
+        return Err(AttestRefusal::Malformed);
+    }
+    if !inner
+        .origin
+        .eq_ignore_ascii_case(this_origin.trim_end_matches('/'))
+    {
+        return Err(AttestRefusal::WrongOrigin);
+    }
+    let digest = Sha256::digest(outer.attest_json.as_bytes());
+    Ok((
+        AttestHubBody {
+            id: outer.lane.id.to_ascii_lowercase(),
+            identity: outer.lane.identity.to_ascii_lowercase(),
+            h: outer.lane.h,
+            method: "POST".to_string(),
+            path: ATTEST_PATH.to_string(),
+            body_sha256: hex::encode(digest),
+            mac: outer.lane.mac.to_ascii_lowercase(),
+        },
+        inner,
+    ))
+}
+
+#[cfg(test)]
+mod attest_tests {
+    use super::*;
+
+    fn body(origin: &str) -> String {
+        let inner = format!(
+            r#"{{"origin":"{origin}","ask":"a1b2c3d4e5f60718","clientNonce":"{}"}}"#,
+            "ab".repeat(32)
+        );
+        serde_json::json!({
+            "lane": { "id": "cd".repeat(32), "identity": format!("02{}", "ef".repeat(32)), "h": 9, "mac": "01".repeat(32) },
+            "attestJson": inner,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_good_attest_hashes_the_inner_text_verbatim_and_names_the_door_s_route() {
+        let (hub, inner) =
+            prepare_attest(&body("https://door.test"), "https://door.test/").unwrap();
+        assert_eq!(hub.method, "POST");
+        assert_eq!(hub.path, ATTEST_PATH);
+        assert_eq!(hub.h, 9);
+        assert_eq!(hub.identity, format!("02{}", "ef".repeat(32)));
+        let outer: AttestBody = serde_json::from_str(&body("https://door.test")).unwrap();
+        assert_eq!(
+            hub.body_sha256,
+            hex::encode(Sha256::digest(outer.attest_json.as_bytes())),
+            "the digest is over the transmitted text, never a re-serialisation"
+        );
+        assert_eq!(inner.ask, "a1b2c3d4e5f60718");
+        assert_eq!(inner.origin, "https://door.test");
+    }
+
+    #[test]
+    fn the_wrong_door_junk_and_oversize_are_refused_before_the_relay_is_asked() {
+        assert_eq!(
+            prepare_attest(&body("https://other.test"), "https://door.test").unwrap_err(),
+            AttestRefusal::WrongOrigin
+        );
+        assert_eq!(
+            prepare_attest("not json", "https://door.test").unwrap_err(),
+            AttestRefusal::Malformed
+        );
+        let mut bad =
+            serde_json::from_str::<serde_json::Value>(&body("https://door.test")).unwrap();
+        bad["lane"]["mac"] = serde_json::json!("zz");
+        assert_eq!(
+            prepare_attest(&bad.to_string(), "https://door.test").unwrap_err(),
+            AttestRefusal::Malformed
+        );
+        let mut long =
+            serde_json::from_str::<serde_json::Value>(&body("https://door.test")).unwrap();
+        long["attestJson"] = serde_json::json!("x".repeat(ATTEST_JSON_MAX + 1));
+        assert_eq!(
+            prepare_attest(&long.to_string(), "https://door.test").unwrap_err(),
+            AttestRefusal::Malformed
+        );
+        let mut short_ask =
+            serde_json::from_str::<serde_json::Value>(&body("https://door.test")).unwrap();
+        short_ask["attestJson"] =
+            serde_json::json!(r#"{"origin":"https://door.test","ask":"abc","clientNonce":"00"}"#);
+        assert_eq!(
+            prepare_attest(&short_ask.to_string(), "https://door.test").unwrap_err(),
+            AttestRefusal::Malformed
+        );
+    }
+
+    #[test]
+    fn the_answer_carries_the_offer_and_the_server_nonce_by_the_wire_names() {
+        let a = AttestAnswer {
+            session: LaneOffer {
+                id: "aa".repeat(32),
+                expires_at_ms: 5,
+                salt: "bb".repeat(32),
+                ask: "a1b2c3d4e5f60718".into(),
+            },
+            server_nonce: "cc".repeat(32),
+        };
+        let j = serde_json::to_value(&a).unwrap();
+        assert_eq!(j["session"]["expiresAt"], 5);
+        assert!(j["serverNonce"].is_string());
+    }
+}
