@@ -41,6 +41,10 @@ pub const LANE_IDLE_MS: u64 = 60 * 60 * 1000;
 pub const SESSION_HEADER: &str = "x-low-session";
 pub const SESSION_IDENTITY_HEADER: &str = "x-low-session-identity";
 pub const SESSION_COUNTER_HEADER: &str = "x-low-session-n";
+/// The largest counter a laned call may carry: `Number.MAX_SAFE_INTEGER`. Above
+/// it a JSON number no longer survives the JavaScript side of the store's
+/// boundary (0.3.5, bsv-low #493); a lane makes nowhere near 2^53 calls.
+pub const MAX_SAFE_COUNTER: u64 = (1u64 << 53) - 1;
 pub const SESSION_MAC_HEADER: &str = "x-low-session-mac";
 /// The client's explicit ask, a header on its FIRST BRC-104-signed general
 /// message (D10: only an explicit ask mints; the unsigned handshake never does).
@@ -75,16 +79,28 @@ pub struct LaneRecord {
     /// The handshake's peer identity key (66 hex, lowercase).
     pub identity: String,
     pub expires_at_ms: u64,
-    /// The highest accepted `h`.
+    /// The highest accepted `h`. Rides as a DECIMAL STRING since 0.3.5 like the
+    /// mask below: the caller's counter is bounded at the header (`MAX_SAFE_COUNTER`)
+    /// and the store's serializer accepts exactly up to that bound — the same
+    /// constant on both sides, zero headroom — so the field does not depend on it.
+    #[serde(with = "u64_as_string")]
     pub last_h: u64,
     /// Bit `k` set ⇔ `last_h - k` was accepted (k < 64). Rides as a DECIMAL
     /// STRING (0.3.5, bsv-low #493): the store persists the whole cell through
     /// the Durable Object's `storage().put`, whose serializer carries a `u64`
-    /// as a JavaScript number and THROWS past 2^53 — a full window reaches
-    /// that on the 54th accepted call (bit 53 set), after which every verify
-    /// of the lane fails at the put (relay 0.3.24's class, seen live on the
-    /// hub mirror 2026-09-20). A number still reads: every row persisted
-    /// before 0.3.5 is below 2^53 by construction (a larger one never stored).
+    /// as a JavaScript number and THROWS past 2^53. Bit 53 is set as soon as an
+    /// accepted counter sits 53 above the one before it — the 54th of a dense
+    /// run, or the SECOND call of a client whose counter skipped (aborted
+    /// fetches, offline retries) — after which every verify of the lane fails
+    /// at the put (relay 0.3.24's class, seen live on the hub mirror
+    /// 2026-09-20). A number still reads: every row persisted before 0.3.5 is
+    /// below 2^53 by construction (a larger one never stored). The untagged
+    /// number-or-string shape needs a self-describing deserializer:
+    /// serde-wasm-bindgen's `deserialize_any` reads both a JS number and a JS
+    /// string (0.6.x), and a string is always representable. A row that fails
+    /// to read is an EMPTY cell (`AuthSessionStore::load`): the lane is
+    /// unknown, the door refuses by name and the client re-mints — lossy,
+    /// never a grant.
     #[serde(default, with = "u64_as_string")]
     pub seen_mask: u64,
     /// When the lane was minted (ms); the absolute lifetime counts from here.
@@ -415,6 +431,13 @@ pub fn parse_lane_headers(
     let Some(h) = h.and_then(|v| v.trim().parse::<u64>().ok()) else {
         return Err(Refusal::Malformed);
     };
+    // 0.3.5 (bsv-low #493, the review's MED): the counter rides to the store as
+    // a JSON number (`req.json()` = JSON.parse + serde-wasm-bindgen), which
+    // faults above 2^53 — a crafted header would turn into an uncaught store
+    // fault (a 503 the client retries) instead of a refusal by name.
+    if h > MAX_SAFE_COUNTER {
+        return Err(Refusal::Malformed);
+    }
     let mac = mac.map(str::trim).unwrap_or_default().to_ascii_lowercase();
     if !is_hex_of(&mac, 64) {
         return Err(Refusal::Malformed);
@@ -753,29 +776,72 @@ mod tests {
         l.last_h = 70;
         l.seen_mask = u64::MAX - 5; // the high bit set: every slot of the window but two taken
         let v = serde_json::to_value(&l).unwrap();
-        assert_eq!(v["seenMask"], serde_json::Value::String((u64::MAX - 5).to_string()));
+        assert_eq!(
+            v["seenMask"],
+            serde_json::Value::String((u64::MAX - 5).to_string())
+        );
+        assert_eq!(
+            v["lastH"],
+            serde_json::Value::String("70".to_string()),
+            "the counter rides as a string too"
+        );
         let back: LaneRecord = serde_json::from_value(v).unwrap();
         assert_eq!(back, l);
+        // a gap of 53 sets bit 53 on the SECOND accepted call (the review's finding 5)
+        let (mut gap, _) = minted();
+        let body = "{}";
+        let call_gap = |l: &mut LaneRecord, h: u64| {
+            let mac = http_mac(l, h, "GET", "/results?identity=02aa", body);
+            verify(
+                l,
+                h,
+                "GET",
+                "/results?identity=02aa",
+                &digest(body),
+                &mac,
+                5_000,
+            )
+        };
+        assert_eq!(call_gap(&mut gap, 1), Ok(()));
+        assert_eq!(call_gap(&mut gap, 54), Ok(()));
+        assert!(gap.seen_mask >= (1u64 << 53), "bit 53 after one skip of 53");
+        assert!(serde_json::to_value(&gap).unwrap()["seenMask"].is_string());
         // 54 accepted calls in a row set bit 53: the value the old shape could not put
         let (mut fresh, _) = minted();
         let body = "{}";
         let call = |l: &mut LaneRecord, h: u64| {
             let mac = http_mac(l, h, "GET", "/results?identity=02aa", body);
-            verify(l, h, "GET", "/results?identity=02aa", &digest(body), &mac, 5_000)
+            verify(
+                l,
+                h,
+                "GET",
+                "/results?identity=02aa",
+                &digest(body),
+                &mac,
+                5_000,
+            )
         };
         for h in 1..=54u64 {
             assert_eq!(call(&mut fresh, h), Ok(()));
         }
-        assert!(fresh.seen_mask >= (1u64 << 53), "the 54th accepted call sets bit 53");
-        assert!(fresh.seen_mask > 9_007_199_254_740_991, "past Number.MAX_SAFE_INTEGER");
+        assert!(
+            fresh.seen_mask >= (1u64 << 53),
+            "the 54th accepted call sets bit 53"
+        );
+        assert!(
+            fresh.seen_mask > 9_007_199_254_740_991,
+            "past Number.MAX_SAFE_INTEGER"
+        );
         let v = serde_json::to_value(&fresh).unwrap();
         assert!(v["seenMask"].is_string(), "a string, whatever the value");
         assert_eq!(serde_json::from_value::<LaneRecord>(v).unwrap(), fresh);
-        // a row persisted before 0.3.5 carried a number (small by construction)
+        // a row persisted before 0.3.5 carried numbers (small by construction)
         let mut old = serde_json::to_value(minted().0).unwrap();
         old["seenMask"] = serde_json::json!(4_503_599_627_370_495u64); // 2^52 - 1
+        old["lastH"] = serde_json::json!(52u64);
         let parsed: LaneRecord = serde_json::from_value(old).unwrap();
         assert_eq!(parsed.seen_mask, 4_503_599_627_370_495u64);
+        assert_eq!(parsed.last_h, 52);
         // a missing field is the default (the pre-window rows)
         let mut none = serde_json::to_value(minted().0).unwrap();
         none.as_object_mut().unwrap().remove("seenMask");
@@ -785,6 +851,50 @@ mod tests {
         let mut junk = serde_json::to_value(minted().0).unwrap();
         junk["seenMask"] = serde_json::json!("not-a-mask");
         assert!(serde_json::from_value::<LaneRecord>(junk).is_err());
+    }
+
+    /// The review's MED (0.3.5): a counter above `Number.MAX_SAFE_INTEGER` is
+    /// refused BY NAME at the header, never carried to the store as a JSON
+    /// number that faults there.
+    #[test]
+    fn a_counter_past_the_safe_integer_is_malformed_at_the_header() {
+        let id = "ab".repeat(32);
+        let mac = "cd".repeat(32);
+        let ok = parse_lane_headers(
+            Some(&id),
+            Some(IDENTITY),
+            Some("9007199254740991"),
+            Some(&mac),
+        );
+        assert_eq!(ok.unwrap().unwrap().h, MAX_SAFE_COUNTER);
+        assert_eq!(
+            parse_lane_headers(
+                Some(&id),
+                Some(IDENTITY),
+                Some("9007199254740992"),
+                Some(&mac)
+            ),
+            Err(Refusal::Malformed)
+        );
+        assert_eq!(
+            parse_lane_headers(
+                Some(&id),
+                Some(IDENTITY),
+                Some("18446744073709551615"),
+                Some(&mac)
+            ),
+            Err(Refusal::Malformed)
+        );
+        assert_eq!(
+            parse_lane_headers(
+                Some(&id),
+                Some(IDENTITY),
+                Some("18446744073709551616"),
+                Some(&mac)
+            ),
+            Err(Refusal::Malformed),
+            "past u64 was malformed already"
+        );
     }
 
     #[test]
