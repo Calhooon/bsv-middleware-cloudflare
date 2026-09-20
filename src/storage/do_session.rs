@@ -70,8 +70,10 @@ pub struct SessionCell {
     /// The session record, once a handshake saved it.
     pub session: Option<StoredSession>,
     /// The session's expiry (ms since the epoch); nothing is answered past it.
+    // bounded: a millisecond stamp
     pub expires_at_ms: u64,
     /// Consumed per-request nonces → their expiry (ms since the epoch).
+    // bounded: the values are millisecond expiries
     pub consumed: HashMap<String, u64>,
     /// Session lane (0.3.4): an object keyed by a LANE id holds the lane here
     /// and never a session; a session object never holds a lane.
@@ -264,6 +266,7 @@ pub fn route_scope(scope: &str) -> ScopeRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SaveBody {
     pub session: StoredSession,
+    // bounded: a TTL in seconds (the configured session TTL)
     pub ttl_seconds: u64,
 }
 
@@ -272,6 +275,7 @@ pub struct SaveBody {
 pub struct NonceBody {
     pub nonce: String,
     #[serde(default)]
+    // bounded: a TTL in seconds (the configured session TTL)
     pub ttl_seconds: Option<u64>,
 }
 
@@ -287,6 +291,7 @@ pub struct LanePutBody {
 pub struct LaneVerifyBody {
     pub ask: LaneVerifyAsk,
     #[serde(default)]
+    // bounded: the configured idle window in ms (an hour)
     pub idle_ms: Option<u64>,
 }
 

@@ -150,6 +150,7 @@ pub use crate::middleware::session_lane::LaneRecord;
 pub struct LaneVerifyAsk {
     pub id: String,
     pub identity: String,
+    // bounded: the counter is refused above MAX_SAFE_COUNTER at the header (parse_lane_headers)
     pub h: u64,
     pub method: String,
     pub path_and_query: String,

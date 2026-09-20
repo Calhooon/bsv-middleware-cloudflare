@@ -103,8 +103,10 @@ pub struct StoredSession {
     /// Whether certificates have been validated.
     pub certificates_validated: bool,
     /// Timestamp when the session was created (ms since epoch).
+    // bounded: a millisecond stamp
     pub created_at: u64,
     /// Timestamp of last activity (ms since epoch).
+    // bounded: a millisecond stamp
     pub last_update: u64,
 }
 

@@ -78,6 +78,7 @@ pub struct LaneRecord {
     pub key: String,
     /// The handshake's peer identity key (66 hex, lowercase).
     pub identity: String,
+    // bounded: a millisecond stamp
     pub expires_at_ms: u64,
     /// The highest accepted `h`. Rides as a DECIMAL STRING since 0.3.5 like the
     /// mask below: the caller's counter is bounded at the header (`MAX_SAFE_COUNTER`)
@@ -106,6 +107,7 @@ pub struct LaneRecord {
     /// When the lane was minted (ms); the absolute lifetime counts from here.
     /// A record without one (pre-lifetime) reads as minted at 0: expired.
     #[serde(default)]
+    // bounded: a millisecond stamp
     pub minted_at_ms: u64,
 }
 
