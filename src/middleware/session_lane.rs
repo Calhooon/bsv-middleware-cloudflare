@@ -77,13 +77,46 @@ pub struct LaneRecord {
     pub expires_at_ms: u64,
     /// The highest accepted `h`.
     pub last_h: u64,
-    /// Bit `k` set ⇔ `last_h - k` was accepted (k < 64).
-    #[serde(default)]
+    /// Bit `k` set ⇔ `last_h - k` was accepted (k < 64). Rides as a DECIMAL
+    /// STRING (0.3.5, bsv-low #493): the store persists the whole cell through
+    /// the Durable Object's `storage().put`, whose serializer carries a `u64`
+    /// as a JavaScript number and THROWS past 2^53 — a full window reaches
+    /// that on the 54th accepted call (bit 53 set), after which every verify
+    /// of the lane fails at the put (relay 0.3.24's class, seen live on the
+    /// hub mirror 2026-09-20). A number still reads: every row persisted
+    /// before 0.3.5 is below 2^53 by construction (a larger one never stored).
+    #[serde(default, with = "u64_as_string")]
     pub seen_mask: u64,
     /// When the lane was minted (ms); the absolute lifetime counts from here.
     /// A record without one (pre-lifetime) reads as minted at 0: expired.
     #[serde(default)]
     pub minted_at_ms: u64,
+}
+
+/// `u64` ⇄ a decimal string on the wire (see `LaneRecord::seen_mask`); a number
+/// is still read (the rows persisted before 0.3.5, all below 2^53 by
+/// construction — anything larger never persisted). The same module as the
+/// relay's (`rust-message-box` 0.3.24 `session_lane::u64_as_string`).
+pub mod u64_as_string {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        v.to_string().serialize(s)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(u64),
+        Str(String),
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        match NumOrStr::deserialize(d)? {
+            NumOrStr::Num(n) => Ok(n),
+            NumOrStr::Str(t) => t.parse::<u64>().map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 /// What the SIGNED answer to the first general message carries when it asked.
@@ -707,6 +740,51 @@ mod tests {
         let parsed: LaneRecord = serde_json::from_str(old).unwrap();
         assert_eq!(parsed.seen_mask, 0);
         assert_eq!(parsed.last_h, 3);
+    }
+
+    /// bsv-low #493 (0.3.5): the store persists the whole cell through the
+    /// Durable Object's `storage().put`, whose serializer carries a `u64` as a
+    /// JavaScript number and throws past 2^53; a full replay window reaches
+    /// that on the 54th accepted call. The mask rides as a decimal string on
+    /// the wire; a number (every pre-0.3.5 row) and a missing field still read.
+    #[test]
+    fn the_seen_mask_rides_as_a_string_so_a_full_window_survives_the_storage_boundary() {
+        let (mut l, _) = minted();
+        l.last_h = 70;
+        l.seen_mask = u64::MAX - 5; // the high bit set: every slot of the window but two taken
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(v["seenMask"], serde_json::Value::String((u64::MAX - 5).to_string()));
+        let back: LaneRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back, l);
+        // 54 accepted calls in a row set bit 53: the value the old shape could not put
+        let (mut fresh, _) = minted();
+        let body = "{}";
+        let call = |l: &mut LaneRecord, h: u64| {
+            let mac = http_mac(l, h, "GET", "/results?identity=02aa", body);
+            verify(l, h, "GET", "/results?identity=02aa", &digest(body), &mac, 5_000)
+        };
+        for h in 1..=54u64 {
+            assert_eq!(call(&mut fresh, h), Ok(()));
+        }
+        assert!(fresh.seen_mask >= (1u64 << 53), "the 54th accepted call sets bit 53");
+        assert!(fresh.seen_mask > 9_007_199_254_740_991, "past Number.MAX_SAFE_INTEGER");
+        let v = serde_json::to_value(&fresh).unwrap();
+        assert!(v["seenMask"].is_string(), "a string, whatever the value");
+        assert_eq!(serde_json::from_value::<LaneRecord>(v).unwrap(), fresh);
+        // a row persisted before 0.3.5 carried a number (small by construction)
+        let mut old = serde_json::to_value(minted().0).unwrap();
+        old["seenMask"] = serde_json::json!(4_503_599_627_370_495u64); // 2^52 - 1
+        let parsed: LaneRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.seen_mask, 4_503_599_627_370_495u64);
+        // a missing field is the default (the pre-window rows)
+        let mut none = serde_json::to_value(minted().0).unwrap();
+        none.as_object_mut().unwrap().remove("seenMask");
+        let parsed: LaneRecord = serde_json::from_value(none).unwrap();
+        assert_eq!(parsed.seen_mask, 0);
+        // a string that is no number reads as a fault, never as a value
+        let mut junk = serde_json::to_value(minted().0).unwrap();
+        junk["seenMask"] = serde_json::json!("not-a-mask");
+        assert!(serde_json::from_value::<LaneRecord>(junk).is_err());
     }
 
     #[test]
