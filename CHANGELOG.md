@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.7 — 2026-10-08
+
+- `conformance/brc29-payment-vectors.json`: the BRC-29 payment-verification conformance set (20 cases: output checks incl. the reference's first-output rule, no-header-service forms, merkle-root outcomes) with `tests/conformance_brc29.rs` pinning and running it. A second implementation runs the same file; see `conformance/README.md`.
+- One additive public decision function so the verdict is callable without a fetch. No behaviour or signature changes.
+
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
