@@ -1352,7 +1352,7 @@ mod tests {
         assert_eq!(
             src.matches("mint_lane_offer(").count(),
             2,
-            "exactly two CALL sites: the Authenticated arm and the #443 step-4 attested wrapper (the definition carries generics before its paren)"
+            "exactly two CALL sites: the Authenticated arm and the step-4 attested wrapper (the definition carries generics before its paren)"
         );
         let wrapper = &src[src.find("pub async fn mint_attested_lane").unwrap()..];
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
