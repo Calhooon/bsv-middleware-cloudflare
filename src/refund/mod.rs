@@ -13,13 +13,18 @@
 //! The result is an `AtomicBEEF` envelope that the client can pass to
 //! `internalizeAction` to receive the refunded funds.
 
-pub mod signer;
+//!
+//! The pure half (the client's receiving key, the template signer) is
+//! `bsv_middleware_core::refund`; [`signer`] is re-exported at its 0.3 path.
+
+pub use bsv_middleware_core::refund::signer;
 
 use crate::client::WorkerStorageClient;
+use bsv_middleware_core::refund::refund_locking_script;
 use bsv_sdk::auth::utils::create_nonce;
-use bsv_sdk::primitives::{to_base64, PrivateKey, PublicKey};
+use bsv_sdk::primitives::{to_base64, PrivateKey};
 use bsv_sdk::transaction::Beef;
-use bsv_sdk::wallet::{Counterparty, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel};
+use bsv_sdk::wallet::ProtoWallet;
 
 /// Information about a completed refund, returned to the caller for inclusion
 /// in the HTTP response to the client.
@@ -104,25 +109,9 @@ pub async fn issue_refund(
         .map_err(|e| RefundError::KeyDerivation(format!("RNG: {}", e)))?;
     let refund_suffix = to_base64(&suffix_bytes);
 
-    let key_id = format!("{} {}", refund_prefix, refund_suffix);
-    let client_pubkey = PublicKey::from_hex(client_identity_key)
-        .map_err(|e| RefundError::KeyDerivation(format!("Invalid client key: {}", e)))?;
-
-    let derived = wallet
-        .get_public_key(GetPublicKeyArgs {
-            identity_key: false,
-            protocol_id: Some(Protocol::new(SecurityLevel::Counterparty, "3241645161d8")),
-            key_id: Some(key_id),
-            counterparty: Some(Counterparty::Other(client_pubkey)),
-            for_self: Some(false),
-        })
-        .map_err(|e| RefundError::KeyDerivation(e.to_string()))?;
-
-    // derived.public_key is a hex string
-    let pubkey_bytes = hex::decode(&derived.public_key)
-        .map_err(|e| RefundError::KeyDerivation(format!("Invalid derived pubkey hex: {}", e)))?;
-    let pkh = signer::hash160(&pubkey_bytes);
-    let locking_script = format!("76a914{}88ac", hex::encode(pkh));
+    let locking_script =
+        refund_locking_script(&wallet, client_identity_key, &refund_prefix, &refund_suffix)
+            .map_err(|e| RefundError::KeyDerivation(e.0))?;
 
     // 2. Create refund transaction via storage server
     let storage_wallet = ProtoWallet::new(Some(private_key));

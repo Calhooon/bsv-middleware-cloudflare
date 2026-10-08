@@ -108,6 +108,29 @@ pub async fn release_payment_nonce(db: &D1Database, nonce: &str) {
     }
 }
 
+/// A D1 `payment_claims` table as the core's
+/// [`ClaimStore`](bsv_middleware_core::ClaimStore): [`claim_payment_nonce`]
+/// and [`release_payment_nonce`] behind the trait, for code written against
+/// the core. A storage fault is a [`StoreError`](bsv_middleware_core::StoreError).
+pub struct D1ClaimStore<'a>(pub &'a D1Database);
+
+impl bsv_middleware_core::ClaimStore for D1ClaimStore<'_> {
+    async fn claim(
+        &self,
+        key: &str,
+        agent: &str,
+    ) -> std::result::Result<bool, bsv_middleware_core::StoreError> {
+        claim_payment_nonce(self.0, key, agent)
+            .await
+            .map_err(bsv_middleware_core::StoreError::new)
+    }
+
+    async fn release(&self, key: &str) -> std::result::Result<(), bsv_middleware_core::StoreError> {
+        release_payment_nonce(self.0, key).await;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

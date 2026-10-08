@@ -1,66 +1,12 @@
 //! Request/response types for BSV Auth Cloudflare middleware.
+//!
+//! [`AuthContext`], [`PaymentContext`] and [`BsvPayment`] are
+//! `bsv_middleware_core::types`, re-exported at their 0.3 paths. What stays
+//! here is bound to this runtime: the stored records and the clock.
 
 use serde::{Deserialize, Serialize};
 
-/// Authentication context attached to authenticated requests.
-///
-/// This provides information about the authenticated peer to request handlers.
-#[derive(Debug, Clone)]
-pub struct AuthContext {
-    /// The authenticated peer's identity key (compressed public key hex, 66 chars).
-    pub identity_key: String,
-    /// Whether the request is fully authenticated.
-    pub is_authenticated: bool,
-}
-
-impl AuthContext {
-    /// Creates an authenticated context with the given identity key.
-    pub fn authenticated(identity_key: String) -> Self {
-        Self {
-            identity_key,
-            is_authenticated: true,
-        }
-    }
-
-    /// Creates an unauthenticated context (for requests allowed without auth).
-    pub fn unauthenticated() -> Self {
-        Self {
-            identity_key: "unknown".to_string(),
-            is_authenticated: false,
-        }
-    }
-}
-
-/// Payment context attached to requests that include payment.
-///
-/// Matches Express's `req.payment = { satoshisPaid, accepted, tx }`.
-#[derive(Debug, Clone)]
-pub struct PaymentContext {
-    /// Amount paid in satoshis.
-    /// Express: `satoshisPaid`
-    pub satoshis_paid: u64,
-    /// Whether payment was accepted by the wallet.
-    /// Express: `accepted`
-    pub accepted: bool,
-    /// The base64-encoded transaction (from the payment header).
-    /// Express: `tx`
-    pub tx: Option<String>,
-}
-
-/// BSV Payment data from x-bsv-payment header.
-///
-/// This structure represents the payment information sent by clients
-/// in the `x-bsv-payment` header for paid requests.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BsvPayment {
-    /// Derivation prefix from the 402 response.
-    pub derivation_prefix: String,
-    /// Derivation suffix chosen by the client.
-    pub derivation_suffix: String,
-    /// Base64 encoded BEEF transaction.
-    pub transaction: String,
-}
+pub use bsv_middleware_core::types::{AuthContext, BsvPayment, PaymentContext};
 
 /// Generic error response body.
 #[derive(Debug, Serialize)]
@@ -108,6 +54,18 @@ pub struct StoredSession {
     /// Timestamp of last activity (ms since epoch).
     // bounded: a millisecond stamp
     pub last_update: u64,
+}
+
+/// The three fields the BRC-103 signatures are keyed on, for the core's
+/// sign and verify functions.
+impl From<&StoredSession> for bsv_middleware_core::SessionBinding {
+    fn from(session: &StoredSession) -> Self {
+        bsv_middleware_core::SessionBinding::new(
+            session.session_nonce.clone(),
+            session.peer_identity_key.clone(),
+            session.peer_nonce.clone(),
+        )
+    }
 }
 
 impl StoredSession {

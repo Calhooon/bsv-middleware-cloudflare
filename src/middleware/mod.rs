@@ -4,6 +4,8 @@ pub mod auth;
 pub mod multipart;
 pub mod payment;
 pub mod session_lane;
+#[cfg(test)]
+mod session_lane_tests;
 
 pub use auth::{
     add_lane_cors_headers, process_auth, process_auth_do, process_auth_lane,

@@ -1,37 +1,161 @@
 # Changelog
 
+All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
+patch versions are additive unless a line below says otherwise.
+
+## 0.4.0 — 2026-10-08
+
+The core extract. The rules moved to a new runtime-free crate, `bsv-middleware-core` 0.1.0 (this repository,
+`core/`); this crate is now the Cloudflare Workers adapter over it. Carries everything in 0.3.7, 0.3.8 and 0.3.9.
+**One breaking change, for 0.3.9 adopters only:** `PaymentVerifyError::Unverifiable` carries `{ satoshis, reason }`
+here where 0.3.9 carried `{ height, reason }`; a match written against 0.3.9's fields must change (a `_` arm compiles
+unchanged). Every other 0.3 public item keeps its name, path and signature (re-exported from the core where the type
+moved), and the fleet's call sites compile unchanged. Versions below 1.0 may change public API between minors.
+
+### What moved to the core (re-exported here at the 0.3 paths)
+
+- `types::{AuthContext, PaymentContext, BsvPayment}`.
+- `transport::{auth_headers, HttpRequestData, HttpResponseData}`; the request payload builder, the varint
+  writer, the signable-header filters and `message_to_headers` are `bsv_middleware_core::brc104`
+  (`CloudflareTransport` delegates to them).
+- `middleware::session_lane` (whole; the adapter keeps the suite and `tests/fixtures/session_lane.vectors.json`).
+- `refund::signer` (whole); `issue_refund` derives the client's key through `bsv_middleware_core::refund`.
+- The BRC-103 sign/verify, the identity binding, the `InitialResponse` and `CertificateResponse` builders and
+  response signing (`bsv_middleware_core::auth`, over a `SessionBinding`); `process_auth*`, `sign_response` and
+  `sign_json_response` call them and are byte-for-byte on the wire.
+- BRC-29 derivation, the output check, BEEF completeness and the SPV decision
+  (`bsv_middleware_core::{brc29, spv, payment_verify}`), answered in the six words (`PaymentVerdict`).
+- `PAYMENT_NONCE_SCOPE` (`bsv_middleware_core::store`).
+
+### Added
+
+- `UrlHeaderService`: the core's `HeaderService` over a ChainTracks-compatible base URL (Workers `fetch`), built
+  only through the 0.3.6 configuration gate (`UrlHeaderService::resolve`).
+- `verify_brc29_payment_verdict`: the core's `PaymentVerdict` through any `HeaderService`, for callers that
+  decide the words themselves.
+- `accept_verdict`: the one visible match from the core's words to `PaymentVerifyError` / `Ok(satoshis)`.
+- `PaymentVerifyError::Unverifiable { satoshis, reason }`: new on this line (0.3.9 introduced it on the 0.3 line as
+  `{ height, reason }`; see Changed). A host's `_` arm compiles unchanged; that arm answers the client's 400 today, so
+  hosts should add a 503 arm for it (the quote kept).
+- `PaymentVerifyError: From<PaymentFault>`; `AuthCloudflareError: From<bsv_middleware_core::AuthError>`.
+- `SessionNonceStore(&storage)`: any `SessionStorage` as the core's `PaymentNonceStore`; `D1ClaimStore(&db)`
+  (feature `d1-claims`): the D1 table as the core's `ClaimStore`.
+- `bsv_middleware_cloudflare::core` (the core crate as a module) and the top-level `HeaderService`,
+  `PaymentVerdict`, `PaymentFault` re-exports.
+- `core/tests/conformance_brc29.rs`: the core runs the 20 vectors of `conformance/brc29-payment-vectors.json` (0.3.7)
+  through its `HeaderService` trait with a stub, from its own copy of the file (`core/conformance/`, shipped in the
+  core's package); the adapter's runner re-pins the root file with the 0.4.0 producer line, writes both copies on
+  `emit`, and pins the core's copy byte-identical to the root one.
+
+### Changed
+
+Against 0.3.9 (the last release on the 0.3 line), three behaviours differ and are intended:
+
+- `Unverifiable` carries `{ satoshis, reason }` (0.3.9: `{ height, reason }`), matching the conformance vectors as the
+  vectors' owner (bsv-stack-lean) keeps them: `spv-lookup-error` expects `fields: {satoshis}`; 0.3.9's file wrote
+  `{height}` and retired the glossary entry `AcceptedUnverified`, this file keeps the entry as a retired alias.
+- Root precedence: the core asks the header service about every root and a mismatch at any height wins over an
+  unanswered root (`RootMismatch`, 400); 0.3.9 stopped at the lowest height that did not match, so a lookup error at
+  a low height answered `Unverifiable` (503) even when a higher root was wrong. A lookup error cannot mask fraud here.
+- Underpaid / WrongScript on the middleware's own payment path answer 400 `ERR_INVALID_PAYMENT` with the quote kept
+  (0.3.8 and 0.3.9 answered 402 with a fresh challenge); reference parity with the Express payment middleware.
+
+- **A header lookup the service cannot answer fails closed.** 0.3.x accepted a payment whose merkle root could not be
+  checked (service unreachable, HTTP error, unparseable answer, height not yet indexed) with a logged warning; 0.4.0
+  refuses it, by the project's ruling of 2026-10-08: a root that was not checked against a block header is not
+  evidence. `accept_verdict`, and with it `verify_brc29_payment`, `verify_brc29_payment_with_header_lookup` and
+  `verify_brc29_payment_verdict`'s callers that use it, answer `Err(PaymentVerifyError::Unverifiable { satoshis,
+  reason })` where 0.3.x answered `Ok(satoshis)`, so no host serves on it by accident. On the middleware's own path
+  (`process_payment_with_storage`, `process_payment_with_storage_signed`, the deprecated `process_payment`) the word
+  is `503 ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept: a transient server-side condition (nothing charged, the
+  prefix not consumed, no fresh challenge, the wallet not called; the client retries the same payment later),
+  distinct from `500 ERR_SERVER_MISCONFIGURED` for `NoHeaderService` and from the 400s for a payment that is wrong
+  (`Underpaid`, `WrongScript`, `RootMismatch`, a `PaymentFault`). The one function that still answers `Ok` with roots
+  unchecked is the named opt-out `verify_brc29_payment_structural_only`, because its caller asked for that by name;
+  it no longer goes through `accept_verdict` for that word. The conformance file's `spv-lookup-error` case expects
+  `Unverifiable`, refused, and carries the ruling in its `rulings` list. Hosts that run their own payment flow
+  through `verify_brc29_payment` should render the new variant 503-class (today a two-arm match answers 400).
+- **A short or misdirected payment on the middleware's own path is refused with `400 ERR_INVALID_PAYMENT` and the
+  quote is kept** (`process_payment_with_storage`, `process_payment_with_storage_signed`, the deprecated
+  `process_payment`; the core's `Underpaid` / `WrongScript` on output 0). 0.3.8 answered `402 ERR_INVALID_PAYMENT`
+  with a fresh challenge. Now: no fresh challenge, the derivation prefix not consumed, the wallet not called, and the
+  body says the challenge is unchanged, so an honest client corrects the payment and retries under the same prefix.
+  Why: the Express reference (`payment-express-middleware`) answers 400 for every refusal after the challenge and
+  reserves 402 for "pay now"; a 402 re-arms automated payers (AuthFetch-class clients) into a second payment for the
+  same request while the first sits un-internalized; one live quote per request keeps the single-use rule simple;
+  and existing hosts built on this crate's `verify_brc29_payment` already answer 400 and keep the quote. `NoHeaderService` stays `500 ERR_SERVER_MISCONFIGURED`,
+  `RootMismatch` and a `PaymentFault` `400 ERR_INVALID_PAYMENT`, `Unverifiable` `503 ERR_HEADER_SERVICE_UNAVAILABLE`
+  (above). The words did not change; the HTTP rendering of three of them did, and one case's expected word
+  (`spv-lookup-error`) changed with the ruling.
+
+### Behaviour
+
+- Unchanged on the wire, except the two refusals under Changed. The verdict mapping is documented in
+  `payment_verify`: `Verified` is the only `Ok(satoshis)`; every other word is the same-named `Err`, `Unverifiable`
+  included (**fail-closed**, with the reason logged).
+- `verify_brc29_payment_structural_only` answers through the core's `Unverifiable` word when a proof carries
+  roots and serves it with the warning logged, as 0.3.6 did: the named opt-out is the one place that may.
+- **The middleware's own payment path decides from the core's words.** `process_payment_with_storage`,
+  `process_payment_with_storage_signed` and the deprecated `process_payment` run the core's output check
+  (`bsv_middleware_core::verify_payment_output`) on output 0 and match its `PaymentVerdict` once
+  (`judge_paying_output`): `Verified` serves and records the amount read; `Underpaid` / `WrongScript` are
+  `400 ERR_INVALID_PAYMENT` with the quote kept (the prefix not consumed, no fresh challenge, the wallet not called;
+  see Changed); a `PaymentFault` or `RootMismatch` is `400 ERR_INVALID_PAYMENT`, the prefix kept; `NoHeaderService` is
+  `500 ERR_SERVER_MISCONFIGURED` (the server's own fault, never a client error); `Unverifiable` is
+  `503 ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept (refused, fail-closed; see Changed). Only `Verified` serves.
+  The output check answers three of the six words today: this path
+  runs no SPV (no merkle proof is checked against a header; what the wallet storage server does on
+  `internalizeAction` is not verified by this crate, and `verify_brc29_payment` is the caller's proof step before
+  the middleware); the other arms are the path's standing answer should the check grow a proof step. Every payment
+  0.3.8 served is served, with the same `satoshis_paid`; the one wire answer that changed is the refusal under
+  Changed.
+
+### Tests
+
+- 0.3.8 baseline: 212 unit + 2 conformance-file tests. 0.4.0: adapter 220 unit + 4 conformance-file tests (the
+  runner, the pinned bytes, the core's copy, the ruling; the emitter is ignored); core 89 unit (82 without `refund`)
+  + 3 conformance. 23 test paths moved from the adapter to the core, none lost. Both runners check the outcome as
+  well as the word: only `Verified` serves.
+
+### Known
+
+- Error-code spelling: hosts that run their own payment flow through `verify_brc29_payment` have answered
+  `ERR_PAYMENT_INVALID` for a refused payment; this crate and the Express reference spell it `ERR_INVALID_PAYMENT`.
+  The Express spelling is the one to keep; aligning the hosts (or documenting the alias) is a later release.
+- Hosts on a two-arm match (`NoHeaderService` → 500, `_` → 400) render the new `PaymentVerifyError::Unverifiable`
+  as the client's 400 today; the intended answer is 503-class with the quote kept, so the client retries the same
+  payment. The hosts' change, not this crate's.
+- The conformance file's `words` glossary still spells `Unverifiable` by its retired name `AcceptedUnverified`, and
+  the ruled case's `expected.fields` carry that word's `satoshis`; both are the file owner's to change in a reviewed
+  diff. This crate's copy differs from the owner's in the `producer` line, the ruling's `why` (public wording) and,
+  on the ruled case, `crate_result` and `note` (this crate's own answer, now a refusal).
+- `HeaderService::merkle_root` and the core's store traits return `impl Future` without a `Send` bound, by design
+  for wasm32. A host on a multi-threaded runtime needs its own implementations' futures to be `Send`; the verifier
+  is generic over the service, so that works, but it is the host's obligation and the core README will say so
+  before a native host adopts the trait.
+
+### Removed from the dependency list
+
+- `hmac` and `ripemd` (they moved with the lane and the signer; `sha2` stays for the Durable Object cell).
+
+## 0.3.9 — 2026-10-08 (0.3 line, branch `release-0.3`, tag `v0.3.9`)
+
+- Fails closed on a header-service lookup error: `verify_brc29_payment` (and the `_with_header_lookup` form) return
+  `Err(PaymentVerifyError::Unverifiable { height, reason })` instead of accepting with a warning; the middleware's own
+  payment path answers 503 `ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept (prefix not consumed, wallet not
+  called). The owner's ruling of 2026-10-08. The conformance file's `spv-lookup-error` case expects `Unverifiable`.
+- No other change: 0.3.8's 402-with-a-fresh-challenge on Underpaid / WrongScript stays on this line.
+
 ## 0.3.8 — 2026-10-08
 
 ### Fixed
 
-- **The middleware's own payment flow reads the paying output** (P0-3b, bsv-stack-lean #50): `verify_brc29_payment_output` runs on output 0 before the derivation prefix is consumed and before `internalizeAction`; `Underpaid` and `WrongScript` answer 402 with a fresh challenge; the amount read is recorded as `satoshis_paid`. 0.3.7 shipped the conformance vectors without this wiring.
-
-## 0.3.7 — 2026-10-08
-
-- `conformance/brc29-payment-vectors.json`: the BRC-29 payment-verification conformance set (20 cases: output checks incl. the reference's first-output rule, no-header-service forms, merkle-root outcomes) with `tests/conformance_brc29.rs` pinning and running it. A second implementation runs the same file; see `conformance/README.md`.
-- One additive public decision function so the verdict is callable without a fetch. No behaviour or signature changes.
-
-All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
-patch versions are additive unless a line below says otherwise.
-
-## Unreleased
-
-### Added
-
-- `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
-  (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
-  fail-open service error. For a service binding, a cached header store, or a conformance runner.
-- `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
-  verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
-  by `tests/conformance_brc29.rs`.
-
-### Fixed
-
-- **The middleware's own payment flow reads the paying output.** `process_payment_with_storage`,
+- **The middleware's own payment flow reads the paying output** (P0-3b). `process_payment_with_storage`,
   `process_payment_with_storage_signed` and the deprecated `process_payment` now run `verify_brc29_payment_output` on
   output 0 before the derivation prefix is consumed and before `internalizeAction`. Until now nothing on this path
   compared the output with the price or checked that it pays this server's BRC-29 derived key; the storage server
-  checks neither, so an underpaid payment, or one paying another key, was served.
+  checks neither, so an underpaid payment, or one paying another key, was served. 0.3.7 shipped the conformance
+  vectors without this wiring.
 
 ### Behaviour
 
@@ -45,6 +169,18 @@ patch versions are additive unless a line below says otherwise.
 - The middleware does not run BEEF structure or SPV (`verify_brc29_payment` stays the caller's choice).
 - Exact-price payers to the key derived from the same `server_private_key` see no change. A deployment whose payment
   key differs from the key its clients derive for will now be refused instead of recording outputs it cannot spend.
+
+## 0.3.7 — 2026-10-08
+
+### Added
+
+- `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
+  (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
+  fail-open service error (0.4.0 fails closed on it; see 0.4.0 Changed). For a service binding, a cached header
+  store, or a conformance runner.
+- `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
+  verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
+  by `tests/conformance_brc29.rs`. A second implementation runs the same file. No behaviour or signature changes.
 
 ## 0.3.6 — 2026-10-08
 
@@ -71,7 +207,8 @@ patch versions are additive unless a line below says otherwise.
   `Err(NoHeaderService)` before any other check. The host is normalised before the placeholder comparison, so no
   spelling of the placeholder slips through to DNS and fails open. SPV is never skipped
   silently. Once a service is named, a service error (unreachable, HTTP error, unparseable answer) still fails open
-  with a logged warning, and a merkle root that differs from the block header still fails closed with `RootMismatch`.
+  with a logged warning (until 0.3.8; 0.4.0 fails closed on it, see 0.4.0 Changed), and a merkle root that differs
+  from the block header still fails closed with `RootMismatch`.
 - The configuration gate and the per-root SPV decision are pure functions with table tests (match, mismatch, lookup
   error, and every refused `header_url` shape); the header lookup is injected into the loop that runs them.
 

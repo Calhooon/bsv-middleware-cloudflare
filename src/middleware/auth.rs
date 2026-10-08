@@ -57,14 +57,13 @@ use crate::error::{AuthCloudflareError, Result};
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::transport::{auth_headers, CloudflareTransport, HttpResponseData};
 use crate::types::{current_time_ms, AuthContext, ErrorResponse, StoredSession};
-use bsv_sdk::auth::types::{AuthMessage, MessageType, RequestedCertificateSet, AUTH_PROTOCOL_ID};
-use bsv_sdk::auth::utils::create_nonce;
+use bsv_middleware_core::auth as core_auth;
+use bsv_middleware_core::brc104::signable_response_headers;
+use bsv_middleware_core::SessionBinding;
+use bsv_sdk::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
 use bsv_sdk::auth::VerifiableCertificate;
 use bsv_sdk::primitives::PrivateKey;
-use bsv_sdk::wallet::{
-    Counterparty, CreateSignatureArgs, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel,
-    VerifySignatureArgs,
-};
+use bsv_sdk::wallet::ProtoWallet;
 use serde::Serialize;
 use worker::{Env, Headers, Request, Response};
 
@@ -174,6 +173,18 @@ pub struct AuthSession {
     pub peer_identity_key: String,
     /// Request ID from the client's auth headers (32 bytes).
     pub request_id: [u8; 32],
+}
+
+/// The three fields the BRC-103 signatures are keyed on, for the core's
+/// sign and verify functions.
+impl From<&AuthSession> for SessionBinding {
+    fn from(session: &AuthSession) -> Self {
+        SessionBinding::new(
+            session.session_nonce.clone(),
+            session.peer_identity_key.clone(),
+            session.peer_nonce.clone(),
+        )
+    }
 }
 
 /// Result of auth middleware processing.
@@ -366,11 +377,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     // identity over this session is refused by name before its signature is
     // judged (the reference verifies with `peerSession.peerIdentityKey`; the
     // header is a claim — the 2026-09-14 delta-verify NEW-1).
-    if !auth_message
-        .identity_key
-        .to_hex()
-        .eq_ignore_ascii_case(&session.peer_identity_key)
-    {
+    if !core_auth::message_identity_is_sessions(&auth_message, &SessionBinding::from(&session)) {
         return Err(AuthCloudflareError::InvalidAuthentication(
             "Message identity key is not the session's".into(),
         ));
@@ -384,7 +391,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         ));
     }
 
-    // Replay protection (the-composer audit #30): consume the per-request
+    // Replay protection (audit finding #30): consume the per-request
     // nonce so a byte-identical replay of a signed request is rejected.
     //
     // Reference behavior: the TS stack (@bsv/auth-express-middleware 1.2.3 →
@@ -517,16 +524,6 @@ pub fn sign_response(response: Response, session: &AuthSession) -> Result<Respon
     })?;
     let wallet = ProtoWallet::new(Some(private_key));
 
-    // Get server's identity key
-    let identity_result = wallet.get_public_key(GetPublicKeyArgs {
-        identity_key: true,
-        protocol_id: None,
-        key_id: None,
-        counterparty: None,
-        for_self: None,
-    })?;
-    let identity_key = bsv_sdk::primitives::PublicKey::from_hex(&identity_result.public_key)?;
-
     // Build response payload (matching Express's buildResponsePayload)
     let status = response.status_code();
 
@@ -542,28 +539,10 @@ pub fn sign_response(response: Response, session: &AuthSession) -> Result<Respon
         body: vec![],    // Body is sent in the HTTP response directly
     };
 
-    let payload = response_data.to_payload();
-
-    // Create a General AuthMessage with the payload
-    let nonce = generate_random_nonce();
-
-    let mut msg = AuthMessage::new(MessageType::General, identity_key);
-    msg.nonce = Some(nonce);
-    msg.your_nonce = session.peer_nonce.clone();
-    msg.payload = Some(payload);
-
-    // Sign the message
-    let stored_session = StoredSession {
-        session_nonce: session.session_nonce.clone(),
-        peer_identity_key: session.peer_identity_key.clone(),
-        peer_nonce: session.peer_nonce.clone(),
-        is_authenticated: true,
-        certificates_required: false,
-        certificates_validated: false,
-        created_at: 0,
-        last_update: 0,
-    };
-    sign_message(&wallet, &mut msg, &stored_session)?;
+    // A signed General message over the payload (the core: a fresh random
+    // nonce, your_nonce = the peer's HANDSHAKE nonce, signed for the session).
+    let msg =
+        core_auth::sign_http_response(&wallet, &SessionBinding::from(session), &response_data)?;
 
     // Add auth headers to the response
     let auth_header_pairs = CloudflareTransport::message_to_headers(&msg);
@@ -626,42 +605,17 @@ pub fn sign_json_response<T: Serialize>(
         headers: signable_headers,
         body: json_bytes.clone(),
     };
-    let payload = response_data.to_payload();
 
-    // Step 4: Create wallet and get identity key
+    // Step 4: Create wallet
     let private_key = PrivateKey::from_hex(&session.server_private_key).map_err(|e| {
         AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
     })?;
     let wallet = ProtoWallet::new(Some(private_key));
 
-    let identity_result = wallet.get_public_key(GetPublicKeyArgs {
-        identity_key: true,
-        protocol_id: None,
-        key_id: None,
-        counterparty: None,
-        for_self: None,
-    })?;
-    let identity_key = bsv_sdk::primitives::PublicKey::from_hex(&identity_result.public_key)?;
-
-    // Step 5: Create and sign a General AuthMessage
-    let nonce = generate_random_nonce();
-
-    let mut msg = AuthMessage::new(MessageType::General, identity_key);
-    msg.nonce = Some(nonce);
-    msg.your_nonce = session.peer_nonce.clone();
-    msg.payload = Some(payload);
-
-    let stored_session = StoredSession {
-        session_nonce: session.session_nonce.clone(),
-        peer_identity_key: session.peer_identity_key.clone(),
-        peer_nonce: session.peer_nonce.clone(),
-        is_authenticated: true,
-        certificates_required: false,
-        certificates_validated: false,
-        created_at: 0,
-        last_update: 0,
-    };
-    sign_message(&wallet, &mut msg, &stored_session)?;
+    // Step 5: Create and sign a General AuthMessage over the payload (the
+    // core: a fresh random nonce, your_nonce = the peer's HANDSHAKE nonce).
+    let msg =
+        core_auth::sign_http_response(&wallet, &SessionBinding::from(session), &response_data)?;
 
     // Step 6: Build the Response
     let auth_header_pairs = CloudflareTransport::message_to_headers(&msg);
@@ -697,22 +651,7 @@ pub fn sign_json_response<T: Serialize>(
 /// - Exclude: all `x-bsv-auth-*` headers
 /// - Sort: alphabetically by lowercase key
 fn filter_signable_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    let mut signable: Vec<(String, String)> = headers
-        .iter()
-        .filter_map(|(key, value)| {
-            let lower = key.to_lowercase();
-            if lower.starts_with("x-bsv-auth-") {
-                // Exclude all x-bsv-auth-* headers
-                None
-            } else if lower.starts_with("x-bsv-") || lower == "authorization" {
-                Some((lower, value.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    signable.sort_by(|a, b| a.0.cmp(&b.0));
-    signable
+    signable_response_headers(headers)
 }
 
 /// Handle a handshake request to /.well-known/auth
@@ -763,25 +702,15 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
 ) -> Result<AuthResult> {
     let peer_identity_key = message.identity_key.to_hex();
 
-    // Get our identity key
-    let my_identity_result = wallet.get_public_key(GetPublicKeyArgs {
-        identity_key: true,
-        protocol_id: None,
-        key_id: None,
-        counterparty: None,
-        for_self: None,
-    })?;
-    let my_identity_key = bsv_sdk::primitives::PublicKey::from_hex(&my_identity_result.public_key)?;
-
     // Create our session nonce (matches Peer: create_nonce with counterparty=Self)
-    let session_nonce = create_nonce(wallet, None, ORIGINATOR).await?;
+    let session_nonce = core_auth::create_session_nonce(wallet, ORIGINATOR).await?;
 
     // Get the peer's nonce (initial_nonce from the InitialRequest)
     let peer_nonce = message.initial_nonce.clone().or(message.nonce.clone());
 
     // Create and save session
-    let mut session = StoredSession::new(session_nonce.clone(), peer_identity_key.clone());
-    session.peer_nonce = peer_nonce.clone();
+    let mut session = StoredSession::new(session_nonce, peer_identity_key);
+    session.peer_nonce = peer_nonce;
     session.is_authenticated = true;
 
     // Check if certificates are required
@@ -791,24 +720,18 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
 
     session_storage.save_session(&session).await?;
 
-    // Build InitialResponse (matches Peer's process_initial_request)
-    // InitialResponse fields:
+    // Build and sign the InitialResponse (the core, matching Peer's
+    // process_initial_request):
     //   nonce = our session nonce (same as initial_nonce)
     //   initial_nonce = our session nonce
     //   your_nonce = peer's nonce (echoed back)
+    //   requested_certificates = ours, if configured
     //   signature = signature over (your_nonce || initial_nonce)
-    let mut response_msg = AuthMessage::new(MessageType::InitialResponse, my_identity_key);
-    response_msg.nonce = Some(session_nonce.clone());
-    response_msg.initial_nonce = Some(session_nonce.clone());
-    response_msg.your_nonce = peer_nonce;
-
-    // Request certificates if configured
-    if options.certificates_to_request.is_some() {
-        response_msg.requested_certificates = options.certificates_to_request.clone();
-    }
-
-    // Sign the response (InitialResponse signing uses its own fields for key_id)
-    sign_message(wallet, &mut response_msg, &session)?;
+    let response_msg = core_auth::build_initial_response(
+        wallet,
+        &SessionBinding::from(&session),
+        options.certificates_to_request.clone(),
+    )?;
 
     // Build response with auth headers
     let auth_headers = CloudflareTransport::message_to_headers(&response_msg);
@@ -1253,22 +1176,12 @@ async fn handle_certificate_request<S: SessionStorage + ?Sized>(
         vec![]
     };
 
-    // Build CertificateResponse
-    let my_identity_result = wallet.get_public_key(GetPublicKeyArgs {
-        identity_key: true,
-        protocol_id: None,
-        key_id: None,
-        counterparty: None,
-        for_self: None,
-    })?;
-    let my_identity_key = bsv_sdk::primitives::PublicKey::from_hex(&my_identity_result.public_key)?;
-
-    let mut response_msg = AuthMessage::new(MessageType::CertificateResponse, my_identity_key);
-    response_msg.nonce = Some(generate_random_nonce());
-    response_msg.your_nonce = session.peer_nonce.clone();
-    response_msg.certificates = Some(certificates);
-
-    sign_message(wallet, &mut response_msg, &session)?;
+    // Build and sign the CertificateResponse (the core).
+    let response_msg = core_auth::build_certificate_response(
+        wallet,
+        &SessionBinding::from(&session),
+        certificates,
+    )?;
 
     let auth_headers = CloudflareTransport::message_to_headers(&response_msg);
     let headers = Headers::new();
@@ -1283,88 +1196,19 @@ async fn handle_certificate_request<S: SessionStorage + ?Sized>(
     Ok(AuthResult::Response(add_cors_headers(response)))
 }
 
-/// Sign an auth message using ProtoWallet.
-///
-/// Matches Peer's `sign_message`:
-/// - Protocol: AUTH_PROTOCOL_ID ("auth message signature")
-/// - Security level: Counterparty (2)
-/// - Key ID: "{nonce} {peer_session_nonce}" (from AuthMessage::get_key_id)
-/// - Counterparty: peer's identity key
-fn sign_message(
-    wallet: &ProtoWallet,
-    message: &mut AuthMessage,
-    session: &StoredSession,
-) -> Result<()> {
-    let data = message.signing_data();
-    let key_id = message.get_key_id(session.peer_nonce.as_deref());
-    let peer_key = bsv_sdk::primitives::PublicKey::from_hex(&session.peer_identity_key)?;
-
-    let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
-
-    let result = wallet.create_signature(CreateSignatureArgs {
-        data: Some(data),
-        hash_to_directly_sign: None,
-        protocol_id: protocol,
-        key_id,
-        counterparty: Some(Counterparty::Other(peer_key)),
-    })?;
-
-    message.signature = Some(result.signature);
-    Ok(())
-}
-
-/// Verify an auth message signature.
-///
-/// Matches Peer's `verify_message_signature`:
-/// - Uses the message's signing_data() as the data
-/// - Key ID: "{nonce} {server_session_nonce}"
-/// - Counterparty: the SESSION's peer identity (`peerSession.peerIdentityKey`
-///   in the reference), never the message header's. The header is a claim;
-///   with the header as the counterparty ANY wallet's honest signature
-///   verified under a session another identity's unsigned initialRequest
-///   opened, and the context reported that identity (the 2026-09-14
-///   delta-verify NEW-1).
+/// Verify an auth message signature
+/// (`bsv_middleware_core::auth::verify_message_signature`): the counterparty
+/// is the SESSION's peer identity, never the message header's.
 fn verify_message_signature(
     wallet: &ProtoWallet,
     message: &AuthMessage,
     session: &StoredSession,
 ) -> Result<bool> {
-    let signature = message
-        .signature
-        .as_ref()
-        .ok_or_else(|| AuthCloudflareError::InvalidAuthentication("Message not signed".into()))?;
-
-    let data = message.signing_data();
-    let key_id = message.get_key_id(Some(session.session_nonce.as_str()));
-    let Ok(session_identity) = bsv_sdk::primitives::PublicKey::from_hex(&session.peer_identity_key)
-    else {
-        return Ok(false); // a session whose identity is not a key verifies nothing
-    };
-
-    let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
-
-    let result = wallet.verify_signature(VerifySignatureArgs {
-        data: Some(data),
-        hash_to_directly_verify: None,
-        signature: signature.clone(),
-        protocol_id: protocol,
-        key_id,
-        counterparty: Some(Counterparty::Other(session_identity)),
-        for_self: None,
-    });
-
-    match result {
-        Ok(r) => Ok(r.valid),
-        Err(_) => Ok(false),
-    }
-}
-
-/// Generate a random nonce (32 bytes, base64 encoded).
-/// Used for General message nonces (not session nonces which use HMAC).
-fn generate_random_nonce() -> String {
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).unwrap_or_default();
-    bsv_sdk::primitives::to_base64(&bytes)
+    Ok(core_auth::verify_message_signature(
+        wallet,
+        message,
+        &SessionBinding::from(session),
+    )?)
 }
 
 /// Add CORS headers to a response.
@@ -1428,6 +1272,26 @@ mod tests {
     use super::*;
     use bsv_sdk::primitives::PrivateKey;
 
+    /// Sign an auth message (`bsv_middleware_core::auth::sign_message` over
+    /// the session's binding), as the 0.3 tests called it; production paths
+    /// build their messages through the core directly.
+    fn sign_message(
+        wallet: &ProtoWallet,
+        message: &mut AuthMessage,
+        session: &StoredSession,
+    ) -> Result<()> {
+        Ok(core_auth::sign_message(
+            wallet,
+            message,
+            &SessionBinding::from(session),
+        )?)
+    }
+
+    /// A random per-message nonce (`bsv_middleware_core::auth::generate_random_nonce`).
+    fn generate_random_nonce() -> String {
+        core_auth::generate_random_nonce()
+    }
+
     // Helper to create a test wallet
     fn test_wallet(hex: &str) -> ProtoWallet {
         let pk = PrivateKey::from_hex(hex).unwrap();
@@ -1488,7 +1352,7 @@ mod tests {
         assert_eq!(
             src.matches("mint_lane_offer(").count(),
             2,
-            "exactly two CALL sites: the Authenticated arm and the #443 step-4 attested wrapper (the definition carries generics before its paren)"
+            "exactly two CALL sites: the Authenticated arm and the step-4 attested wrapper (the definition carries generics before its paren)"
         );
         let wrapper = &src[src.find("pub async fn mint_attested_lane").unwrap()..];
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
@@ -2071,17 +1935,19 @@ mod tests {
         let src = &whole[..whole.find("#[cfg(test)]").unwrap()];
         let general = &src[src.find("pub async fn process_auth_with_storage").unwrap()..];
         let bind = general
-            .find(".eq_ignore_ascii_case(&session.peer_identity_key)")
+            .find("core_auth::message_identity_is_sessions(")
             .expect("the identity binding");
         let verify = general
             .find("verify_message_signature(&wallet, &auth_message, &session)")
             .expect("the verify call");
         assert!(bind < verify, "the binding precedes the signature check");
+        // The verify is the core's, over the SESSION's binding (the core pins
+        // its own counterparty: `bsv_middleware_core::auth` tests).
         let verify_fn = &src[src.find("fn verify_message_signature(").unwrap()..];
         let verify_fn = &verify_fn[..verify_fn.find("\n}\n").unwrap()];
         assert!(
-            verify_fn.contains("PublicKey::from_hex(&session.peer_identity_key)")
-                && verify_fn.contains("Counterparty::Other(session_identity)")
+            verify_fn.contains("core_auth::verify_message_signature(")
+                && verify_fn.contains("SessionBinding::from(session)")
                 && !verify_fn.contains("message.identity_key"),
             "the counterparty is the session's identity, never the header's"
         );

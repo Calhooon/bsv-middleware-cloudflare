@@ -78,7 +78,7 @@ pub trait SessionStorage {
     /// 1.2.3 / `@bsv/sdk` `Peer.processGeneralMessage`, and
     /// `@bsv/payment-express-middleware` 1.2.3 `verifyNonce`) performs **no**
     /// consumption tracking at all — this method is a deliberate hardening
-    /// divergence (the-composer audit issues #30/#44).
+    /// divergence (security audit findings #30/#44).
     ///
     /// Backends without an atomic primitive (Cloudflare KV) may implement
     /// this as read-then-write; see
@@ -144,6 +144,41 @@ pub trait SessionStorage {
 
 pub use crate::middleware::session_lane::LaneRecord;
 
+/// Any [`SessionStorage`] as the core's
+/// [`PaymentNonceStore`](bsv_middleware_core::PaymentNonceStore): the
+/// trait's `try_consume_nonce` / `release_nonce`, with a storage fault as a
+/// [`StoreError`](bsv_middleware_core::StoreError). For code written against
+/// the core's traits (the fleet's own payment flows) over this crate's
+/// backends: `SessionNonceStore(&storage)`.
+pub struct SessionNonceStore<'a, S: ?Sized>(pub &'a S);
+
+impl<S: SessionStorage + ?Sized> bsv_middleware_core::PaymentNonceStore
+    for SessionNonceStore<'_, S>
+{
+    async fn try_consume(
+        &self,
+        scope: &str,
+        nonce: &str,
+        ttl_seconds: Option<u64>,
+    ) -> std::result::Result<bool, bsv_middleware_core::StoreError> {
+        self.0
+            .try_consume_nonce(scope, nonce, ttl_seconds)
+            .await
+            .map_err(|e| bsv_middleware_core::StoreError::new(e.to_string()))
+    }
+
+    async fn release(
+        &self,
+        scope: &str,
+        nonce: &str,
+    ) -> std::result::Result<(), bsv_middleware_core::StoreError> {
+        self.0
+            .release_nonce(scope, nonce)
+            .await
+            .map_err(|e| bsv_middleware_core::StoreError::new(e.to_string()))
+    }
+}
+
 /// One laned call, as the door read it (the body already digested).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,7 +208,7 @@ pub struct LaneVerdict {
 
 /// In-memory [`SessionStorage`] test double, shared by the trait-contract
 /// tests below and the payment middleware's executed money-path tests
-/// (`middleware::payment` — the-composer #62).
+/// (`middleware::payment` — audit finding #62).
 ///
 /// `try_consume_nonce` here is genuinely atomic (single-threaded map
 /// insert), i.e. the semantics a Durable Object SQLite implementation
@@ -357,6 +392,35 @@ mod tests {
             .await
             .unwrap();
         assert!(again, "released nonce must be consumable again");
+    }
+
+    /// The core's nonce-store trait over a `SessionStorage`: the same
+    /// consume-once rule, and a storage fault is the core's `StoreError`
+    /// (never `Ok(true)`).
+    #[tokio::test]
+    async fn test_session_storage_is_the_cores_nonce_store() {
+        use bsv_middleware_core::PaymentNonceStore;
+        let storage = MemorySessionStorage::default();
+        let store = SessionNonceStore(&storage);
+        assert!(store
+            .try_consume(bsv_middleware_core::PAYMENT_NONCE_SCOPE, "p", None)
+            .await
+            .unwrap());
+        assert!(!store
+            .try_consume(bsv_middleware_core::PAYMENT_NONCE_SCOPE, "p", None)
+            .await
+            .unwrap());
+        assert!(storage.is_consumed(bsv_middleware_core::PAYMENT_NONCE_SCOPE, "p"));
+        store
+            .release(bsv_middleware_core::PAYMENT_NONCE_SCOPE, "p")
+            .await
+            .unwrap();
+        assert!(!storage.is_consumed(bsv_middleware_core::PAYMENT_NONCE_SCOPE, "p"));
+        storage.fail_consume(true);
+        let err = store.try_consume("s", "n", Some(1)).await.unwrap_err();
+        assert!(err.reason().contains("injected consume fault"), "{err}");
+        storage.fail_release(true);
+        assert!(store.release("s", "n").await.is_err());
     }
 
     #[tokio::test]

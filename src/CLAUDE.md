@@ -8,6 +8,8 @@ This crate provides BRC-103/104 authentication and BRC-29 (Direct Payment) middl
 
 This is a 1:1 port of the Express-based `auth-express-middleware` and `payment-express-middleware`, adapted for Cloudflare Workers. Error codes and response formats match the Express versions exactly.
 
+Since 0.4.0 the rules live in `bsv-middleware-core` (`../core/`, no runtime dependency) and this crate is the Workers adapter over it: `worker::Request` in, the core's data through, HTTP out, plus the KV / Durable Object / D1 implementations of the core's traits and the URL-configured header service. Every 0.3 public item keeps its name, path and signature; items whose type moved are re-exported at their 0.3 paths (`types::{AuthContext, PaymentContext, BsvPayment}`, `transport::{auth_headers, HttpRequestData, HttpResponseData}`, `middleware::session_lane`, `refund::signer`, `middleware::payment::PAYMENT_NONCE_SCOPE`). `api_surface_tests.rs` pins the fleet's call shapes at compile time.
+
 ## Architecture
 
 ```
@@ -44,15 +46,18 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `client/storage.rs` | `WorkerStorageClient` - WASM-compatible storage client with BRC-103/104 auth handshake |
 | `middleware/mod.rs` | Re-exports for auth and payment middleware |
 | `middleware/auth.rs` | BRC-103/104 authentication (`process_auth` / `process_auth_with_storage`), per-request nonce replay protection (401 `ERR_REPLAYED_REQUEST` on reuse), `sign_response()`, `sign_json_response()`, inline CORS (`add_cors_headers`, `handle_cors_preflight`), handshake handling (InitialRequest, CertificateRequest, CertificateResponse). `process_auth` returns raw body bytes via `AuthResult::Authenticated { body }` for General messages. |
-| `middleware/payment.rs` | BRC-29 payment verification (`process_payment_with_storage` with `accepted` gate + single-use derivation prefixes; deprecated stateless `process_payment`), 402 response generation, `payment_headers` module (incl. `TXID`), `PAYMENT_NONCE_SCOPE`, `payment_failed_response()`. Internally split into a request/`Response`-free decision core (`decide_payment` → `PaymentDecision`, with an internalize seam) so the money path executes under native `cargo test` (the-composer #62), plus thin wrappers that render decisions into the exact historical HTTP responses. |
-| `payment_verify.rs` | Pre-internalize BRC-29 verification: `expected_brc29_locking_script`, `verify_brc29_payment_output` (script + amount, sync), `verify_brc29_payment` (adds BEEF completeness + SPV against a caller-supplied header service, which is REQUIRED: `None` / empty / the `.invalid` placeholder in any spelling (the host is normalised — lowercased, trailing dot stripped — before the comparison) / no `http(s)://` scheme / a host the gate cannot classify (userinfo, `%`, `\`, whitespace, non-ASCII, bad port) is `NoHeaderService`, fail-closed; once named, fail-open on service errors, fail-closed on a root mismatch; the gate `resolve_header_service` and the per-root `decide_root` are pure and table-tested), `verify_brc29_payment_structural_only` (the named opt-out: no SPV), `verify_brc29_payment_with_header_lookup` (caller-supplied header lookup, no URL gate; drives `conformance/brc29-payment-vectors.json` via `tests/conformance_brc29.rs`), `PaymentVerifyError` |
-| `payment_claims.rs` | Feature `d1-claims`: `claim_payment_nonce` / `release_payment_nonce`, an atomic `INSERT OR IGNORE` single-use claim on a D1 `payment_claims` table (`PAYMENT_CLAIMS_SCHEMA`); module docs state when it is needed next to `try_consume_nonce(PAYMENT_NONCE_SCOPE, ..)` |
+| `middleware/payment.rs` | BRC-29 payment verification (`process_payment_with_storage` with `accepted` gate + single-use derivation prefixes; deprecated stateless `process_payment`), the paying output judged from the core's words (`judge_paying_output`, the path's one match: `Verified` serves, `Underpaid` / `WrongScript` 400 with the quote kept (no fresh challenge, prefix not consumed, wallet not called), a fault / `RootMismatch` 400, `NoHeaderService` 500, `Unverifiable` 503 `ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept (fail-closed; `HEADER_SERVICE_UNAVAILABLE`, `header_service_unavailable_description`)), 402 response generation, `payment_headers` module (incl. `TXID`), `PAYMENT_NONCE_SCOPE`, `payment_failed_response()`. Internally split into a request/`Response`-free decision core (`decide_payment` → `PaymentDecision`, with an internalize seam) so the money path executes under native `cargo test` (audit finding #62), plus thin wrappers that render decisions into the exact historical HTTP responses. |
+| `api_surface_tests.rs` | `cfg(test)`: the 0.3 public surface pinned as call sites (the fleet's `verify_brc29_payment` gate, the context and session types, the re-exports, the `SessionBinding` conversions) |
+| `payment_verify.rs` | The Workers adapter of the core's BRC-29 verification: the 0.3 functions with their signatures over `bsv_middleware_core::{brc29, spv, payment_verify}` (`expected_brc29_locking_script`; `verify_brc29_payment_output`, script + amount, sync; `verify_brc29_payment`, which adds BEEF completeness + SPV through the header service named by `header_url`; `verify_brc29_payment_structural_only`, the named opt-out with no SPV; `verify_brc29_payment_with_header_lookup`, a caller-supplied lookup with no URL gate, which drives `conformance/brc29-payment-vectors.json` via `tests/conformance_brc29.rs`); `UrlHeaderService`, the core's `HeaderService` over a ChainTracks-compatible base URL with Workers `fetch`, built only through the 0.3.6 gate `UrlHeaderService::resolve`: `None` / empty / the `.invalid` placeholder in any spelling (the host is normalised — lowercased, trailing dot stripped — before the comparison) / no `http(s)://` scheme / a host the gate cannot classify (userinfo, `%`, `\`, whitespace, non-ASCII, bad port) is `NoHeaderService`, fail-closed; once named, fail-closed on service errors too (`Unverifiable`, 503-class at the host, the quote kept; 0.3.x accepted with a warning) and on a root mismatch (the gate `resolve_header_service` and the core's per-root `decide_root` are pure and table-tested); `PaymentVerifyError` (the 0.3 type plus 0.4.0's `Unverifiable { satoshis, reason }`, `From<PaymentFault>`); `accept_verdict`, the ONE visible match from the six words (`Verified` → `Ok(satoshis)`, the only `Ok`; every other word → the same-named `Err`, `Unverifiable` included, logged); `verify_brc29_payment_structural_only` serves its own `Unverifiable` by name, outside `accept_verdict`; `verify_brc29_payment_verdict` for callers that want the words themselves. |
+| `payment_claims.rs` | Feature `d1-claims`: `claim_payment_nonce` / `release_payment_nonce`, an atomic `INSERT OR IGNORE` single-use claim on a D1 `payment_claims` table (`PAYMENT_CLAIMS_SCHEMA`); `D1ClaimStore(&db)` is the same table as the core's `ClaimStore`; module docs state when it is needed next to `try_consume_nonce(PAYMENT_NONCE_SCOPE, ..)` |
+| `middleware/session_lane.rs` | `pub use bsv_middleware_core::session_lane::*` (the lane's rules moved whole in 0.4.0); `middleware/session_lane_tests.rs` keeps the adapter's copy of the suite and pins `tests/fixtures/session_lane.vectors.json` |
+| `refund/mod.rs` | `issue_refund` (the storage-client flow); `signer` is `bsv_middleware_core::refund::signer` re-exported; the client's receiving key is `bsv_middleware_core::refund::refund_locking_script` |
 | `storage/mod.rs` | Re-exports for storage trait + KV implementations |
-| `storage/session_storage.rs` | `SessionStorage` trait: pluggable session persistence + single-use nonce consumption (`try_consume_nonce` / `release_nonce`); `MemorySessionStorage` (`cfg(test)`, `pub(crate)`) — atomic in-memory test double with consume/release fault injection, shared by the payment money-path tests |
+| `storage/session_storage.rs` | `SessionStorage` trait: pluggable session persistence + single-use nonce consumption (`try_consume_nonce` / `release_nonce`); `SessionNonceStore(&storage)` adapts any of them to the core's `PaymentNonceStore`; `MemorySessionStorage` (`cfg(test)`, `pub(crate)`) — atomic in-memory test double with consume/release fault injection, shared by the payment money-path tests |
 | `storage/kv_session.rs` | `KvSessionStorage` for BRC-103/104 session persistence with identity index and nonce-consumption records (read-then-write; see residual window note) |
 | `storage/kv_payment.rs` | `KvPaymentStorage` for payment records with unspent/derivation tracking |
 | `transport/mod.rs` | Re-exports for transport layer |
-| `transport/cloudflare.rs` | `CloudflareTransport` for BRC-104 header extraction (incl. `content-type` media type), payload building, varint encoding. `extract_auth_message()` returns `(AuthMessage, Vec<u8>)` with raw body passthrough. |
+| `transport/cloudflare.rs` | `CloudflareTransport` for BRC-104 header extraction (incl. `content-type` media type) into the core's payloads (`bsv_middleware_core::brc104`: `auth_headers`, `HttpRequestData`, `HttpResponseData`, `build_request_payload`, `write_varint`, the signable-header filters, `message_to_headers`, re-exported here). `extract_auth_message()` returns `(AuthMessage, Vec<u8>)` with raw body passthrough. |
 | `utils/mod.rs` | Re-exports for utility functions |
 | `utils/cors.rs` | `CorsConfig`, `cors_headers()`, preflight handlers, response helpers |
 
@@ -70,7 +75,7 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `sign_json_response` | Sign a JSON response with body bytes included in signed payload (recommended over `sign_response`) |
 | `WorkerStorageClient` | Storage server RPC client with BRC-103/104 authentication (re-exported from `client`) |
 | `init_panic_hook` | Initialize WASM panic hook for better error messages |
-| `verify_brc29_payment` / `verify_brc29_payment_output` / `expected_brc29_locking_script` | Pre-internalize payment verification (`payment_verify`); the middleware's own flow runs `verify_brc29_payment_output` on output 0 before internalizing (0.3.7), the full `verify_brc29_payment` is for callers with their own payment flow |
+| `verify_brc29_payment` / `verify_brc29_payment_output` / `expected_brc29_locking_script` | Pre-internalize payment verification (`payment_verify`); the middleware's own flow runs `verify_brc29_payment_output` on output 0 before internalizing (0.3.8), the full `verify_brc29_payment` is for callers with their own payment flow |
 | `claim_payment_nonce` / `release_payment_nonce` | Feature `d1-claims`: atomic single-use payment-nonce claim on D1 (`payment_claims`) |
 
 ### Middleware Types
@@ -295,7 +300,7 @@ Payment flow (`process_payment_with_storage`):
 1. Client makes request without payment
 2. Server returns **402 Payment Required** with `derivation_prefix` and `satoshis_required`
 3. Client constructs payment transaction, sends with `x-bsv-payment` header (JSON)
-4. Server verifies derivation prefix via HMAC nonce, **consumes it single-use** (`400 ERR_INVALID_DERIVATION_PREFIX` if already used), internalizes payment via `WorkerStorageClient::internalize_action()`, and **gates on `accepted: true`** (`402 ERR_PAYMENT_FAILED` with a fresh challenge if the wallet rejected), then returns success
+4. Server verifies derivation prefix via HMAC nonce, **reads output 0 through the core's output check and decides its word** (`400 ERR_INVALID_PAYMENT` with the quote kept, no fresh challenge, when the output is short or pays another key, and when the transaction is unreadable; `500 ERR_SERVER_MISCONFIGURED` on `NoHeaderService`; `503 ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept on `Unverifiable`), **consumes it single-use** (`400 ERR_INVALID_DERIVATION_PREFIX` if already used), internalizes payment via `WorkerStorageClient::internalize_action()`, and **gates on `accepted: true`** (`402 ERR_PAYMENT_FAILED` with a fresh challenge if the wallet rejected), then returns success
 
 Consumption ordering on the money path: prefix consumed **before** internalize; released (best-effort) only if internalize **errors** (so an honest client can retry the same payment); kept consumed on success or `accepted: false`.
 
@@ -332,7 +337,7 @@ The TS reference stack has **no** replay protection: `@bsv/sdk`
 via stateless HMAC and binds `message.nonce` into the signature keyID, but never
 records consumed nonces; `@bsv/payment-express-middleware` 1.2.3 likewise only
 HMAC-checks the derivation prefix and even calls `next()` when
-`internalizeAction` returns `accepted: false`. Per the-composer audit issues
+`internalizeAction` returns `accepted: false`. Per security audit findings
 #30/#44, this crate diverges deliberately:
 
 - **Auth:** after signature verification, `(session_nonce, x-bsv-auth-nonce)` is
@@ -407,9 +412,11 @@ Error variants and their codes (matching Express middleware):
 | `ConfigError(String)` | 500 | `ERR_CONFIG` | Infra |
 | `SerializationError(String)` | 400 | `ERR_SERIALIZATION` | Infra |
 
-Automatic `From` conversions: `bsv_sdk::Error` -> `SdkError`, `worker::Error` -> `KvError`, `serde_json::Error` -> `SerializationError`.
+Two payment-path answers are rendered directly by `middleware/payment.rs` without an `AuthCloudflareError` variant: `500 ERR_SERVER_MISCONFIGURED` for the core's `NoHeaderService` (the `ServerFault` decision) and `503 ERR_HEADER_SERVICE_UNAVAILABLE` for `Unverifiable` (the `HeaderServiceUnavailable` decision: fail-closed, the quote kept, retry the same payment).
 
-Two wire-level codes are emitted directly as `ErrorResponse` bodies (no enum variant; not in the Express reference — hardening additions): `401 ERR_REPLAYED_REQUEST` (auth per-request nonce reuse) and `402 ERR_PAYMENT_FAILED` with fresh challenge headers (wallet returned `accepted: false`).
+Automatic `From` conversions: `bsv_sdk::Error` -> `SdkError`, `worker::Error` -> `KvError`, `serde_json::Error` -> `SerializationError`, `bsv_middleware_core::AuthError` -> the same-named variant, message intact (`InvalidAuthentication`, `Config` -> `ConfigError`, `Sdk` -> `SdkError`, `Serialization` -> `SerializationError`).
+
+Two wire-level codes are emitted directly as `ErrorResponse` bodies (no enum variant; not in the Express reference — hardening additions): `401 ERR_REPLAYED_REQUEST` (auth per-request nonce reuse) and `402 ERR_PAYMENT_FAILED` with fresh challenge headers (wallet returned `accepted: false`). The paying-output refusal (output 0 short or paying another key) is the reference's own `400 ERR_INVALID_PAYMENT`, emitted as a body with the quote kept: no challenge headers, the prefix not consumed (0.4.0; 0.3.8 answered 402 with a fresh challenge).
 
 ## Cloudflare Configuration
 
@@ -454,6 +461,7 @@ wrangler secret put SERVER_PRIVATE_KEY
 
 ## Dependencies
 
+- `bsv_middleware_core` - the rules (`../core/`): the six-word verdict, the header-service and store traits, BRC-29 derivation and verification, BRC-103/104 message build and verify, the session lane, the refund signer
 - `bsv_sdk` - BSV primitives, wallet (`ProtoWallet`, `WalletInterface`), auth protocol, nonce utils
 - `worker` - Cloudflare Workers runtime (Request, Response, KV, Headers; `d1` only under the `d1-claims` feature)
 - `serde` / `serde_json` - Serialization
