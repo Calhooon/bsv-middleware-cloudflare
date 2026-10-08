@@ -42,5 +42,7 @@ Workers adapter over this crate in its 0.4.0.
 
 ### Conformance
 
-- `tests/conformance_brc29.rs` runs the repository's `conformance/brc29-payment-vectors.json` (20 cases) through
-  `verify_brc29_payment` with a stub service.
+- `tests/conformance_brc29.rs` runs `conformance/brc29-payment-vectors.json` (20 cases) through
+  `verify_brc29_payment` with a stub service. The file ships inside this package (a copy of the repository root's
+  canonical file, which the Workers adapter produces and pins byte-identical to this one), so the published crate
+  runs the vectors on its own.

@@ -43,8 +43,10 @@
 //! ## Conformance
 //!
 //! `tests/conformance_brc29.rs` runs the implementation-neutral BRC-29
-//! payment vectors (`conformance/brc29-payment-vectors.json` at the
-//! repository root) through [`verify_brc29_payment`] with a stub service.
+//! payment vectors (this crate's `conformance/brc29-payment-vectors.json`,
+//! a copy of the repository root's canonical file that the Workers adapter
+//! produces and pins byte-identical) through [`verify_brc29_payment`] with
+//! a stub service.
 
 pub mod auth;
 pub mod brc104;

@@ -8,6 +8,12 @@
 //! describes the schema. The runner below reads the file the way a second
 //! implementation would: from JSON only, never from the emitter's tables.
 //!
+//! The core (`core/`, the `bsv-middleware-core` package) ships its own copy
+//! under `core/conformance/` so its published tarball runs the vectors
+//! without this repository; the emitter writes both copies and
+//! `the_cores_copy_of_the_vectors_is_byte_identical` pins them equal, so
+//! the root copy stays canonical.
+//!
 //! Regenerate (only when a case is added or the verifier's answer changes on
 //! purpose): `cargo test --test conformance_brc29 -- --ignored emit`.
 
@@ -30,6 +36,13 @@ const VECTORS_PATH: &str = concat!(
     "/conformance/brc29-payment-vectors.json"
 );
 const PINNED: &str = include_str!("../conformance/brc29-payment-vectors.json");
+/// The core's copy of the file (`core/conformance/`), shipped inside the
+/// `bsv-middleware-core` package. It sits next to this manifest only in the
+/// repository: the sub-package is not part of this crate's own tarball.
+const CORE_COPY_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/core/conformance/brc29-payment-vectors.json"
+);
 
 // ─── The runner (reads JSON only) ───────────────────────────────────
 
@@ -277,12 +290,41 @@ async fn brc29_vectors_are_the_pinned_bytes() {
     );
 }
 
-/// Writes `conformance/brc29-payment-vectors.json` on purpose.
+/// The core's copy is the root copy, byte for byte. Outside the repository
+/// (this crate's own packaged tarball) the core sub-package is not shipped
+/// and there is no second copy to compare; inside it, a missing copy is a
+/// defect.
+#[test]
+fn the_cores_copy_of_the_vectors_is_byte_identical() {
+    match std::fs::read_to_string(CORE_COPY_PATH) {
+        Ok(core_copy) => assert!(
+            core_copy == PINNED,
+            "core/conformance/brc29-payment-vectors.json differs from the root copy. The root copy \
+             is canonical: regenerate with `cargo test --test conformance_brc29 -- --ignored emit` \
+             (it writes both copies)."
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let core_manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/core/Cargo.toml");
+            assert!(
+                !std::path::Path::new(core_manifest).exists(),
+                "core/ is present but its conformance copy is missing: {e}"
+            );
+            eprintln!("core/ is not part of this package; no second copy to compare");
+        }
+        Err(e) => panic!("cannot read {CORE_COPY_PATH}: {e}"),
+    }
+}
+
+/// Writes `conformance/brc29-payment-vectors.json` and the core's copy
+/// (`core/conformance/`) on purpose.
 #[tokio::test]
-#[ignore = "writes conformance/brc29-payment-vectors.json on purpose"]
+#[ignore = "writes conformance/brc29-payment-vectors.json (both copies) on purpose"]
 async fn emit_brc29_payment_vectors() {
-    std::fs::create_dir_all(std::path::Path::new(VECTORS_PATH).parent().unwrap()).unwrap();
-    std::fs::write(VECTORS_PATH, build_vectors().await).unwrap();
+    let bytes = build_vectors().await;
+    for path in [VECTORS_PATH, CORE_COPY_PATH] {
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+    }
 }
 
 // ─── The producer (fixed synthetic inputs) ──────────────────────────

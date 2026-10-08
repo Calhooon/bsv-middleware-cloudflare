@@ -38,7 +38,9 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 - `bsv_middleware_cloudflare::core` (the core crate as a module) and the top-level `HeaderService`,
   `PaymentVerdict`, `PaymentFault` re-exports.
 - `core/tests/conformance_brc29.rs`: the core runs the 20 vectors of `conformance/brc29-payment-vectors.json` (0.3.7)
-  through its `HeaderService` trait with a stub; the adapter's runner re-pins the file with the 0.4.0 producer line.
+  through its `HeaderService` trait with a stub, from its own copy of the file (`core/conformance/`, shipped in the
+  core's package); the adapter's runner re-pins the root file with the 0.4.0 producer line, writes both copies on
+  `emit`, and pins the core's copy byte-identical to the root one.
 
 ### Behaviour
 

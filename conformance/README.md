@@ -6,7 +6,9 @@ least the quoted satoshis, and does the transaction's merkle proof tie to a real
 
 The file is implementation-neutral. Copy it verbatim; do not edit it by hand. It is produced by
 `bsv-middleware-cloudflare` (`tests/conformance_brc29.rs`, `build_vectors`) from fixed synthetic inputs and pinned
-byte-for-byte by that crate's tests, so any change shows up as a reviewed diff there first. All keys are synthetic
+byte-for-byte by that crate's tests, so any change shows up as a reviewed diff there first. The `bsv-middleware-core`
+package ships its own copy (`core/conformance/` in this repository), pinned byte-identical to this one by the same
+tests, so the published core runs the file without the repository. All keys are synthetic
 (private keys `0x01`, `0x02`, `0x03`); `headers.example`, `real.example` and `chaintracks.invalid` are RFC 2606
 reserved names.
 

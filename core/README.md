@@ -68,9 +68,11 @@ them, declares no executor, and its tests run on `tokio`'s current-thread runtim
 ## Conformance
 
 `tests/conformance_brc29.rs` runs the implementation-neutral BRC-29 payment vectors
-(`conformance/brc29-payment-vectors.json` at the repository root, 20 cases) through `verify_brc29_payment` with a
-stub service, reading the file the way a second implementation does: from JSON only. The file's
-`AcceptedUnverified` is this crate's `Unverifiable`.
+(`conformance/brc29-payment-vectors.json`, 20 cases) through `verify_brc29_payment` with a stub service, reading
+the file the way a second implementation does: from JSON only. The file's `AcceptedUnverified` is this crate's
+`Unverifiable`. The copy under this crate's `conformance/` is shipped in the package so the published crate runs
+the vectors on its own; the canonical copy is the repository root's (produced and pinned by the Workers adapter's
+runner, which also pins this copy byte-identical to it).
 
 ## Build
 

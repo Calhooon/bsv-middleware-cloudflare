@@ -1,11 +1,15 @@
-//! BRC-29 payment-verification conformance: every case of the repository's
+//! BRC-29 payment-verification conformance: every case of
 //! `conformance/brc29-payment-vectors.json` through the core's
 //! [`verify_brc29_payment`] with the header service replaced by a stub that
 //! answers from the case's `header_service.lookup`.
 //!
 //! The file is owned and produced by the Workers adapter
 //! (`tests/conformance_brc29.rs` at the repository root, which pins its
-//! bytes); this runner reads it the way a second implementation does: from
+//! bytes at `conformance/brc29-payment-vectors.json` there). This crate
+//! ships its own copy under `core/conformance/` so the published package
+//! runs the file on its own; the adapter's runner asserts the two copies
+//! are byte-identical, so the root copy stays the canonical one. This
+//! runner reads it the way a second implementation does: from
 //! JSON only, comparing `expected.word` and `expected.fields`. The six
 //! words are the core's [`PaymentVerdict`], with one spelling difference the
 //! file documents: its `AcceptedUnverified` is the core's `Unverifiable`
@@ -24,7 +28,9 @@ use bsv_sdk::primitives::PrivateKey;
 use bsv_sdk::transaction::Transaction;
 use serde_json::{json, Value};
 
-const VECTORS: &str = include_str!("../../conformance/brc29-payment-vectors.json");
+/// This crate's copy of the vector file (inside the package, so the
+/// published tarball runs it); the adapter pins it equal to the root copy.
+const VECTORS: &str = include_str!("../conformance/brc29-payment-vectors.json");
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key]

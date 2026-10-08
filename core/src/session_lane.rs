@@ -1006,8 +1006,7 @@ mod tests {
         assert_eq!(path_and_query("/results", None), "/results");
     }
 
-    const SESSION_LANE_VECTORS: &str =
-        include_str!("../../tests/fixtures/session_lane.vectors.json");
+    const SESSION_LANE_VECTORS: &str = include_str!("../tests/fixtures/session_lane.vectors.json");
     const SESSION_LANE_VECTORS_SHA256: &str =
         "d4ad8ba0eb10798453df395fc1e265d535ea57a7d3b0f0fdf1822e35d4d44d39";
 
