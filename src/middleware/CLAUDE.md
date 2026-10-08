@@ -26,7 +26,7 @@ pub use payment::{process_payment, PaymentMiddlewareOptions, PaymentResult, paym
 - **When:** First middleware in the pipeline; runs on every request
 - **Input:** `Request`, `&Env`, `&AuthMiddlewareOptions`
 - **Output:** `Result<AuthResult>` - either `Authenticated { context, request, session, body }` or `Response`
-- **Errors:** Returns 401 responses or `AuthCloudflareError` variants
+- **Errors:** every authentication refusal is a 401 `AuthResult::Response` with CORS, unsigned (0.4.1); an `Err(AuthCloudflareError)` is a fault (storage, config, transport, SDK)
 
 **Authentication Flow:**
 
@@ -39,7 +39,7 @@ pub use payment::{process_payment, PaymentMiddlewareOptions, PaymentResult, paym
 3. **For general requests with auth headers:**
    - Extracts `AuthMessage` from BRC-104 headers
    - Looks up session by identity key or nonce
-   - Verifies message signature using `ProtoWallet`
+   - Verifies message signature using `ProtoWallet` (the `Request`/`Response`-free `judge_general_message`: the session, the identity binding, the signature, the single-use nonce; a refusal is an `AuthRefusal` value the door renders 401)
    - Updates session last activity timestamp only (peer_nonce is NOT updated for General messages — it is set once during handshake to match TS SDK behavior)
    - Captures raw request body bytes before auth consumes the body stream
 4. **For requests without auth headers:**
@@ -342,15 +342,17 @@ All error responses are JSON with this structure:
 
 | Code | HTTP Status | Middleware | Condition |
 |------|-------------|-----------|-----------|
-| `UNAUTHORIZED` | 401 | auth | Request lacks auth headers when required |
-| `ERR_SESSION_NOT_FOUND` | 401 | auth | Session not found in KV storage |
+| `UNAUTHORIZED` | 401 | auth | Request lacks auth headers when required (body field `message`, as the reference) |
+| `ERR_SESSION_NOT_FOUND` | 401 | auth | No session for the nonce or identity named |
+| `ERR_INVALID_AUTH` | 401 | auth | The header's identity is not the session's; the signature is missing or wrong; the session never completed its handshake; no per-request nonce; headers that do not form a message; a refused handshake message (0.4.1: a response, never an `Err`) |
+| `ERR_REPLAYED_REQUEST` | 401 | auth | The per-request nonce was already used (hardening, not in the reference) |
 | `ERR_SERVER_MISCONFIGURED` | 500 | payment | Payment middleware called without prior auth |
 | `ERR_PAYMENT_REQUIRED` | 402 | payment | Payment needed for this resource |
 | `ERR_MALFORMED_PAYMENT` | 400 | payment | Cannot parse payment JSON |
 | `ERR_INVALID_DERIVATION_PREFIX` | 400 | payment | HMAC nonce verification failed |
 | `ERR_PAYMENT_FAILED` | 400 | payment | Transaction internalization failed |
 
-Auth signature/certificate failures raise `AuthCloudflareError::InvalidAuthentication` rather than returning an HTTP error response.
+Since 0.4.1 no authentication refusal is raised as an `Err`: `process_auth*` renders each as the 401 above (`AuthRefusal` → `refusal_response`, the one place; `settle` catches the 401-class errors raised below the door, the transport's and the handshake path's). An `Err` from `process_auth*` is a fault the host renders 500.
 
 ## Key Types
 
@@ -416,7 +418,7 @@ Payment processing uses `WorkerStorageClient` (from `../client/`) to talk to a r
 
 Both modules have comprehensive `#[cfg(test)]` suites:
 
-- **auth.rs** (~500 lines): Message signing/verification roundtrips, tamper detection, wrong-key rejection, unsigned message rejection, nonce generation (base64 format, uniqueness), `AuthContext` construction, `AuthMiddlewareOptions` defaults, `AuthSession` construction, `StoredSession` camelCase serialization roundtrips, `filter_signable_headers` rules (x-bsv-* inclusion, auth header exclusion, authorization inclusion, key lowercasing, alphabetical sorting, standard header exclusion), `sign_json_response` payload byte layout verification
+- **auth.rs** (~500 lines): Message signing/verification roundtrips, tamper detection, wrong-key rejection, unsigned message rejection, nonce generation (base64 format, uniqueness), `AuthContext` construction, `AuthMiddlewareOptions` defaults, `AuthSession` construction, `StoredSession` camelCase serialization roundtrips, `filter_signable_headers` rules (x-bsv-* inclusion, auth header exclusion, authorization inclusion, key lowercasing, alphabetical sorting, standard header exclusion), `sign_json_response` payload byte layout verification; the 0.4.1 refusal suite over `judge_general_message` with the in-memory store (identity not the session's, bad or missing signature, session not authenticated, unknown session, missing nonce, replay: each a 401 refusal with its code, nothing consumed; a storage fault still an `Err`), the refusal table, and the structural pin that every door settles and the one renderer sets 401 + CORS
 - **payment.rs** (~230 lines): HMAC nonce create/verify cycle (including different-key failure, tampered nonce failure, uniqueness), BRC-29 header constants, `BsvPayment` camelCase deserialization (including missing field and invalid JSON failure), `ErrorResponse` Express format matching, `PaymentContext` construction, `PaymentMiddlewareOptions` constructors (mainnet and custom storage URL)
 
 ## Related

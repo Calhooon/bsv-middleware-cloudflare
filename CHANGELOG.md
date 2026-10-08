@@ -3,6 +3,40 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## 0.4.1 — 2026-10-08
+
+### Changed
+
+- **Authentication refusals are 401 responses from the middleware itself, never an `Err`.** `process_auth`,
+  `process_auth_with_storage`, `process_auth_do`, `process_auth_lane` and `process_auth_lane_with_storage` answer
+  every refusal as `Ok(AuthResult::Response(..))`: status 401, the body
+  `{"status":"error","code":"…","description":"…"}`, the CORS headers, unsigned (there is no session to sign with,
+  as the existing 401s already were). The codes are the ones the crate has declared for them since 0.1
+  (`AuthCloudflareError::status_code()` has always said 401): `UNAUTHORIZED` (no auth headers; the reference's
+  body, its `message` field), `ERR_SESSION_NOT_FOUND` (no session for the nonce or identity named),
+  `ERR_INVALID_AUTH` (the header's identity is not the session's; the signature is missing or does not verify; the
+  session never completed its handshake; a general message without `x-bsv-auth-nonce`; headers that do not form a
+  BRC-103 message; a handshake message refused: an unparseable body, a certificate message whose signature or
+  certificates fail), `ERR_REPLAYED_REQUEST` (the per-request nonce already used). 0.4.0 raised three of these as
+  `Err(AuthCloudflareError::InvalidAuthentication(..))` ("Message identity key is not the session's", "Invalid
+  message signature", "Session not authenticated"), and the transport's header refusals and the handshake path's
+  refusals likewise; every host rendered an `Err` as a generic 500, so the clients that re-handshake on 401 only
+  (`AuthFetch`, and the paid-call helpers built on it) never recovered a stale session. `Err` from `process_auth*`
+  now means a fault: storage (KV, Durable Object, D1), the server's own key, the transport, the SDK. No public item
+  changed; a host's existing `match` compiles unchanged and sees the 401 on the `Response` arm it already has.
+  (Reference note: the Express middleware answers 401 `UNAUTHORIZED` for a request without auth headers; a general
+  message its SDK refuses is swallowed by the `Peer` and never answered. The 401 here is this crate's own rule, as
+  the `ERR_REPLAYED_REQUEST` 401 was.)
+
+### Behaviour
+
+- Served requests, the handshake replies and response signing are byte-for-byte 0.4.0; the three 401 bodies that
+  existed (`UNAUTHORIZED`, `ERR_SESSION_NOT_FOUND`, `ERR_REPLAYED_REQUEST`, and the missing-nonce
+  `ERR_INVALID_AUTH`) are byte-for-byte too. The general path's decision is a `Request`/`Response`-free judgement
+  inside `middleware::auth`, so it runs under native `cargo test`: each refusal pinned at 401 with its code and
+  nothing consumed or served, a storage fault pinned as the `Err` it was.
+- The core (`bsv-middleware-core`) is unchanged, 0.1.0.
+
 ## 0.4.0 — 2026-10-08
 
 The core extract. The rules moved to a new runtime-free crate, `bsv-middleware-core` 0.1.0 (this repository,

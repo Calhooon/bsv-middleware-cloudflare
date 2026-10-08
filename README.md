@@ -6,7 +6,7 @@ Port of [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-m
 
 ## What it provides
 
-- **`process_auth`** / **`process_auth_with_storage`** — BRC-103/104 mutual identity handshake, session verification, certificate exchange, and per-request replay protection (each `x-bsv-auth-nonce` is single-use per session). Returns the authenticated identity key, a reusable session handle, and the raw request body.
+- **`process_auth`** / **`process_auth_with_storage`** — BRC-103/104 mutual identity handshake, session verification, certificate exchange, and per-request replay protection (each `x-bsv-auth-nonce` is single-use per session). Returns the authenticated identity key, a reusable session handle, and the raw request body. Every authentication refusal is a 401 response from the middleware itself (0.4.1), with CORS, unsigned; an `Err` is a fault (storage, the server's key, the transport).
 - **`process_payment_with_storage`** — BRC-29 payment verification. Emits `402 Payment Required` with derivation prefix, accepts `x-bsv-payment` header, reads output 0 of the payment and refuses it (`400 ERR_INVALID_PAYMENT`, the quote kept) unless it pays this server's BRC-29 derived key at least the price (0.3.8; 400 since 0.4.0), internalizes via a remote wallet storage endpoint, gates on the wallet's `accepted` flag, and enforces single-use derivation prefixes. `satoshis_paid` is the amount read from the output. (`process_payment` remains as a deprecated stateless variant.)
 - **`sign_json_response`** — signs outbound JSON responses so BRC-103/104 clients (e.g. `AuthFetch`) can verify server identity and message integrity. Equivalent to Express's `res.json` hijacking, but explicit.
 - **`WorkerStorageClient`** — WASM-compatible RPC client for a wallet storage server (e.g. `storage.babbage.systems`), used by `process_payment` and optional refund flows.
@@ -114,7 +114,7 @@ All error codes, HTTP statuses, and header names match the Express versions:
 | Auth error codes | `UNAUTHORIZED`, `ERR_INVALID_AUTH`, `ERR_SESSION_NOT_FOUND` | identical |
 | Payment error codes | `ERR_PAYMENT_REQUIRED`, `ERR_MALFORMED_PAYMENT`, `ERR_INVALID_DERIVATION_PREFIX`, `ERR_PAYMENT_FAILED` | identical |
 | Headers | `x-bsv-auth-*`, `x-bsv-payment-*` | identical |
-| HTTP statuses | 400 / 401 / 402 / 500 | identical, plus 503 `ERR_HEADER_SERVICE_UNAVAILABLE` when the header service cannot answer (the quote kept) |
+| HTTP statuses | 400 / 401 / 402 / 500 | identical, plus 503 `ERR_HEADER_SERVICE_UNAVAILABLE` when the header service cannot answer (the quote kept); every authentication refusal is a 401 `AuthResult::Response` (0.4.1), never an `Err` |
 
 Known divergences (architectural, not bugs):
 - **Response signing is explicit.** Callers invoke `sign_json_response` rather than relying on `res.json` interception.
@@ -125,6 +125,7 @@ Known divergences (architectural, not bugs):
 
 Deliberate hardening divergences (the reference is weaker here; security audit findings #30/#44):
 - **Auth replay protection.** The TS stack (`@bsv/sdk` `Peer.processGeneralMessage`) never records consumed per-request nonces, so a byte-identical signed request replays successfully there for the whole session TTL. This crate consumes each `(session nonce, x-bsv-auth-nonce)` pair and rejects duplicates with `401 ERR_REPLAYED_REQUEST`. See `middleware::auth` docs for the exact residual window under eventually-consistent KV.
+- **Every authentication refusal is a 401 answer (0.4.1).** The reference answers `401 UNAUTHORIZED` only when no auth headers are present; a general message its SDK refuses (another identity's key over the session, a bad signature, a session that never completed its handshake) is swallowed by the `Peer` and never answered. Here each of those is `401 ERR_INVALID_AUTH` (`ERR_SESSION_NOT_FOUND` for an unknown session), from `process_auth*` as an `AuthResult::Response` with CORS, so `AuthFetch`-class clients re-handshake; an `Err` from `process_auth*` is a fault (storage, the server's key, the transport), the host's 500.
 - **`accepted` gate.** `payment-express-middleware` calls `next()` even when `wallet.internalizeAction` returns `accepted: false`. Here a rejected payment returns `402` with a fresh challenge and never reaches the handler.
 - **The paying output's script.** `payment-express-middleware` 2.1.9 reads output 0's satoshis and refuses below the price with `400 ERR_INVALID_PAYMENT`, and leaves the script to its wallet's signer. Here the storage server is not a signer, so output 0 must also pay this server's BRC-29 derived key; a short or misdirected payment gets the reference's `400 ERR_INVALID_PAYMENT` with the quote kept (no fresh challenge, the prefix not consumed), before the storage is called (0.3.8 answered 402 with a fresh challenge; 400 since 0.4.0).
 - **Single-use payment derivation prefixes.** The reference's `verifyNonce` is a stateless HMAC; here each verified prefix is consumed (no expiry) via the `SessionStorage` nonce store, so a captured `X-BSV-Payment` header cannot be internalized twice.

@@ -37,6 +37,24 @@
 //! SQLite put-if-absent) eliminates windows 1 and 2 entirely; retaining
 //! nonce records for the whole session lifetime eliminates window 3.
 //!
+//! ## Refusals are the middleware's own 401 (0.4.1)
+//!
+//! Every authentication refusal `process_auth*` decides is an
+//! `Ok(AuthResult::Response(..))`: status 401, the body
+//! `{"status":"error","code":..,"description":..}` (the reference's `message`
+//! field for `UNAUTHORIZED`), the CORS headers, unsigned (there is no session
+//! to sign with). The codes: `UNAUTHORIZED` (no auth headers),
+//! `ERR_SESSION_NOT_FOUND` (no session for the nonce or identity named),
+//! `ERR_INVALID_AUTH` (the header's identity is not the session's; the
+//! signature is missing or wrong; the session never completed its handshake;
+//! a general message without its per-request nonce; headers that do not form
+//! a BRC-103 message; a handshake message refused), `ERR_REPLAYED_REQUEST`
+//! (the per-request nonce already used). `Err` is a fault only: storage, the
+//! server's own key, the transport, the SDK. 0.4.0 raised three of the
+//! refusals as `Err(AuthCloudflareError::InvalidAuthentication(..))`, which
+//! every host rendered as a generic 500, and the clients that re-handshake
+//! on 401 only (`AuthFetch` among them) never recovered a stale session.
+//!
 //! ## Usage:
 //! ```rust,ignore
 //! let auth_result = process_auth(req, &env, &options).await?;
@@ -204,7 +222,9 @@ pub enum AuthResult {
         body: Vec<u8>,
     },
     /// Authentication processing produced a response - return it to the client.
-    /// This happens for handshake requests and error responses.
+    /// This happens for handshake requests and error responses: every
+    /// authentication refusal is one of these, a 401 (0.4.1); an `Err` from
+    /// `process_auth*` is a fault (storage, the server's key, the transport).
     Response(Response),
 }
 
@@ -212,6 +232,132 @@ const ORIGINATOR: &str = "bsv-auth-cloudflare";
 
 use crate::middleware::session_lane as lane;
 use crate::storage::session_storage::LaneVerifyAsk;
+
+/// Why the door refused a request: rendered by [`refusal_response`] as the
+/// middleware's own 401 (0.4.1). Before, three of these were an `Err` every
+/// host rendered as a generic 500, and the clients that re-handshake on 401
+/// only (`AuthFetch` among them) never recovered a stale session. A fault
+/// (storage, the server's own key, the transport, the SDK) is never one of
+/// these: it stays `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthRefusal {
+    /// No BRC-104 auth headers and `allow_unauthenticated` is off →
+    /// `UNAUTHORIZED` (the reference's body: the `message` field).
+    NoAuthHeaders,
+    /// The request is not a BRC-103 message for this server: the transport
+    /// could not read one from the headers (the identity key missing or not
+    /// a key, an unknown message type), a handshake body that does not
+    /// parse, a certificate message whose signature or certificates fail →
+    /// `ERR_INVALID_AUTH`, the reason as the description.
+    InvalidMessage(String),
+    /// No session for the nonce (or identity) named → `ERR_SESSION_NOT_FOUND`.
+    SessionNotFound,
+    /// The session exists but its handshake never completed → `ERR_INVALID_AUTH`.
+    SessionNotAuthenticated,
+    /// The identity in the header is not the session's (the 2026-09-14
+    /// delta-verify NEW-1) → `ERR_INVALID_AUTH`.
+    IdentityNotSessions,
+    /// The signature is missing or does not verify under the session's
+    /// identity → `ERR_INVALID_AUTH`.
+    InvalidSignature(String),
+    /// A general message without `x-bsv-auth-nonce` → `ERR_INVALID_AUTH`.
+    MissingNonce,
+    /// The per-request nonce was already consumed for this session (audit
+    /// #30) → `ERR_REPLAYED_REQUEST`.
+    Replayed,
+}
+
+impl AuthRefusal {
+    /// Every refusal is a 401.
+    const STATUS: u16 = 401;
+
+    /// The wire code (the reference's where it has one; `ERR_REPLAYED_REQUEST`
+    /// is this crate's).
+    fn code(&self) -> &'static str {
+        match self {
+            Self::NoAuthHeaders => "UNAUTHORIZED",
+            Self::SessionNotFound => "ERR_SESSION_NOT_FOUND",
+            Self::Replayed => "ERR_REPLAYED_REQUEST",
+            Self::InvalidMessage(_)
+            | Self::SessionNotAuthenticated
+            | Self::IdentityNotSessions
+            | Self::InvalidSignature(_)
+            | Self::MissingNonce => "ERR_INVALID_AUTH",
+        }
+    }
+
+    /// The body's text (the 0.3 wire texts where a 401 already existed).
+    fn description(&self) -> String {
+        match self {
+            Self::NoAuthHeaders => "Mutual-authentication failed!".into(),
+            Self::InvalidMessage(reason) | Self::InvalidSignature(reason) => reason.clone(),
+            Self::SessionNotFound => "No authenticated session found".into(),
+            Self::SessionNotAuthenticated => "Session not authenticated".into(),
+            Self::IdentityNotSessions => "Message identity key is not the session's".into(),
+            Self::MissingNonce => {
+                "General message is missing the per-request nonce (x-bsv-auth-nonce).".into()
+            }
+            Self::Replayed => "The request nonce has already been used (replay rejected).".into(),
+        }
+    }
+
+    /// An error raised below the door: the 401 class (what
+    /// `AuthCloudflareError::status_code` has called 401 since 0.1) is a
+    /// refusal; anything else is a fault and stays an `Err`.
+    fn from_fault(e: AuthCloudflareError) -> std::result::Result<Self, AuthCloudflareError> {
+        match e {
+            AuthCloudflareError::Unauthorized => Ok(Self::NoAuthHeaders),
+            AuthCloudflareError::InvalidAuthentication(reason) => Ok(Self::InvalidMessage(reason)),
+            AuthCloudflareError::SessionNotFound(_) => Ok(Self::SessionNotFound),
+            fault => Err(fault),
+        }
+    }
+}
+
+/// What the door decided about a general message, free of `Request` and
+/// `Response` so the whole path runs under native `cargo test`.
+#[derive(Debug)]
+enum GeneralJudgement {
+    /// Verified over its session (the per-request nonce consumed, the
+    /// liveness touched): the session the answer is signed for.
+    Accepted(StoredSession),
+    /// Refused: the door answers 401 and serves nothing.
+    Refused(AuthRefusal),
+}
+
+/// The 0.4.1 rule at the door: a refusal raised below it as an `Err` of the
+/// 401 class becomes the middleware's own 401 answer; a fault stays `Err`.
+fn settle(outcome: Result<AuthResult>) -> Result<AuthResult> {
+    match outcome {
+        Err(e) => {
+            let refusal = AuthRefusal::from_fault(e)?;
+            Ok(AuthResult::Response(refusal_response(&refusal)?))
+        }
+        ok => ok,
+    }
+}
+
+/// Render a refusal as the middleware's own answer: 401, the wire body, the
+/// CORS headers, unsigned (there is no session to sign with, as the 0.3 401s
+/// already were). The ONE place a refusal becomes a `Response`.
+fn refusal_response(refusal: &AuthRefusal) -> Result<Response> {
+    let response = match refusal {
+        // TS Express middleware wire format:
+        //   { status: "error", code: "UNAUTHORIZED", message: "Mutual-authentication failed!" }
+        // Field is `message` (not `description`) — verified against a live
+        // TS server. Handler-layer errors use `description`; middleware-
+        // layer auth errors use `message`. Mirror exactly.
+        AuthRefusal::NoAuthHeaders => Response::from_json(&serde_json::json!({
+            "status": "error",
+            "code": refusal.code(),
+            "message": refusal.description(),
+        })),
+        _ => Response::from_json(&ErrorResponse::new(refusal.code(), refusal.description())),
+    }
+    .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+    .with_status(AuthRefusal::STATUS);
+    Ok(add_cors_headers(response))
+}
 
 /// Process authentication for a Cloudflare Worker request.
 ///
@@ -221,6 +367,7 @@ use crate::storage::session_storage::LaneVerifyAsk;
 /// 1. Handshake requests (`/.well-known/auth`) → processes handshake, returns Response
 /// 2. Authenticated requests (with auth headers) → verifies signature, returns Authenticated
 /// 3. Unauthenticated requests → returns 401 or allows through if configured
+/// 4. A refused request → a 401 `AuthResult::Response` (0.4.1); `Err` is a fault only
 pub async fn process_auth(
     req: Request,
     env: &Env,
@@ -268,7 +415,21 @@ pub async fn process_auth_do(
 /// 1. Handshake requests (`/.well-known/auth`) → processes handshake, returns Response
 /// 2. Authenticated requests (with auth headers) → verifies signature, returns Authenticated
 /// 3. Unauthenticated requests → returns 401 or allows through if configured
+/// 4. A refused request → a 401 `AuthResult::Response` (0.4.1); `Err` is a fault only
 pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
+    req: Request,
+    session_storage: &S,
+    options: &AuthMiddlewareOptions,
+) -> Result<AuthResult> {
+    settle(authenticate(req, session_storage, options).await)
+}
+
+/// The reference flow over the store, before the door settles it: the
+/// general path's own refusals are already answers (`judge_general_message`);
+/// a refusal raised below the door as an `Err` of the 401 class (the transport
+/// could not read a BRC-103 message from the headers; a handshake message
+/// refused) is rendered by [`settle`]; a fault stays `Err`.
+async fn authenticate<S: SessionStorage + ?Sized>(
     mut req: Request,
     session_storage: &S,
     options: &AuthMiddlewareOptions,
@@ -295,21 +456,9 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
                 body: vec![],
             });
         } else {
-            // TS Express middleware wire format:
-            //   { status: "error", code: "UNAUTHORIZED", message: "Mutual-authentication failed!" }
-            // Field is `message` (not `description`) — verified against live
-            // TS server at messagebox.babbage.systems. Handler-layer errors
-            // (ERR_MESSAGEBOX_REQUIRED etc.) use `description`; middleware-
-            // layer auth errors use `message`. Mirror exactly.
-            let body = serde_json::json!({
-                "status": "error",
-                "code": "UNAUTHORIZED",
-                "message": "Mutual-authentication failed!",
-            });
-            let response = Response::from_json(&body)
-                .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-                .with_status(401);
-            return Ok(AuthResult::Response(add_cors_headers(response)));
+            return Ok(AuthResult::Response(refusal_response(
+                &AuthRefusal::NoAuthHeaders,
+            )?));
         }
     }
 
@@ -319,12 +468,58 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     // Extract auth message from request (also returns raw body bytes)
     let (auth_message, request_body) = CloudflareTransport::extract_auth_message(&mut req).await?;
 
+    // The door's judgement of the general message (Request/Response-free,
+    // so the whole path runs under native `cargo test`): a refusal is the
+    // middleware's own 401, never an `Err` (0.4.1).
+    let now_ms = current_time_ms();
+    let session =
+        match judge_general_message(&wallet, &auth_message, session_storage, options, now_ms)
+            .await?
+        {
+            GeneralJudgement::Accepted(session) => session,
+            GeneralJudgement::Refused(refusal) => {
+                return Ok(AuthResult::Response(refusal_response(&refusal)?));
+            }
+        };
+
+    // Build session info for response signing.
+    // peer_nonce = the client's HANDSHAKE nonce (from session), not the per-message random nonce.
+    let auth_session = AuthSession {
+        server_private_key: options.server_private_key.clone(),
+        session_nonce: session.session_nonce.clone(),
+        peer_nonce: session.peer_nonce.clone(),
+        peer_identity_key: session.peer_identity_key.clone(),
+        request_id,
+    };
+
+    Ok(AuthResult::Authenticated {
+        context: AuthContext::authenticated(session.peer_identity_key),
+        request: req,
+        session: Some(auth_session),
+        body: request_body,
+    })
+}
+
+/// Judge a general message over the store: the session it names, its
+/// identity binding (NEW-1), its signature under the SESSION's identity, its
+/// per-request nonce (single-use, audit #30), then the liveness touch. Every
+/// refusal is a value ([`AuthRefusal`], rendered 401 by the door); `Err` is a
+/// storage or SDK fault only. Free of `Request`, `Response` and the clock
+/// (`now_ms` is the caller's), so the whole path executes under native
+/// `cargo test` (as the payment path's `decide_payment` does, audit finding
+/// #62).
+async fn judge_general_message<S: SessionStorage + ?Sized>(
+    wallet: &ProtoWallet,
+    message: &AuthMessage,
+    session_storage: &S,
+    options: &AuthMiddlewareOptions,
+    now_ms: u64,
+) -> Result<GeneralJudgement> {
+    use GeneralJudgement::Refused;
+
     // Get session by peer's identity key or nonce
-    let identity_key_hex = auth_message.identity_key.to_hex();
-    let session_nonce = auth_message
-        .your_nonce
-        .as_ref()
-        .or(auth_message.nonce.as_ref());
+    let identity_key_hex = message.identity_key.to_hex();
+    let session_nonce = message.your_nonce.as_ref().or(message.nonce.as_ref());
 
     // The combined hot path: a backend that answers "is this session live?" and "has
     // this request nonce been seen?" from ONE place (the Durable Object
@@ -332,7 +527,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     // "unsupported" and takes the two-step path below, unchanged. The nonce
     // is then consumed before the signature check — harmless (an
     // unverifiable request's nonce is nobody else's) and never weaker.
-    let request_nonce_opt = auth_message.nonce.as_deref().filter(|n| !n.is_empty());
+    let request_nonce_opt = message.nonce.as_deref().filter(|n| !n.is_empty());
     let mut combined_fresh: Option<bool> = None;
     let session = if let Some(nonce) = session_nonce {
         match request_nonce_opt {
@@ -354,41 +549,35 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
             .await?
     };
 
-    let session = match session {
-        Some(s) => s,
-        None => {
-            let response = Response::from_json(&ErrorResponse::new(
-                "ERR_SESSION_NOT_FOUND",
-                "No authenticated session found",
-            ))
-            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-            .with_status(401);
-            return Ok(AuthResult::Response(add_cors_headers(response)));
-        }
+    let Some(session) = session else {
+        return Ok(Refused(AuthRefusal::SessionNotFound));
     };
 
     if !session.is_authenticated {
-        return Err(AuthCloudflareError::InvalidAuthentication(
-            "Session not authenticated".into(),
-        ));
+        return Ok(Refused(AuthRefusal::SessionNotAuthenticated));
     }
 
     // The signed identity IS the session's: a general message naming another
     // identity over this session is refused by name before its signature is
     // judged (the reference verifies with `peerSession.peerIdentityKey`; the
     // header is a claim — the 2026-09-14 delta-verify NEW-1).
-    if !core_auth::message_identity_is_sessions(&auth_message, &SessionBinding::from(&session)) {
-        return Err(AuthCloudflareError::InvalidAuthentication(
-            "Message identity key is not the session's".into(),
-        ));
+    if !core_auth::message_identity_is_sessions(message, &SessionBinding::from(&session)) {
+        return Ok(Refused(AuthRefusal::IdentityNotSessions));
     }
 
-    // Verify signature
-    let is_valid = verify_message_signature(&wallet, &auth_message, &session)?;
-    if !is_valid {
-        return Err(AuthCloudflareError::InvalidAuthentication(
-            "Invalid message signature".into(),
-        ));
+    // Verify signature: `false` and the core's "not a message for this
+    // session" (unsigned) are refusals; a fault below stays an `Err`.
+    match verify_message_signature(wallet, message, &session) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(Refused(AuthRefusal::InvalidSignature(
+                "Invalid message signature".into(),
+            )))
+        }
+        Err(AuthCloudflareError::InvalidAuthentication(reason)) => {
+            return Ok(Refused(AuthRefusal::InvalidSignature(reason)))
+        }
+        Err(fault) => return Err(fault),
     }
 
     // Replay protection (audit finding #30): consume the per-request
@@ -415,20 +604,12 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     // TTL: the nonce record lives `session_ttl_seconds`. See the module docs
     // for the exact residual-replay window this leaves under KV and under
     // sliding session renewal.
-    let request_nonce = match auth_message.nonce.as_deref() {
+    let request_nonce = match message.nonce.as_deref() {
         Some(n) if !n.is_empty() => n,
-        _ => {
-            // Honest BRC-104 clients always send x-bsv-auth-nonce on General
-            // messages (SimplifiedFetchTransport sets it unconditionally).
-            // Without it replay protection is impossible — reject.
-            let response = Response::from_json(&ErrorResponse::new(
-                "ERR_INVALID_AUTH",
-                "General message is missing the per-request nonce (x-bsv-auth-nonce).",
-            ))
-            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-            .with_status(401);
-            return Ok(AuthResult::Response(add_cors_headers(response)));
-        }
+        // Honest BRC-104 clients always send x-bsv-auth-nonce on General
+        // messages (SimplifiedFetchTransport sets it unconditionally).
+        // Without it replay protection is impossible — reject.
+        _ => return Ok(Refused(AuthRefusal::MissingNonce)),
     };
 
     // Fail closed on storage errors (`?`): a nonce-store outage must not
@@ -448,13 +629,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         }
     };
     if !nonce_fresh {
-        let response = Response::from_json(&ErrorResponse::new(
-            "ERR_REPLAYED_REQUEST",
-            "The request nonce has already been used (replay rejected).",
-        ))
-        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-        .with_status(401);
-        return Ok(AuthResult::Response(add_cors_headers(response)));
+        return Ok(Refused(AuthRefusal::Replayed));
     }
 
     // Update session last activity (but NOT peer_nonce).
@@ -478,30 +653,15 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     //       and ignored; the session's existing TTL is still valid, so the
     //       request proceeds authenticated.
     let refresh_after_ms = options.session_ttl_seconds.saturating_mul(1000) / 2;
-    if current_time_ms().saturating_sub(session.last_update) >= refresh_after_ms {
+    if now_ms.saturating_sub(session.last_update) >= refresh_after_ms {
         let mut updated_session = session.clone();
-        updated_session.touch();
+        updated_session.last_update = now_ms;
         if let Err(e) = session_storage.update_session(&updated_session).await {
             worker::console_warn!("BRC-31 session liveness touch skipped (non-fatal): {e:?}");
         }
     }
 
-    // Build session info for response signing.
-    // peer_nonce = the client's HANDSHAKE nonce (from session), not the per-message random nonce.
-    let auth_session = AuthSession {
-        server_private_key: options.server_private_key.clone(),
-        session_nonce: session.session_nonce.clone(),
-        peer_nonce: session.peer_nonce.clone(),
-        peer_identity_key: session.peer_identity_key.clone(),
-        request_id,
-    };
-
-    Ok(AuthResult::Authenticated {
-        context: AuthContext::authenticated(session.peer_identity_key),
-        request: req,
-        session: Some(auth_session),
-        body: request_body,
-    })
+    Ok(GeneralJudgement::Accepted(session))
 }
 
 /// Sign a response for BRC-103/104 interop.
@@ -924,9 +1084,9 @@ pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
             AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
         })?;
         let wallet = ProtoWallet::new(Some(private_key));
-        return Ok(LaneAuthResult::Reference(
-            handle_handshake_request(req, &wallet, session_storage, options).await?,
-        ));
+        return Ok(LaneAuthResult::Reference(settle(
+            handle_handshake_request(req, &wallet, session_storage, options).await,
+        )?));
     }
     // The reference path judges the general message (the BRC-104 signature
     // over the payload, the session, the per-request nonce). Only a request it
@@ -1938,7 +2098,7 @@ mod tests {
             .find("core_auth::message_identity_is_sessions(")
             .expect("the identity binding");
         let verify = general
-            .find("verify_message_signature(&wallet, &auth_message, &session)")
+            .find("verify_message_signature(wallet, message, &session)")
             .expect("the verify call");
         assert!(bind < verify, "the binding precedes the signature check");
         // The verify is the core's, over the SESSION's binding (the core pins
@@ -1960,5 +2120,350 @@ mod tests {
                 "{emitter} exposes the lane offer header"
             );
         }
+    }
+    // ===========================================
+    // 0.4.1: an authentication refusal is the door's own 401, never an Err
+    // ===========================================
+
+    use crate::storage::session_storage::MemorySessionStorage;
+
+    const SERVER_SESSION_NONCE: &str = "server-session-nonce";
+    const CLIENT_HANDSHAKE_NONCE: &str = "client-handshake-nonce";
+    const OTHER_KEY_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000003";
+
+    /// The server's record of the session `client_hex`'s handshake opened.
+    fn session_for(client_hex: &str, authenticated: bool) -> StoredSession {
+        StoredSession {
+            session_nonce: SERVER_SESSION_NONCE.to_string(),
+            peer_identity_key: test_key(client_hex).to_hex(),
+            peer_nonce: Some(CLIENT_HANDSHAKE_NONCE.to_string()),
+            is_authenticated: authenticated,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 0,
+            last_update: 0,
+        }
+    }
+
+    /// A general message over the server's session: `claimed_hex` in the
+    /// header, signed by `signer_hex` (honest when they are the same key).
+    fn general_message(claimed_hex: &str, signer_hex: &str, nonce: &str) -> AuthMessage {
+        let mut msg = AuthMessage::new(MessageType::General, test_key(claimed_hex));
+        msg.nonce = Some(nonce.to_string());
+        msg.your_nonce = Some(SERVER_SESSION_NONCE.to_string());
+        msg.payload = Some(vec![1, 2, 3]);
+        // The signer's view of the session: the server is its peer, the
+        // server's session nonce its peer's nonce.
+        let signer_view = StoredSession {
+            session_nonce: CLIENT_HANDSHAKE_NONCE.to_string(),
+            peer_identity_key: test_key(SERVER_KEY_HEX).to_hex(),
+            peer_nonce: Some(SERVER_SESSION_NONCE.to_string()),
+            ..session_for(claimed_hex, true)
+        };
+        sign_message(&test_wallet(signer_hex), &mut msg, &signer_view).unwrap();
+        msg
+    }
+
+    fn door() -> AuthMiddlewareOptions {
+        AuthMiddlewareOptions {
+            server_private_key: SERVER_KEY_HEX.to_string(),
+            ..Default::default()
+        }
+    }
+
+    async fn store_with(session: StoredSession) -> MemorySessionStorage {
+        let store = MemorySessionStorage::default();
+        store.save_session(&session).await.unwrap();
+        store
+    }
+
+    /// The door's judgement at `NOW_MS` (past the half-TTL mark of a session
+    /// last touched at 0, so an accepted message also exercises the touch).
+    const NOW_MS: u64 = 3_600_000;
+
+    async fn judge(store: &MemorySessionStorage, msg: &AuthMessage) -> Result<GeneralJudgement> {
+        judge_general_message(&test_wallet(SERVER_KEY_HEX), msg, store, &door(), NOW_MS).await
+    }
+
+    fn refused(judgement: Result<GeneralJudgement>) -> AuthRefusal {
+        match judgement {
+            Ok(GeneralJudgement::Refused(refusal)) => refusal,
+            Ok(GeneralJudgement::Accepted(s)) => panic!("served {s:?}, expected a refusal"),
+            Err(e) => panic!("an Err ({e:?}), expected a refusal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_honest_general_message_is_accepted_and_its_nonce_consumed() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, true)).await;
+        let msg = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-1");
+        match judge(&store, &msg).await.unwrap() {
+            GeneralJudgement::Accepted(session) => {
+                assert_eq!(session.peer_identity_key, test_key(CLIENT_KEY_HEX).to_hex());
+            }
+            GeneralJudgement::Refused(r) => panic!("refused: {r:?}"),
+        }
+        assert!(store.is_consumed(SERVER_SESSION_NONCE, "nonce-1"));
+        // The liveness touch (past the half-TTL mark) wrote the caller's clock.
+        let touched = store
+            .get_session(SERVER_SESSION_NONCE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(touched.last_update, NOW_MS);
+    }
+
+    /// The live gap (2026-10-08): a general message naming another identity
+    /// over the session was `Err(InvalidAuthentication)`, a 500 at every host.
+    #[tokio::test]
+    async fn a_message_naming_another_identity_is_refused_401_not_err() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, true)).await;
+        // The attacker names its own key and signs honestly for it.
+        let msg = general_message(OTHER_KEY_HEX, OTHER_KEY_HEX, "nonce-1");
+        let refusal = refused(judge(&store, &msg).await);
+        assert_eq!(refusal, AuthRefusal::IdentityNotSessions);
+        assert_eq!(refusal.code(), "ERR_INVALID_AUTH");
+        assert_eq!(
+            refusal.description(),
+            "Message identity key is not the session's"
+        );
+        assert_eq!(
+            store.consumed_count(),
+            0,
+            "nothing consumed, nothing served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_or_missing_signature_is_refused_401_not_err() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, true)).await;
+        // Another key's signature under the session's identity.
+        let forged = general_message(CLIENT_KEY_HEX, OTHER_KEY_HEX, "nonce-1");
+        let refusal = refused(judge(&store, &forged).await);
+        assert!(
+            matches!(refusal, AuthRefusal::InvalidSignature(_)),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.code(), "ERR_INVALID_AUTH");
+        assert_eq!(refusal.description(), "Invalid message signature");
+        // A tampered payload.
+        let mut tampered = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-2");
+        tampered.payload = Some(vec![9, 9, 9]);
+        assert!(matches!(
+            refused(judge(&store, &tampered).await),
+            AuthRefusal::InvalidSignature(_)
+        ));
+        // No signature at all (the core's "Message not signed" was an Err too).
+        let mut unsigned = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-3");
+        unsigned.signature = None;
+        let refusal = refused(judge(&store, &unsigned).await);
+        assert_eq!(
+            refusal,
+            AuthRefusal::InvalidSignature("Message not signed".into())
+        );
+        assert_eq!(
+            store.consumed_count(),
+            0,
+            "nothing consumed, nothing served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_handshake_never_completed_is_refused_401_not_err() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, false)).await;
+        let msg = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-1");
+        let refusal = refused(judge(&store, &msg).await);
+        assert_eq!(refusal, AuthRefusal::SessionNotAuthenticated);
+        assert_eq!(refusal.code(), "ERR_INVALID_AUTH");
+        assert_eq!(store.consumed_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_session_is_refused_session_not_found() {
+        let store = MemorySessionStorage::default();
+        let msg = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-1");
+        let refusal = refused(judge(&store, &msg).await);
+        assert_eq!(refusal, AuthRefusal::SessionNotFound);
+        assert_eq!(refusal.code(), "ERR_SESSION_NOT_FOUND");
+        assert_eq!(refusal.description(), "No authenticated session found");
+    }
+
+    #[tokio::test]
+    async fn a_general_message_without_a_per_request_nonce_is_refused() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, true)).await;
+        let msg = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "");
+        let refusal = refused(judge(&store, &msg).await);
+        assert_eq!(refusal, AuthRefusal::MissingNonce);
+        assert_eq!(refusal.code(), "ERR_INVALID_AUTH");
+        assert_eq!(store.consumed_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_nonce_is_refused_replayed_request() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, true)).await;
+        let msg = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-1");
+        assert!(matches!(
+            judge(&store, &msg).await.unwrap(),
+            GeneralJudgement::Accepted(_)
+        ));
+        let refusal = refused(judge(&store, &msg).await);
+        assert_eq!(refusal, AuthRefusal::Replayed);
+        assert_eq!(refusal.code(), "ERR_REPLAYED_REQUEST");
+        assert_eq!(store.consumed_count(), 1);
+    }
+
+    /// The compatibility proof: a storage fault is still an `Err` (the host's
+    /// 500), never dressed as a refusal; replay protection fails closed.
+    #[tokio::test]
+    async fn a_storage_fault_is_still_an_err_never_a_refusal() {
+        let store = store_with(session_for(CLIENT_KEY_HEX, true)).await;
+        store.fail_consume(true);
+        let msg = general_message(CLIENT_KEY_HEX, CLIENT_KEY_HEX, "nonce-1");
+        let err = judge(&store, &msg).await.unwrap_err();
+        assert!(matches!(err, AuthCloudflareError::KvError(_)), "{err:?}");
+        assert_eq!(err.status_code(), 500);
+    }
+
+    /// Every refusal is a 401 with the code the reference (or the 0.3 wire)
+    /// gave it, and the door settles exactly the 401-class errors raised
+    /// below it: the class `AuthCloudflareError::status_code` has declared.
+    #[test]
+    fn every_refusal_is_a_401_with_its_code_and_only_the_401_class_settles() {
+        let table = [
+            (
+                AuthRefusal::NoAuthHeaders,
+                "UNAUTHORIZED",
+                "Mutual-authentication failed!",
+            ),
+            (
+                AuthRefusal::InvalidMessage("Missing identity key header".into()),
+                "ERR_INVALID_AUTH",
+                "Missing identity key header",
+            ),
+            (
+                AuthRefusal::SessionNotFound,
+                "ERR_SESSION_NOT_FOUND",
+                "No authenticated session found",
+            ),
+            (
+                AuthRefusal::SessionNotAuthenticated,
+                "ERR_INVALID_AUTH",
+                "Session not authenticated",
+            ),
+            (
+                AuthRefusal::IdentityNotSessions,
+                "ERR_INVALID_AUTH",
+                "Message identity key is not the session's",
+            ),
+            (
+                AuthRefusal::InvalidSignature("Invalid message signature".into()),
+                "ERR_INVALID_AUTH",
+                "Invalid message signature",
+            ),
+            (
+                AuthRefusal::MissingNonce,
+                "ERR_INVALID_AUTH",
+                "General message is missing the per-request nonce (x-bsv-auth-nonce).",
+            ),
+            (
+                AuthRefusal::Replayed,
+                "ERR_REPLAYED_REQUEST",
+                "The request nonce has already been used (replay rejected).",
+            ),
+        ];
+        assert_eq!(AuthRefusal::STATUS, 401);
+        for (refusal, code, description) in table {
+            assert_eq!(refusal.code(), code, "{refusal:?}");
+            assert_eq!(refusal.description(), description, "{refusal:?}");
+        }
+        let errors = vec![
+            AuthCloudflareError::Unauthorized,
+            AuthCloudflareError::InvalidAuthentication("Invalid identity key: x".into()),
+            AuthCloudflareError::SessionNotFound("02ab".into()),
+            AuthCloudflareError::KvError("kv".into()),
+            AuthCloudflareError::SdkError("sdk".into()),
+            AuthCloudflareError::TransportError("body".into()),
+            AuthCloudflareError::ConfigError("key".into()),
+            AuthCloudflareError::SerializationError("json".into()),
+            AuthCloudflareError::ServerMisconfigured,
+            AuthCloudflareError::PaymentFailed("x".into()),
+        ];
+        for e in errors {
+            let is_refusal = e.status_code() == 401;
+            let shown = format!("{e:?}");
+            match AuthRefusal::from_fault(e) {
+                Ok(r) => assert!(is_refusal, "{shown} settled as {r:?}"),
+                Err(fault) => assert!(!is_refusal, "{shown} stayed Err({fault:?})"),
+            }
+        }
+        assert_eq!(
+            AuthRefusal::from_fault(AuthCloudflareError::InvalidAuthentication(
+                "Invalid identity key: x".into()
+            ))
+            .unwrap(),
+            AuthRefusal::InvalidMessage("Invalid identity key: x".into())
+        );
+        assert_eq!(
+            AuthRefusal::from_fault(AuthCloudflareError::SessionNotFound("02ab".into())).unwrap(),
+            AuthRefusal::SessionNotFound
+        );
+        assert_eq!(
+            AuthRefusal::from_fault(AuthCloudflareError::Unauthorized).unwrap(),
+            AuthRefusal::NoAuthHeaders
+        );
+    }
+
+    /// Structural: every door answers through `settle` (the general path, and
+    /// the lane's handshake call), the ONE renderer sets 401 and appends CORS,
+    /// and no refusal is raised as an `Err` inside the general path.
+    #[test]
+    fn every_refusal_leaves_the_door_as_a_401_response_with_cors() {
+        fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+            let from = &src[src.find(name).unwrap_or_else(|| panic!("{name}"))..];
+            &from[..from.find("\n}\n").unwrap()]
+        }
+        let whole = include_str!("auth.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        let door = body_of(src, "pub async fn process_auth_with_storage");
+        assert!(
+            door.contains("settle(authenticate(req, session_storage, options).await)"),
+            "the door settles"
+        );
+        let lane = body_of(src, "pub async fn process_auth_lane_with_storage");
+        let handshake = lane
+            .find("handle_handshake_request(req, &wallet, session_storage, options).await")
+            .unwrap();
+        assert!(
+            lane[..handshake].trim_end().ends_with("settle("),
+            "the lane's handshake call settles"
+        );
+        let render = body_of(src, "fn refusal_response(");
+        assert!(
+            render.contains(".with_status(AuthRefusal::STATUS)")
+                && render.contains("add_cors_headers(response)"),
+            "one renderer: 401 + CORS"
+        );
+        assert_eq!(
+            src.matches(".with_status(401)").count(),
+            0,
+            "no 401 is built by hand outside the renderer"
+        );
+        for path in ["async fn judge_general_message", "async fn authenticate"] {
+            let body = body_of(src, path);
+            assert!(
+                !body.contains("return Err(AuthCloudflareError::"),
+                "{path} raises no refusal as an Err"
+            );
+            assert!(
+                !body.contains("AuthCloudflareError::InvalidAuthentication(\n")
+                    && !body.contains("AuthCloudflareError::SessionNotFound("),
+                "{path} builds no 401-class error"
+            );
+        }
+        let settle_fn = body_of(src, "fn settle(");
+        assert!(
+            settle_fn.contains("AuthRefusal::from_fault(e)?")
+                && settle_fn.contains("refusal_response(&refusal)?")
+        );
     }
 }

@@ -96,6 +96,13 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
   (no merkle proof is checked against a header here, and what the wallet storage server does on internalize is not
   verified by this crate); `verify_brc29_payment` is the caller's proof step, run before the middleware.
 
+- **Authentication refusals are 401 responses (0.4.1).** `process_auth*` never returns an `Err` for a refusal:
+  identity not the session's, bad or missing signature, session not authenticated, unknown session, missing or
+  replayed per-request nonce, malformed auth headers, a refused handshake message are all
+  `Ok(AuthResult::Response(401))` with CORS, unsigned (`AuthRefusal` → `refusal_response`, the one renderer;
+  `judge_general_message` is the Request/Response-free decision; `settle` renders the 401-class `Err`s raised
+  below the door). An `Err` from `process_auth*` is a fault (storage, config, transport, SDK): the host's 500.
+  Hosts and `AuthFetch`-class clients re-handshake on 401 only; 0.4.0's `Err` was rendered 500 by every host.
 - **Raw body passthrough.** `process_auth` returns the original request bytes via
   `AuthResult::Authenticated { body }`. Workers consume the body stream during auth
   payload construction, so downstream handlers must use this `body` instead of
@@ -133,7 +140,7 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
 | Status | Code | Variant |
 |---|---|---|
 | 400 | `ERR_MALFORMED_PAYMENT` / `ERR_INVALID_DERIVATION_PREFIX` / `ERR_PAYMENT_FAILED` / `ERR_INVALID_PAYMENT` / `ERR_SERIALIZATION` | payment / serialization |
-| 401 | `UNAUTHORIZED` / `ERR_INVALID_AUTH` / `ERR_SESSION_NOT_FOUND` / `ERR_REPLAYED_REQUEST`¹ | auth |
+| 401 | `UNAUTHORIZED` / `ERR_INVALID_AUTH` / `ERR_SESSION_NOT_FOUND` / `ERR_REPLAYED_REQUEST`¹ | auth (every one an `AuthResult::Response` since 0.4.1, never an `Err`) |
 | 402 | `ERR_PAYMENT_REQUIRED` / `ERR_PAYMENT_FAILED`¹ (wallet rejected, fresh challenge attached) | payment |
 | 500 | `ERR_SERVER_MISCONFIGURED` / `ERR_PAYMENT_INTERNAL` / `ERR_STORAGE` / `ERR_SDK` / `ERR_TRANSPORT` / `ERR_CONFIG` | payment / infra |
 | 503 | `ERR_HEADER_SERVICE_UNAVAILABLE`¹ (the proof's merkle root could not be checked; quote kept, retry the same payment) | payment (rendered directly, no `AuthCloudflareError` variant) |
