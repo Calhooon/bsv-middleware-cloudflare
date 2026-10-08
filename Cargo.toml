@@ -8,6 +8,9 @@ repository = "https://github.com/Calhooon/bsv-middleware-cloudflare"
 keywords = ["bsv", "authentication", "cloudflare", "workers", "middleware"]
 categories = ["web-programming", "authentication", "cryptography"]
 
+[workspace]
+members = [".", "core"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
