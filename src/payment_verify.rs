@@ -32,18 +32,25 @@
 //! This crate ships **no** header service of its own, and it never skips SPV
 //! silently. `header_url` must name your own ChainTracks-compatible service
 //! (for example a ChainTracks deployment you run). `None`, an empty string,
-//! [`DEFAULT_CHAINTRACKS_URL`], any other `.invalid` host, or a value without
-//! an `http://` / `https://` scheme is refused with
+//! [`DEFAULT_CHAINTRACKS_URL`], any other `.invalid` host, a value without
+//! an `http://` / `https://` scheme, or a value whose host the gate cannot
+//! classify as a real hostname is refused with
 //! [`PaymentVerifyError::NoHeaderService`] BEFORE anything else is checked, so
 //! a misconfigured deployment rejects every payment loudly instead of
-//! accepting unverified ones. Adopters that truly have no header service opt
-//! out *by name* with [`verify_brc29_payment_structural_only`].
+//! accepting unverified ones. The host is normalised (lowercased, trailing
+//! dot stripped) before the placeholder comparison, and spellings that would
+//! need a URL parser to decode or rewrite (percent-encoding, backslashes,
+//! userinfo, whitespace, non-ASCII) are refused rather than guessed at, so
+//! no spelling of the placeholder reaches DNS and fails open. Adopters that
+//! truly have no header service opt out *by name* with
+//! [`verify_brc29_payment_structural_only`].
 //!
 //! | `header_url` | outcome |
 //! |---|---|
 //! | `None`, `Some("")`, whitespace only | `Err(NoHeaderService)` |
-//! | the `.invalid` placeholder (trailing slash or not), any `.invalid` host | `Err(NoHeaderService)` |
-//! | no `http://` / `https://` scheme | `Err(NoHeaderService)` |
+//! | the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host | `Err(NoHeaderService)` |
+//! | no `http://` / `https://` scheme, no host | `Err(NoHeaderService)` |
+//! | userinfo (`@`), `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
 //! | service unreachable, HTTP error, unparseable answer | `Ok`, warning logged (fail-open) |
 //! | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 //! | the header carries the proof's root | `Ok(satoshis)` |
@@ -170,37 +177,98 @@ impl std::error::Error for PaymentVerifyError {}
 
 // ─── Header-service configuration (pure) ────────────────────────────
 
-/// The host of an `http://` / `https://` base URL, lowercased: the authority
-/// without userinfo or port, IPv6 literals unbracketed. `None` when the value
-/// is not such a URL or has no host.
+/// The normalised host of an `http://` / `https://` base URL, or `None` when
+/// the value cannot be classified as such a URL naming a real host.
+///
+/// This is deliberately stricter than a WHATWG URL parse. The gate compares
+/// the host against the `.invalid` placeholder, so any spelling that a URL
+/// parser would decode or rewrite into a different host than this function
+/// sees could slip past that comparison and then fail open at lookup time
+/// (a trailing-dot FQDN, a percent-encoded dot, a backslash before an `@`).
+/// The rule is therefore: normalise what can be normalised, refuse what
+/// would need decoding, and never guess. After the scheme:
+///
+/// - the authority is the text up to the first `/`, `?` or `#`;
+/// - the whole value must be free of `\`, whitespace and control characters;
+/// - the authority must be ASCII and carry no `@` (userinfo: the Fetch
+///   standard rejects URL credentials, so an `@` can only be a trick) and
+///   no `%` (the gate does not decode, so it accepts nothing that needs it);
+/// - the host is either a bracketed IPv6 literal that `Ipv6Addr` parses, or
+///   dot-separated labels of ASCII letters, digits and hyphens (no hyphen at
+///   a label's ends), with one optional trailing dot (the FQDN marker);
+/// - an optional `:port` is a run of decimal digits that fits in 16 bits.
+///
+/// The host comes back lowercased, without the port, with the trailing dot
+/// stripped and an IPv6 literal unbracketed, so the `.invalid` test sees one
+/// spelling of each host.
 fn header_service_host(base: &str) -> Option<String> {
+    if base
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
     let (scheme, rest) = base.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return None;
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        hostport.split(':').next().unwrap_or("")
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
+    if authority.is_empty() || !authority.is_ascii() || authority.contains(['@', '%']) {
+        return None;
     }
+    let (host, port_suffix) = match authority.strip_prefix('[') {
+        Some(after_bracket) => {
+            let (literal, after) = after_bracket.split_once(']')?;
+            literal.parse::<std::net::Ipv6Addr>().ok()?;
+            (literal, after)
+        }
+        None => authority.split_at(authority.find(':').unwrap_or(authority.len())),
+    };
+    match port_suffix.strip_prefix(':') {
+        Some(port) => {
+            if port.is_empty()
+                || !port.bytes().all(|b| b.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+            {
+                return None;
+            }
+        }
+        None if port_suffix.is_empty() => {}
+        None => return None,
+    }
+    let host = host.to_ascii_lowercase();
+    if authority.starts_with('[') {
+        return Some(host);
+    }
+    let name = host.strip_suffix('.').unwrap_or(&host);
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if name.is_empty() || !name.split('.').all(label_ok) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// The pure configuration gate: the base URL SPV will query, or
 /// [`PaymentVerifyError::NoHeaderService`].
 ///
 /// Trims surrounding whitespace and trailing slashes, then refuses `None`,
-/// the empty string, anything that is not an `http://` / `https://` URL with
-/// a host, and any host under the reserved `.invalid` TLD, which covers
-/// [`DEFAULT_CHAINTRACKS_URL`] with or without a trailing slash, in any case.
-/// A real but wrong host is NOT caught here: that surfaces as a service
-/// error at lookup time and fails open, by design (see the module docs).
+/// the empty string, anything [`header_service_host`] cannot classify as an
+/// `http://` / `https://` URL naming a real host (no scheme, no host,
+/// userinfo, percent-encoding, backslashes, whitespace, a port that is not a
+/// number, labels that are not a hostname), and any host that normalises
+/// (lowercased, trailing dot stripped) to the reserved `.invalid` TLD, which
+/// covers [`DEFAULT_CHAINTRACKS_URL`] in any case, with or without a trailing
+/// slash or dot. The normalisation runs BEFORE the placeholder comparison, so
+/// no spelling of the placeholder reaches DNS. A real but wrong host is NOT
+/// caught here: that surfaces as a service error at lookup time and fails
+/// open, by design (see the module docs).
 fn resolve_header_service(
     header_url: Option<&str>,
 ) -> std::result::Result<&str, PaymentVerifyError> {
@@ -507,7 +575,9 @@ where
 /// **`header_url` is required.** Pass the base URL of your own
 /// ChainTracks-compatible header service (for example a ChainTracks deployment
 /// you run). `None`, `Some("")`, [`DEFAULT_CHAINTRACKS_URL`], any `.invalid`
-/// host, or a value without an `http(s)://` scheme returns
+/// host (in any case, with or without a trailing dot), a value without an
+/// `http(s)://` scheme, or a value whose host cannot be classified as a real
+/// hostname (userinfo, percent-encoding, backslashes, whitespace) returns
 /// [`PaymentVerifyError::NoHeaderService`] before any other check: fail-closed,
 /// never a silent skip. Once a service is named, SPV is fail-open on a service
 /// error (unreachable, HTTP error, unparseable answer: accept and warn) and
@@ -908,27 +978,95 @@ mod tests {
     }
 
     /// The configuration gate, as a table: every shape of "no header service"
-    /// is `NoHeaderService` (never fail-open, never a skip); a real base URL
+    /// is `NoHeaderService` (never fail-open, never a skip), including the
+    /// placeholder spellings a URL parser would have decoded or rewritten
+    /// into the placeholder after our comparison (the re-review's R1: a
+    /// trailing-dot FQDN, a percent-encoded dot, a backslash before an `@`)
+    /// and every host form the gate declines to classify; a real base URL
     /// comes back trimmed, without trailing slashes.
     #[test]
     fn test_resolve_header_service_table() {
-        let refused: [Option<&str>; 11] = [
+        let refused: &[Option<&str>] = &[
+            // nothing
             None,
             Some(""),
             Some("   "),
             Some("/"),
+            // the placeholder, in every spelling
             Some(DEFAULT_CHAINTRACKS_URL),
             Some("https://chaintracks.invalid/"),
             Some("HTTPS://CHAINTRACKS.INVALID"),
-            Some("https://user:pw@headers.invalid:8443/v1/"),
+            Some("http://CHAINTRACKS.INVALID:443/"),
+            Some("HTTPS://Chaintracks.Invalid///"),
             Some("https://invalid"),
+            Some("https://invalid."),
+            // R1: trailing-dot FQDN, with and without a path
+            Some("https://chaintracks.invalid."),
+            Some("https://chaintracks.invalid./"),
+            Some("https://chaintracks.invalid./v1"),
+            Some("HTTPS://CHAINTRACKS.INVALID.:8443/"),
+            Some("https://chaintracks.invalid.."),
+            // R1: percent-encoding (a URL parser decodes it to the placeholder)
+            Some("https://chaintracks%2Einvalid"),
+            Some("https://chaintracks%2einvalid/"),
+            Some("https://chaintracks.invalid%2F"),
+            Some("https://%63haintracks.invalid"),
+            // R1: backslash parser differential (WHATWG reads `\` as `/`,
+            // so the fetch would have gone to the placeholder)
+            Some("https://chaintracks.invalid\\@real.example"),
+            Some("https://real.example\\@chaintracks.invalid"),
+            Some("https://chaintracks.invalid\\real.example"),
+            Some("https:\\\\chaintracks.invalid"),
+            Some("https://headers.example\\v1"),
+            // userinfo, on the placeholder and on a real host alike
+            Some("https://user@chaintracks.invalid"),
+            Some("https://user:pw@headers.invalid:8443/v1/"),
+            Some("https://user:pw@CHAINTRACKS.invalid:8443/x"),
+            Some("https://chaintracks.invalid@real.example"),
+            Some("https://user:pw@headers.example"),
+            Some("https://@headers.example"),
+            Some("https://@"),
+            // whitespace and control characters inside the value
+            Some("https://chain tracks.invalid"),
+            Some("https://chaintracks.invalid\t"),
+            Some("https://chaintracks.invalid\n/"),
+            Some("https://headers.example/v1 /x"),
+            Some("https://headers.example\u{0}"),
+            Some("https://headers\u{a0}.example"),
+            Some("\0\u{ff}garbage"),
+            // non-ASCII (an IDNA mapping could fold it onto the placeholder)
+            Some("https://chaintracks\u{ff0e}invalid"),
+            Some("https://h\u{e9}aders.example"),
+            // no scheme, the wrong scheme, no host
             Some("headers.example"),
             Some("ftp://headers.example"),
+            Some("https:/headers.example"),
+            Some("https:///headers.example"),
+            Some("https://"),
+            Some("https://:443"),
+            Some("https://[]"),
+            Some("https://[::1"),
+            Some("https://[::1]x"),
+            Some("https://[zz::1]"),
+            Some("https://[fe80::1%25eth0]"),
+            // a port that is not a port
+            Some("https://headers.example:"),
+            Some("https://headers.example:abc"),
+            Some("https://headers.example:+80"),
+            Some("https://headers.example:99999"),
+            Some("https://chaintracks.invalid:"),
+            // labels that are not a hostname
+            Some("https://-headers.example"),
+            Some("https://headers-.example"),
+            Some("https://headers..example"),
+            Some("https://.headers.example"),
+            Some("https://headers_svc.example"),
+            Some("https://."),
         ];
         for url in refused {
             assert!(
                 matches!(
-                    resolve_header_service(url),
+                    resolve_header_service(*url),
                     Err(PaymentVerifyError::NoHeaderService)
                 ),
                 "{url:?} must be refused as NoHeaderService"
@@ -942,12 +1080,66 @@ mod tests {
                 "  https://headers.example/v1//  ",
                 "https://headers.example/v1",
             ),
+            ("HTTPS://Headers.Example", "HTTPS://Headers.Example"),
+            ("https://headers.example.", "https://headers.example."),
+            (
+                "https://headers.example.:8443/v1",
+                "https://headers.example.:8443/v1",
+            ),
             ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://localhost:3000/", "http://localhost:3000"),
             ("https://[::1]:8080/", "https://[::1]:8080"),
+            ("https://[::ffff:10.0.0.1]", "https://[::ffff:10.0.0.1]"),
             ("https://invalid.example", "https://invalid.example"),
+            (
+                "https://chaintracks.invalid.example.com",
+                "https://chaintracks.invalid.example.com",
+            ),
+            (
+                "https://xn--hders-kva.example",
+                "https://xn--hders-kva.example",
+            ),
+            (
+                "https://headers.example/v1?x=1",
+                "https://headers.example/v1?x=1",
+            ),
         ];
         for (url, base) in accepted {
             assert_eq!(resolve_header_service(Some(url)).unwrap(), base, "{url:?}");
+        }
+    }
+
+    /// The host classifier normalises BEFORE the gate compares: case,
+    /// port, trailing dot, brackets and path all fold away, so every spelling
+    /// of one host is one string, and the forms it will not classify are
+    /// `None` rather than a guess.
+    #[test]
+    fn test_header_service_host_normalises_before_comparison() {
+        let normalised = [
+            ("https://chaintracks.invalid", "chaintracks.invalid"),
+            ("HTTPS://CHAINTRACKS.INVALID.:8443/x", "chaintracks.invalid"),
+            ("http://chaintracks.invalid./", "chaintracks.invalid"),
+            ("https://Headers.Example.", "headers.example"),
+            ("https://headers.example:443/v1", "headers.example"),
+            ("https://[::1]:8080", "::1"),
+            ("https://[FE80::1]", "fe80::1"),
+            ("http://127.0.0.1", "127.0.0.1"),
+            ("https://invalid.", "invalid"),
+        ];
+        for (url, host) in normalised {
+            assert_eq!(header_service_host(url).as_deref(), Some(host), "{url:?}");
+        }
+        for url in [
+            "https://chaintracks%2Einvalid",
+            "https://chaintracks.invalid\\@real.example",
+            "https://user@headers.example",
+            "https://headers.example:",
+            "https://headers..example",
+            "https://headers.example..",
+            "ftp://headers.example",
+            "https://",
+        ] {
+            assert_eq!(header_service_host(url), None, "{url:?}");
         }
     }
 

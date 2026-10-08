@@ -22,8 +22,11 @@ patch versions are additive unless a line below says otherwise.
 ### Behaviour
 
 - **A header service URL is required for `verify_brc29_payment`.** `header_url = None`, `Some("")`, the
-  `DEFAULT_CHAINTRACKS_URL` `.invalid` placeholder (with or without a trailing slash), any other `.invalid` host, or a
-  value without an `http(s)://` scheme returns `Err(NoHeaderService)` before any other check. SPV is never skipped
+  `DEFAULT_CHAINTRACKS_URL` `.invalid` placeholder (in any case, with or without a trailing slash or dot), any other
+  `.invalid` host, a value without an `http(s)://` scheme, or a value whose host the gate cannot classify as a real
+  hostname (userinfo, percent-encoding, backslashes, whitespace, non-ASCII, a non-numeric port) returns
+  `Err(NoHeaderService)` before any other check. The host is normalised before the placeholder comparison, so no
+  spelling of the placeholder slips through to DNS and fails open. SPV is never skipped
   silently. Once a service is named, a service error (unreachable, HTTP error, unparseable answer) still fails open
   with a logged warning, and a merkle root that differs from the block header still fails closed with `RootMismatch`.
 - The configuration gate and the per-root SPV decision are pure functions with table tests (match, mismatch, lookup
@@ -37,7 +40,7 @@ Session-lane hardening; no new API.
   `MAX_SAFE_COUNTER` (2^53 − 1) is refused by name instead of faulting the store.
 - Every 64-bit field of the session cell and its body types documents its bound.
 
-## 0.3.4 — 2026-09-10
+## 0.3.4 — 2026-09-14
 
 - **Session lane (opt-in).** One BRC-103/104 handshake per origin, then MAC'd calls with no wallet calls and one
   Durable Object round trip: `process_auth_lane`, `LaneAuthResult`, `seal_lane_response` / `seal_lane_response_text`,

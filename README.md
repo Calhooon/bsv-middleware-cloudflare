@@ -157,16 +157,19 @@ proves, offline and before any wallet call, that the payment *pays this server c
 
 > **Warning: a header service URL is required.** The crate ships no header service and never skips SPV silently.
 > Pass the base URL of your own ChainTracks-compatible service as `header_url` (for example a ChainTracks deployment
-> you run). `None`, `Some("")`, the `DEFAULT_CHAINTRACKS_URL` `.invalid` placeholder (with or without a trailing
-> slash), any other `.invalid` host, or a value without an `http(s)://` scheme is refused with
-> `PaymentVerifyError::NoHeaderService` before any other check: fail-closed, never a silent skip. Adopters with no
-> header service opt out of SPV *by name* with `verify_brc29_payment_structural_only(..)` (script + amount + BEEF
-> structure, no root check).
+> you run). `None`, `Some("")`, the `DEFAULT_CHAINTRACKS_URL` `.invalid` placeholder (in any case, with or without a
+> trailing slash or dot), any other `.invalid` host, a value without an `http(s)://` scheme, or a value whose host the
+> gate cannot classify as a real hostname (userinfo, percent-encoding, backslashes, whitespace, non-ASCII, a
+> non-numeric port) is refused with `PaymentVerifyError::NoHeaderService` before any other check: fail-closed, never
+> a silent skip. The host is normalised before the placeholder comparison, so no spelling of the placeholder reaches
+> DNS and fails open. Adopters with no header service opt out of SPV *by name* with
+> `verify_brc29_payment_structural_only(..)` (script + amount + BEEF structure, no root check).
 
 | `header_url` | result |
 |---|---|
 | `None`, `Some("")`, whitespace only | `Err(NoHeaderService)` |
-| the `.invalid` placeholder (trailing slash or not), any `.invalid` host, no `http(s)://` scheme | `Err(NoHeaderService)` |
+| the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host, no `http(s)://` scheme | `Err(NoHeaderService)` |
+| userinfo, `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
 | service unreachable, HTTP error, unparseable answer | `Ok(satoshis)`, warning logged (fail-open) |
 | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 | the header carries the proof's root | `Ok(satoshis)` |
