@@ -542,10 +542,10 @@ pub fn verify_brc29_payment_output(
 }
 
 /// The core's verdict on a payment through `service`
-/// (`bsv_middleware_core::verify_brc29_payment`), for callers that want to
-/// decide the words themselves (in particular `Unverifiable`) instead of
-/// taking this adapter's [`accept_verdict`] policy. `None` is
-/// `NoHeaderService`.
+/// (`bsv_middleware_core::verify_brc29_payment`), for hosts that render the
+/// words themselves instead of taking this adapter's [`accept_verdict`]
+/// rendering. No word is accepted on the host's behalf: `Unverifiable` is
+/// always a refusal (503-class, the quote kept). `None` is `NoHeaderService`.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment_verdict<H: HeaderService + ?Sized>(
     server_key: &str,

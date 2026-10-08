@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Calhooon/bsv-middleware-cloudflare"
 keywords = ["bsv", "authentication", "cloudflare", "workers", "middleware"]
 categories = ["web-programming", "authentication", "cryptography"]
+exclude = ["CLAUDE.md", "src/**/CLAUDE.md", ".claude/**", "LEAK-CHECK-*.txt"]
 
 [workspace]
 members = [".", "core"]

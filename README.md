@@ -114,7 +114,7 @@ All error codes, HTTP statuses, and header names match the Express versions:
 | Auth error codes | `UNAUTHORIZED`, `ERR_INVALID_AUTH`, `ERR_SESSION_NOT_FOUND` | identical |
 | Payment error codes | `ERR_PAYMENT_REQUIRED`, `ERR_MALFORMED_PAYMENT`, `ERR_INVALID_DERIVATION_PREFIX`, `ERR_PAYMENT_FAILED` | identical |
 | Headers | `x-bsv-auth-*`, `x-bsv-payment-*` | identical |
-| HTTP statuses | 400 / 401 / 402 / 500 | identical |
+| HTTP statuses | 400 / 401 / 402 / 500 | identical, plus 503 `ERR_HEADER_SERVICE_UNAVAILABLE` when the header service cannot answer (the quote kept) |
 
 Known divergences (architectural, not bugs):
 - **Response signing is explicit.** Callers invoke `sign_json_response` rather than relying on `res.json` interception.

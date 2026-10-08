@@ -6,9 +6,11 @@ patch versions are additive unless a line below says otherwise.
 ## 0.4.0 — 2026-10-08
 
 The core extract. The rules moved to a new runtime-free crate, `bsv-middleware-core` 0.1.0 (this repository,
-`core/`); this crate is now the Cloudflare Workers adapter over it. **Not a breaking change for adopters:** every
-0.3 public item keeps its name, path and signature (re-exported from the core where the type moved), and the
-fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
+`core/`); this crate is now the Cloudflare Workers adapter over it. Carries everything in 0.3.7, 0.3.8 and 0.3.9.
+**One breaking change, for 0.3.9 adopters only:** `PaymentVerifyError::Unverifiable` carries `{ satoshis, reason }`
+here where 0.3.9 carried `{ height, reason }`; a match written against 0.3.9's fields must change (a `_` arm compiles
+unchanged). Every other 0.3 public item keeps its name, path and signature (re-exported from the core where the type
+moved), and the fleet's call sites compile unchanged. Versions below 1.0 may change public API between minors.
 
 ### What moved to the core (re-exported here at the 0.3 paths)
 
@@ -32,8 +34,8 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 - `verify_brc29_payment_verdict`: the core's `PaymentVerdict` through any `HeaderService`, for callers that
   decide the words themselves.
 - `accept_verdict`: the one visible match from the core's words to `PaymentVerifyError` / `Ok(satoshis)`.
-- `PaymentVerifyError::Unverifiable { satoshis, reason }`: the refusal for a merkle root the header service could not
-  check (see Changed). A host's match with a `_` arm compiles unchanged; that arm answers the client's 400 today, so
+- `PaymentVerifyError::Unverifiable { satoshis, reason }`: new on this line (0.3.9 introduced it on the 0.3 line as
+  `{ height, reason }`; see Changed). A host's `_` arm compiles unchanged; that arm answers the client's 400 today, so
   hosts should add a 503 arm for it (the quote kept).
 - `PaymentVerifyError: From<PaymentFault>`; `AuthCloudflareError: From<bsv_middleware_core::AuthError>`.
 - `SessionNonceStore(&storage)`: any `SessionStorage` as the core's `PaymentNonceStore`; `D1ClaimStore(&db)`
@@ -46,6 +48,17 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
   `emit`, and pins the core's copy byte-identical to the root one.
 
 ### Changed
+
+Against 0.3.9 (the last release on the 0.3 line), three behaviours differ and are intended:
+
+- `Unverifiable` carries `{ satoshis, reason }` (0.3.9: `{ height, reason }`), matching the conformance vectors as the
+  vectors' owner (bsv-stack-lean) keeps them: `spv-lookup-error` expects `fields: {satoshis}`; 0.3.9's file wrote
+  `{height}` and retired the glossary entry `AcceptedUnverified`, this file keeps the entry as a retired alias.
+- Root precedence: the core asks the header service about every root and a mismatch at any height wins over an
+  unanswered root (`RootMismatch`, 400); 0.3.9 stopped at the lowest height that did not match, so a lookup error at
+  a low height answered `Unverifiable` (503) even when a higher root was wrong. A lookup error cannot mask fraud here.
+- Underpaid / WrongScript on the middleware's own payment path answer 400 `ERR_INVALID_PAYMENT` with the quote kept
+  (0.3.8 and 0.3.9 answered 402 with a fresh challenge); reference parity with the Express payment middleware.
 
 - **A header lookup the service cannot answer fails closed.** 0.3.x accepted a payment whose merkle root could not be
   checked (service unreachable, HTTP error, unparseable answer, height not yet indexed) with a logged warning; 0.4.0
@@ -124,6 +137,14 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 ### Removed from the dependency list
 
 - `hmac` and `ripemd` (they moved with the lane and the signer; `sha2` stays for the Durable Object cell).
+
+## 0.3.9 — 2026-10-08 (0.3 line, branch `release-0.3`, tag `v0.3.9`)
+
+- Fails closed on a header-service lookup error: `verify_brc29_payment` (and the `_with_header_lookup` form) return
+  `Err(PaymentVerifyError::Unverifiable { height, reason })` instead of accepting with a warning; the middleware's own
+  payment path answers 503 `ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept (prefix not consumed, wallet not
+  called). The owner's ruling of 2026-10-08. The conformance file's `spv-lookup-error` case expects `Unverifiable`.
+- No other change: 0.3.8's 402-with-a-fresh-challenge on Underpaid / WrongScript stays on this line.
 
 ## 0.3.8 — 2026-10-08
 
