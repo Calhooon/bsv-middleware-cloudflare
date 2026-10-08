@@ -22,9 +22,11 @@ pub enum PaymentVerdict {
 `verify_brc29_payment` runs, in order: the service gate (`None` is `NoHeaderService`, fail closed, before anything
 else), script and amount (`WrongScript`, `Underpaid`), BEEF structural completeness (a `PaymentFault::BadBeef`),
 then SPV through the header service: a root that differs from its header is `RootMismatch`; a root the service
-could not answer makes the verdict `Unverifiable`, which the host decides on (the core never serves on it);
-every root matched is `Verified`. `verify_brc29_payment_structural_only` is the named opt-out: no SPV, and a
-proof with roots is answered `Unverifiable` so the skip is visible.
+could not answer makes the verdict `Unverifiable`, a refusal (fail closed, by the rule adopted 2026-10-08: an
+unchecked root is not evidence; the host answers a 5xx and keeps the quote); every root matched is `Verified`.
+Only `Verified` serves (`is_verified`; every other word `is_refused`). `verify_brc29_payment_structural_only` is
+the named opt-out: no SPV, and a proof with roots is answered `Unverifiable` so the skip is visible; a host that
+serves on that answer does so because its caller named the opt-out, never through the full check.
 
 **The header service is a trait.** No URL lives in the core.
 
@@ -69,8 +71,10 @@ them, declares no executor, and its tests run on `tokio`'s current-thread runtim
 
 `tests/conformance_brc29.rs` runs the implementation-neutral BRC-29 payment vectors
 (`conformance/brc29-payment-vectors.json`, 20 cases) through `verify_brc29_payment` with a stub service, reading
-the file the way a second implementation does: from JSON only. The file's `AcceptedUnverified` is this crate's
-`Unverifiable`. The copy under this crate's `conformance/` is shipped in the package so the published crate runs
+the file the way a second implementation does: from JSON only, and checks the outcome as well as the word: only
+`Verified` serves, and `spv-lookup-error` is refused as `Unverifiable` (the ruling of 2026-10-08, in the file's
+`rulings`; the glossary still spells that word by its retired name `AcceptedUnverified`). The copy under this
+crate's `conformance/` is shipped in the package so the published crate runs
 the vectors on its own; the canonical copy is the repository root's (produced and pinned by the Workers adapter's
 runner, which also pins this copy byte-identical to it).
 

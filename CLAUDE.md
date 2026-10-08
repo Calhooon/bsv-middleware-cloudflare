@@ -67,7 +67,7 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
 │                         header names are the core's brc104, re-exported)
 ├── payment_verify.rs   — the 0.3 verify_brc29_payment* functions over the core; UrlHeaderService
 │                         (the 0.3.6 URL gate + Workers fetch), PaymentVerifyError, accept_verdict
-│                         (the one match from the six words; Unverifiable = fail-open, logged)
+│                         (the one match from the six words; only Verified is Ok, Unverifiable refused)
 ├── payment_claims.rs   — feature `d1-claims`: atomic single-use payment-nonce claim on D1; D1ClaimStore
 ├── refund/             — feature-gated BRC-41 refund builder (issue_refund); signer re-exported from the core
 ├── api_surface_tests.rs — the 0.3 surface pinned as call sites (cfg(test))
@@ -79,16 +79,20 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
 
 - **The core decides, the adapter renders** (0.4.0). The payment check answers in the core's six words
   (`PaymentVerdict`); `payment_verify::accept_verdict` is the ONE match from them to the 0.3
-  `Result<u64, PaymentVerifyError>`, and `Unverifiable` (a header service that could not answer, or the
-  named structural-only opt-out) is accepted there with the reason logged: fail-open stays the adapter's
-  documented 0.4 policy; a later release changes the hosts. `NoHeaderService` is a server fault (5xx at the host).
+  `Result<u64, PaymentVerifyError>`; `Verified` is its only `Ok`, and `Unverifiable` (a header service that could
+  not answer) is `Err(PaymentVerifyError::Unverifiable)` there, the reason logged: fail-closed since 0.4.0 by the
+  ruling of 2026-10-08 (0.3.x accepted with a warning; an unchecked root is not evidence). The named structural-only
+  opt-out is the one function that serves with roots unchecked, by name, outside `accept_verdict`.
+  `NoHeaderService` is a server fault (5xx at the host).
   Code that wants the words uses `verify_brc29_payment_verdict` or `bsv_middleware_cloudflare::core` directly.
   The middleware's own payment path (`middleware/payment.rs`, `judge_paying_output`) matches the words once more,
   into its decisions: `Verified` serves (`satoshis_paid` is the amount read); `Underpaid` / `WrongScript` 400
   `ERR_INVALID_PAYMENT` with the quote kept: no fresh challenge, the prefix not consumed, the wallet not called
   (0.4.0; 0.3.8 answered 402 with a fresh challenge); a `PaymentFault` or `RootMismatch` 400
-  `ERR_INVALID_PAYMENT`; `NoHeaderService` 500 `ERR_SERVER_MISCONFIGURED`;
-  `Unverifiable` through `accept_verdict`. The output check answers three of the six today: this path runs no SPV
+  `ERR_INVALID_PAYMENT`; `NoHeaderService` 500 `ERR_SERVER_MISCONFIGURED`; `Unverifiable` 503
+  `ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept (the server's transient condition: nothing charged, prefix
+  not consumed, no fresh challenge; the client retries the same payment later). Only `Verified` serves.
+  The output check answers three of the six today: this path runs no SPV
   (no merkle proof is checked against a header here, and what the wallet storage server does on internalize is not
   verified by this crate); `verify_brc29_payment` is the caller's proof step, run before the middleware.
 
@@ -132,8 +136,9 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
 | 401 | `UNAUTHORIZED` / `ERR_INVALID_AUTH` / `ERR_SESSION_NOT_FOUND` / `ERR_REPLAYED_REQUEST`¹ | auth |
 | 402 | `ERR_PAYMENT_REQUIRED` / `ERR_PAYMENT_FAILED`¹ (wallet rejected, fresh challenge attached) | payment |
 | 500 | `ERR_SERVER_MISCONFIGURED` / `ERR_PAYMENT_INTERNAL` / `ERR_STORAGE` / `ERR_SDK` / `ERR_TRANSPORT` / `ERR_CONFIG` | payment / infra |
+| 503 | `ERR_HEADER_SERVICE_UNAVAILABLE`¹ (the proof's merkle root could not be checked; quote kept, retry the same payment) | payment (rendered directly, no `AuthCloudflareError` variant) |
 
-¹ Not in the Express reference — hardening additions (audit #30/#44).
+¹ Not in the Express reference — hardening additions (audit #30/#44; the 503 by the fail-closed ruling of 2026-10-08).
 
 Full table with `From` conversions in `src/CLAUDE.md`.
 

@@ -12,7 +12,10 @@ Workers adapter over this crate in its 0.4.0.
 
 - `PaymentVerdict`: `Verified { satoshis }`, `Underpaid { paid, required }`, `WrongScript { expected, actual }`,
   `NoHeaderService`, `RootMismatch { height, root }`, `Unverifiable { satoshis, reason }`. One enum, no booleans.
-  `Unverifiable` is the fail-open case handed to the host as a word: the core never serves on it.
+  Only `Verified` serves (`is_verified`); every other word `is_refused`. `Unverifiable` (a root the service could
+  not answer, or the named structural-only opt-out) is a refusal: the core never serves on it and a host fails closed
+  on it, by the rule adopted on 2026-10-08 (a 5xx of the server's own, the quote kept). The structural-only opt-out
+  is the one place a host may serve with roots unchecked, and only because its caller named it.
 - `PaymentFault`: `BadTransaction`, `MissingOutput`, `KeyDerivation`, `BadBeef`. The input could not be judged.
 
 ### The seams
@@ -43,10 +46,11 @@ Workers adapter over this crate in its 0.4.0.
 ### Conformance
 
 - `tests/conformance_brc29.rs` runs `conformance/brc29-payment-vectors.json` (20 cases) through
-  `verify_brc29_payment` with a stub service. The file ships inside this package (a copy of the repository root's
-  canonical file, which the Workers adapter produces and pins byte-identical to this one), so the published crate
-  runs the vectors on its own.
-- 89 unit tests with `refund` (82 without) + 2 conformance tests; the packaged crate runs all of them on its own.
+  `verify_brc29_payment` with a stub service, and checks the outcome as well as the word (only `Verified` serves).
+  `spv-lookup-error` expects `Unverifiable`, refused, as the file's `rulings` list records (2026-10-08). The file
+  ships inside this package (a copy of the repository root's canonical file, which the Workers adapter produces and
+  pins byte-identical to this one), so the published crate runs the vectors on its own.
+- 89 unit tests with `refund` (82 without) + 3 conformance tests; the packaged crate runs all of them on its own.
 
 ### Known
 

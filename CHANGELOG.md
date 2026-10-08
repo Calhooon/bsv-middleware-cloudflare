@@ -32,6 +32,9 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 - `verify_brc29_payment_verdict`: the core's `PaymentVerdict` through any `HeaderService`, for callers that
   decide the words themselves.
 - `accept_verdict`: the one visible match from the core's words to `PaymentVerifyError` / `Ok(satoshis)`.
+- `PaymentVerifyError::Unverifiable { satoshis, reason }`: the refusal for a merkle root the header service could not
+  check (see Changed). A host's match with a `_` arm compiles unchanged; that arm answers the client's 400 today, so
+  hosts should add a 503 arm for it (the quote kept).
 - `PaymentVerifyError: From<PaymentFault>`; `AuthCloudflareError: From<bsv_middleware_core::AuthError>`.
 - `SessionNonceStore(&storage)`: any `SessionStorage` as the core's `PaymentNonceStore`; `D1ClaimStore(&db)`
   (feature `d1-claims`): the D1 table as the core's `ClaimStore`.
@@ -44,6 +47,21 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 
 ### Changed
 
+- **A header lookup the service cannot answer fails closed.** 0.3.x accepted a payment whose merkle root could not be
+  checked (service unreachable, HTTP error, unparseable answer, height not yet indexed) with a logged warning; 0.4.0
+  refuses it, by the project's ruling of 2026-10-08: a root that was not checked against a block header is not
+  evidence. `accept_verdict`, and with it `verify_brc29_payment`, `verify_brc29_payment_with_header_lookup` and
+  `verify_brc29_payment_verdict`'s callers that use it, answer `Err(PaymentVerifyError::Unverifiable { satoshis,
+  reason })` where 0.3.x answered `Ok(satoshis)`, so no host serves on it by accident. On the middleware's own path
+  (`process_payment_with_storage`, `process_payment_with_storage_signed`, the deprecated `process_payment`) the word
+  is `503 ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept: a transient server-side condition (nothing charged, the
+  prefix not consumed, no fresh challenge, the wallet not called; the client retries the same payment later),
+  distinct from `500 ERR_SERVER_MISCONFIGURED` for `NoHeaderService` and from the 400s for a payment that is wrong
+  (`Underpaid`, `WrongScript`, `RootMismatch`, a `PaymentFault`). The one function that still answers `Ok` with roots
+  unchecked is the named opt-out `verify_brc29_payment_structural_only`, because its caller asked for that by name;
+  it no longer goes through `accept_verdict` for that word. The conformance file's `spv-lookup-error` case expects
+  `Unverifiable`, refused, and carries the ruling in its `rulings` list. Hosts that run their own payment flow
+  through `verify_brc29_payment` should render the new variant 503-class (today a two-arm match answers 400).
 - **A short or misdirected payment on the middleware's own path is refused with `400 ERR_INVALID_PAYMENT` and the
   quote is kept** (`process_payment_with_storage`, `process_payment_with_storage_signed`, the deprecated
   `process_payment`; the core's `Underpaid` / `WrongScript` on output 0). 0.3.8 answered `402 ERR_INVALID_PAYMENT`
@@ -53,24 +71,26 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
   reserves 402 for "pay now"; a 402 re-arms automated payers (AuthFetch-class clients) into a second payment for the
   same request while the first sits un-internalized; one live quote per request keeps the single-use rule simple;
   and existing hosts built on this crate's `verify_brc29_payment` already answer 400 and keep the quote. `NoHeaderService` stays `500 ERR_SERVER_MISCONFIGURED`,
-  `RootMismatch` and a `PaymentFault` `400 ERR_INVALID_PAYMENT`, `Unverifiable` the documented `accept_verdict`
-  policy. The conformance vectors do not change: the words did not change, only the HTTP rendering of two of them.
+  `RootMismatch` and a `PaymentFault` `400 ERR_INVALID_PAYMENT`, `Unverifiable` `503 ERR_HEADER_SERVICE_UNAVAILABLE`
+  (above). The words did not change; the HTTP rendering of three of them did, and one case's expected word
+  (`spv-lookup-error`) changed with the ruling.
 
 ### Behaviour
 
-- Unchanged on the wire, except the refusal under Changed. The verdict mapping is documented in `payment_verify`: `Verified` and `Unverifiable`
-  are `Ok(satoshis)` (**fail-open on a header-service error stays this adapter's documented policy in 0.4**, with
-  the reason logged; a later release changes the hosts), every other word is the same-named `Err`.
-- `verify_brc29_payment_structural_only` now answers through the core's `Unverifiable` word when a proof carries
-  roots; the adapter accepts it and logs the warning, as 0.3.6 did.
+- Unchanged on the wire, except the two refusals under Changed. The verdict mapping is documented in
+  `payment_verify`: `Verified` is the only `Ok(satoshis)`; every other word is the same-named `Err`, `Unverifiable`
+  included (**fail-closed**, with the reason logged).
+- `verify_brc29_payment_structural_only` answers through the core's `Unverifiable` word when a proof carries
+  roots and serves it with the warning logged, as 0.3.6 did: the named opt-out is the one place that may.
 - **The middleware's own payment path decides from the core's words.** `process_payment_with_storage`,
   `process_payment_with_storage_signed` and the deprecated `process_payment` run the core's output check
   (`bsv_middleware_core::verify_payment_output`) on output 0 and match its `PaymentVerdict` once
   (`judge_paying_output`): `Verified` serves and records the amount read; `Underpaid` / `WrongScript` are
   `400 ERR_INVALID_PAYMENT` with the quote kept (the prefix not consumed, no fresh challenge, the wallet not called;
   see Changed); a `PaymentFault` or `RootMismatch` is `400 ERR_INVALID_PAYMENT`, the prefix kept; `NoHeaderService` is
-  `500 ERR_SERVER_MISCONFIGURED` (the server's own fault, never a client error); `Unverifiable` takes the adapter's
-  `accept_verdict` policy (accepted, logged). The output check answers three of the six words today: this path
+  `500 ERR_SERVER_MISCONFIGURED` (the server's own fault, never a client error); `Unverifiable` is
+  `503 ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept (refused, fail-closed; see Changed). Only `Verified` serves.
+  The output check answers three of the six words today: this path
   runs no SPV (no merkle proof is checked against a header; what the wallet storage server does on
   `internalizeAction` is not verified by this crate, and `verify_brc29_payment` is the caller's proof step before
   the middleware); the other arms are the path's standing answer should the check grow a proof step. Every payment
@@ -79,15 +99,23 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 
 ### Tests
 
-- 0.3.8 baseline: 212 unit + 2 conformance-file tests. 0.4.0: adapter 219 unit + 3 conformance-file tests (the
-  runner, the pinned bytes, the core's copy; the emitter is ignored); core 89 unit (82 without `refund`) + 2
-  conformance. 23 test paths moved from the adapter to the core, none lost.
+- 0.3.8 baseline: 212 unit + 2 conformance-file tests. 0.4.0: adapter 220 unit + 4 conformance-file tests (the
+  runner, the pinned bytes, the core's copy, the ruling; the emitter is ignored); core 89 unit (82 without `refund`)
+  + 3 conformance. 23 test paths moved from the adapter to the core, none lost. Both runners check the outcome as
+  well as the word: only `Verified` serves.
 
 ### Known
 
 - Error-code spelling: hosts that run their own payment flow through `verify_brc29_payment` have answered
   `ERR_PAYMENT_INVALID` for a refused payment; this crate and the Express reference spell it `ERR_INVALID_PAYMENT`.
   The Express spelling is the one to keep; aligning the hosts (or documenting the alias) is a later release.
+- Hosts on a two-arm match (`NoHeaderService` → 500, `_` → 400) render the new `PaymentVerifyError::Unverifiable`
+  as the client's 400 today; the intended answer is 503-class with the quote kept, so the client retries the same
+  payment. The hosts' change, not this crate's.
+- The conformance file's `words` glossary still spells `Unverifiable` by its retired name `AcceptedUnverified`, and
+  the ruled case's `expected.fields` carry that word's `satoshis`; both are the file owner's to change in a reviewed
+  diff. This crate's copy differs from the owner's in the `producer` line, the ruling's `why` (public wording) and,
+  on the ruled case, `crate_result` and `note` (this crate's own answer, now a refusal).
 - `HeaderService::merkle_root` and the core's store traits return `impl Future` without a `Send` bound, by design
   for wasm32. A host on a multi-threaded runtime needs its own implementations' futures to be `Send`; the verifier
   is generic over the service, so that works, but it is the host's obligation and the core README will say so
@@ -127,7 +155,8 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 
 - `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
   (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
-  fail-open service error. For a service binding, a cached header store, or a conformance runner.
+  fail-open service error (0.4.0 fails closed on it; see 0.4.0 Changed). For a service binding, a cached header
+  store, or a conformance runner.
 - `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
   verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
   by `tests/conformance_brc29.rs`. A second implementation runs the same file. No behaviour or signature changes.
@@ -157,7 +186,8 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
   `Err(NoHeaderService)` before any other check. The host is normalised before the placeholder comparison, so no
   spelling of the placeholder slips through to DNS and fails open. SPV is never skipped
   silently. Once a service is named, a service error (unreachable, HTTP error, unparseable answer) still fails open
-  with a logged warning, and a merkle root that differs from the block header still fails closed with `RootMismatch`.
+  with a logged warning (until 0.3.8; 0.4.0 fails closed on it, see 0.4.0 Changed), and a merkle root that differs
+  from the block header still fails closed with `RootMismatch`.
 - The configuration gate and the per-root SPV decision are pure functions with table tests (match, mismatch, lookup
   error, and every refused `header_url` shape); the header lookup is injected into the loop that runs them.
 
