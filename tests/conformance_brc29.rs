@@ -626,7 +626,7 @@ async fn build_vectors() -> String {
 
     let doc = json!({
         "schema": "brc29-payment-vectors/1",
-        "producer": "bsv-middleware-cloudflare 0.3.6 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+        "producer": format!("bsv-middleware-cloudflare {} tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)", env!("CARGO_PKG_VERSION")),
         "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
         "words": {
             "Verified": "Accept. fields.satoshis = the output's satoshis.",
