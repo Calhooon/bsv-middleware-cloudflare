@@ -136,7 +136,7 @@ pub enum PaymentResult {
 ///
 /// This is the original port of payment-express-middleware's
 /// `createPaymentMiddleware`, kept for backward compatibility. It now gates
-/// on the wallet's `accepted` flag (the-composer audit #44) but — like the TS
+/// on the wallet's `accepted` flag (audit finding #44) but — like the TS
 /// reference — verifies the derivation prefix with a **stateless HMAC only**:
 /// nothing stops the same `X-BSV-Payment` header from being internalized
 /// again except the upstream wallet's own duplicate handling.
@@ -170,7 +170,7 @@ where
 ///
 /// This is a port of payment-express-middleware's `createPaymentMiddleware`
 /// with two deliberate hardening divergences from the TS reference
-/// (`@bsv/payment-express-middleware` 1.2.3), per the-composer audit #44:
+/// (`@bsv/payment-express-middleware` 1.2.3), per audit finding #44:
 ///
 /// 1. **`accepted` gate.** The reference destructures `accepted` from
 ///    `wallet.internalizeAction(...)` and calls `next()` regardless of its
@@ -436,7 +436,7 @@ fn judge_paying_output(
 /// Owns every ordering decision on the money path — auth gate → price →
 /// challenge → header parse → HMAC verify → base64 decode → **consume
 /// prefix** → internalize → **accepted gate / release** — over plain data,
-/// so the whole path executes under native `cargo test` (the-composer #29
+/// so the whole path executes under native `cargo test` (audit finding #29's
 /// lesson: handler logic must be executed by tests, not just its pure
 /// helpers).
 ///
@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     // ===========================================
-    // Executed money-path tests (the-composer #62)
+    // Executed money-path tests (audit finding #62)
     // ===========================================
     // `decide_payment` is the whole payment decision path over plain data
     // (no worker::Request/Response, which only exist on a live Workers
@@ -1873,7 +1873,7 @@ mod tests {
         async fn stateless_path_still_permits_replay() {
             // The deprecated process_payment (nonce_store: None) semantics —
             // the boundary the storage worker's #[allow(deprecated)] shim
-            // sat on until the-composer #62: a byte-identical replay reaches
+            // sat on until audit finding #62: a byte-identical replay reaches
             // the wallet again, bounded only by its duplicate handling.
             let prefix = issued_prefix().await;
             for _ in 0..2 {
@@ -1893,7 +1893,7 @@ mod tests {
 
         // ---- P0-3b: the paying output is compared with the price ----
         //
-        // Ported from P0-3 (bsv-stack-lean `docs/p0/p0-3.md`) onto the
+        // Ported from the P0-3 finding onto the
         // session-lane line, where the check is the crate's own
         // `verify_brc29_payment_output`. Crafted payments only: one input
         // from a crafted parent, never signed, never broadcast; the wallet

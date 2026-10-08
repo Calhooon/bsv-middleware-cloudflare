@@ -94,7 +94,7 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
   payload construction, so downstream handlers must use this `body` instead of
   re-reading the request.
 - **Replay protection is a deliberate hardening divergence from the TS reference**
-  (the-composer audit #30/#44). The TS stack (`@bsv/sdk` `Peer.processGeneralMessage`,
+  (security audit findings #30/#44). The TS stack (`@bsv/sdk` `Peer.processGeneralMessage`,
   checked through v2.0.13) never records consumed per-request nonces; this crate
   consumes `(session_nonce, x-bsv-auth-nonce)` via `SessionStorage::try_consume_nonce`
   after signature verification and 401s reuse with `ERR_REPLAYED_REQUEST`. Payment

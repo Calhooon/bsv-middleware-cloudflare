@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **The middleware's own payment flow reads the paying output** (P0-3b, bsv-stack-lean #50): `verify_brc29_payment_output` runs on output 0 before the derivation prefix is consumed and before `internalizeAction`; `Underpaid` and `WrongScript` answer 402 with a fresh challenge; the amount read is recorded as `satoshis_paid`. 0.3.7 shipped the conformance vectors without this wiring.
+- **The middleware's own payment flow reads the paying output** (P0-3b): `verify_brc29_payment_output` runs on output 0 before the derivation prefix is consumed and before `internalizeAction`; `Underpaid` and `WrongScript` answer 402 with a fresh challenge; the amount read is recorded as `satoshis_paid`. 0.3.7 shipped the conformance vectors without this wiring.
 
 ## 0.3.7 — 2026-10-08
 

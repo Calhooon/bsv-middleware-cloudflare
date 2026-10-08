@@ -78,7 +78,7 @@ pub trait SessionStorage {
     /// 1.2.3 / `@bsv/sdk` `Peer.processGeneralMessage`, and
     /// `@bsv/payment-express-middleware` 1.2.3 `verifyNonce`) performs **no**
     /// consumption tracking at all — this method is a deliberate hardening
-    /// divergence (the-composer audit issues #30/#44).
+    /// divergence (security audit findings #30/#44).
     ///
     /// Backends without an atomic primitive (Cloudflare KV) may implement
     /// this as read-then-write; see
@@ -208,7 +208,7 @@ pub struct LaneVerdict {
 
 /// In-memory [`SessionStorage`] test double, shared by the trait-contract
 /// tests below and the payment middleware's executed money-path tests
-/// (`middleware::payment` — the-composer #62).
+/// (`middleware::payment` — audit finding #62).
 ///
 /// `try_consume_nonce` here is genuinely atomic (single-threaded map
 /// insert), i.e. the semantics a Durable Object SQLite implementation

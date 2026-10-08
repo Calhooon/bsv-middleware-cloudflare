@@ -391,7 +391,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         ));
     }
 
-    // Replay protection (the-composer audit #30): consume the per-request
+    // Replay protection (audit finding #30): consume the per-request
     // nonce so a byte-identical replay of a signed request is rejected.
     //
     // Reference behavior: the TS stack (@bsv/auth-express-middleware 1.2.3 →

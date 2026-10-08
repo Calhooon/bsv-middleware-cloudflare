@@ -122,7 +122,7 @@ Known divergences (architectural, not bugs):
 - **No injectable logger.** Use `console_log!` / `console_error!` from the `worker` crate at call sites if needed.
 - **Payment internalizes via HTTP to a wallet storage server**, not a local `WalletInterface`. Required for Workers (no local wallet possible).
 
-Deliberate hardening divergences (the reference is weaker here; the-composer audit #30/#44):
+Deliberate hardening divergences (the reference is weaker here; security audit findings #30/#44):
 - **Auth replay protection.** The TS stack (`@bsv/sdk` `Peer.processGeneralMessage`) never records consumed per-request nonces, so a byte-identical signed request replays successfully there for the whole session TTL. This crate consumes each `(session nonce, x-bsv-auth-nonce)` pair and rejects duplicates with `401 ERR_REPLAYED_REQUEST`. See `middleware::auth` docs for the exact residual window under eventually-consistent KV.
 - **`accepted` gate.** `payment-express-middleware` calls `next()` even when `wallet.internalizeAction` returns `accepted: false`. Here a rejected payment returns `402` with a fresh challenge and never reaches the handler.
 - **The paying output's script.** `payment-express-middleware` 2.1.9 reads output 0's satoshis and refuses below the price with `400 ERR_INVALID_PAYMENT`, and leaves the script to its wallet's signer. Here the storage server is not a signer, so output 0 must also pay this server's BRC-29 derived key; a short or misdirected payment gets `402 ERR_INVALID_PAYMENT` with a fresh challenge, before the prefix is consumed or the storage is called (0.3.7).
