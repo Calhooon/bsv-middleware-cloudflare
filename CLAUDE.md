@@ -91,6 +91,7 @@ src/
 | 401 | `UNAUTHORIZED` / `ERR_INVALID_AUTH` / `ERR_SESSION_NOT_FOUND` / `ERR_REPLAYED_REQUEST`¹ | auth |
 | 402 | `ERR_PAYMENT_REQUIRED` / `ERR_PAYMENT_FAILED`¹ (wallet rejected, fresh challenge attached) | payment |
 | 500 | `ERR_SERVER_MISCONFIGURED` / `ERR_PAYMENT_INTERNAL` / `ERR_STORAGE` / `ERR_SDK` / `ERR_TRANSPORT` / `ERR_CONFIG` | payment / infra |
+| 503 | `ERR_HEADER_SERVICE_UNAVAILABLE`¹ (verifier `Unverifiable`: header lookup failed; quote kept, transient; 0.3.9) | payment |
 
 ¹ Not in the Express reference — hardening additions (audit #30/#44).
 

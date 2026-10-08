@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.9 — 2026-10-08
+
+### Changed
+
+- **Fails closed on a header lookup error, per the owner's ruling of 2026-10-08**. When the
+  header service cannot answer for a merkle root's height (unreachable, timeout, HTTP error, height not yet indexed,
+  unparseable answer), `verify_brc29_payment` and `verify_brc29_payment_with_header_lookup` return
+  `Err(PaymentVerifyError::Unverifiable { height, reason })` (new variant) instead of `Ok(satoshis)` with a logged
+  warning. The first root that does not match, lowest height first, decides (`RootMismatch` or `Unverifiable`).
+  `verify_brc29_payment_structural_only` is unchanged.
+- The middleware's own payment path renders `Unverifiable` as **`503 ERR_HEADER_SERVICE_UNAVAILABLE` with the quote
+  kept**: transient, the prefix not consumed, the wallet not called, no fresh challenge. Distinct from the 500
+  misconfiguration and the 400 invalid payment. (This path runs no SPV on the 0.3 line, so the arm is the mapping
+  for when it does; everything else, including 0.3.8's 402 fresh challenge on `Underpaid` / `WrongScript`, is
+  unchanged.)
+- `conformance/brc29-payment-vectors.json` (producer 0.3.9): `spv-lookup-error` expects `Unverifiable` with
+  `fields.height`, the word `AcceptedUnverified` is retired from the glossary, and the file carries the `rulings`
+  list.
+
 ## 0.3.8 — 2026-10-08
 
 ### Fixed

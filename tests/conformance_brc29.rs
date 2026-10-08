@@ -119,24 +119,12 @@ async fn run_case(case: &Value) -> Outcome {
     }
 }
 
-/// The conformance word for an outcome. `Ok` is `AcceptedUnverified` when
-/// the lookup was asked and every answer failed (the fail-open path), else
-/// `Verified`.
-fn word_of(outcome: &Outcome, lookup: &Value) -> (String, Value) {
+/// The conformance word for an outcome. Since 0.3.9 `Ok` is always
+/// `Verified`: a lookup error is `Err(Unverifiable)`, never an accept (the
+/// owner's ruling of 2026-10-08 retired `AcceptedUnverified`).
+fn word_of(outcome: &Outcome) -> (String, Value) {
     match &outcome.result {
-        Ok(sats) => {
-            let all_failed = !outcome.asked.is_empty()
-                && outcome
-                    .asked
-                    .iter()
-                    .all(|h| lookup_answer(lookup, *h).is_err());
-            let word = if all_failed {
-                "AcceptedUnverified"
-            } else {
-                "Verified"
-            };
-            (word.into(), json!({ "satoshis": sats }))
-        }
+        Ok(sats) => ("Verified".into(), json!({ "satoshis": sats })),
         Err(PaymentVerifyError::Underpaid { satoshis, required }) => (
             "Underpaid".into(),
             json!({ "paid": satoshis, "required": required }),
@@ -150,6 +138,9 @@ fn word_of(outcome: &Outcome, lookup: &Value) -> (String, Value) {
             "RootMismatch".into(),
             json!({ "height": height, "merkle_root": root }),
         ),
+        Err(PaymentVerifyError::Unverifiable { height, .. }) => {
+            ("Unverifiable".into(), json!({ "height": height }))
+        }
         Err(other) => (format!("Unmapped({other:?})"), json!({})),
     }
 }
@@ -210,7 +201,7 @@ async fn every_brc29_vector_gives_its_word() {
         check_case_is_self_consistent(case, name);
 
         let outcome = run_case(case).await;
-        let (word, fields) = word_of(&outcome, &case["header_service"]["lookup"]);
+        let (word, fields) = word_of(&outcome);
         let expected = &case["expected"];
         if word != s(expected, "word") || fields != expected["fields"] {
             mismatches.push(format!(
@@ -246,13 +237,10 @@ async fn every_brc29_vector_gives_its_word() {
                 u(case, "output_index") as usize,
                 u(case, "required_satoshis"),
             );
-            let (pure_word, pure_fields) = word_of(
-                &Outcome {
-                    result: pure,
-                    asked: Vec::new(),
-                },
-                &Value::Null,
-            );
+            let (pure_word, pure_fields) = word_of(&Outcome {
+                result: pure,
+                asked: Vec::new(),
+            });
             if pure_word != word || pure_fields != fields {
                 mismatches.push(format!(
                     "{name}: output-only check gave {pure_word} {pure_fields}, full gave {word} {fields}"
@@ -537,9 +525,9 @@ fn case_defs() -> Vec<CaseDef> {
         (
             "spv-lookup-error",
             Lookup::Error,
-            "AcceptedUnverified",
+            "Unverifiable",
             "The header service cannot answer (HTTP 503).",
-            "Fail-open: the crate returns Ok(satoshis) and logs a warning; the root was NOT checked. The word says so; the API result alone cannot tell this from Verified.",
+            "Fail-closed by the owner's ruling of 2026-10-08 (see rulings): the root could not be checked, so the payment is refused, never accepted unchecked. The crate returns Err(Unverifiable { height, reason }); a host answers it 5xx (transient, the quote kept).",
         ),
     ] {
         defs.push(CaseDef {
@@ -554,11 +542,12 @@ fn case_defs() -> Vec<CaseDef> {
 fn expected_fields(word: &str, def: &CaseDef, expected_script: &str, root: &str) -> Value {
     let out = &def.outputs[def.output_index as usize];
     match word {
-        "Verified" | "AcceptedUnverified" => json!({ "satoshis": out.1 }),
+        "Verified" => json!({ "satoshis": out.1 }),
         "Underpaid" => json!({ "paid": out.1, "required": PRICE }),
         "WrongScript" => json!({ "expected_script": expected_script, "actual_script": out.0 }),
         "NoHeaderService" => json!({}),
         "RootMismatch" => json!({ "height": PROOF_HEIGHT, "merkle_root": root }),
+        "Unverifiable" => json!({ "height": PROOF_HEIGHT }),
         other => panic!("unknown word {other}"),
     }
 }
@@ -630,11 +619,11 @@ async fn build_vectors() -> String {
         "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
         "words": {
             "Verified": "Accept. fields.satoshis = the output's satoshis.",
-            "AcceptedUnverified": "Accept, but the header service could not answer so the merkle root was NOT checked (fail-open). fields.satoshis.",
             "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
             "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script.",
             "NoHeaderService": "Refuse before any other check: no usable header service is configured (fail-closed misconfiguration).",
-            "RootMismatch": "Refuse: the header at the proof's height carries a different merkle root (fail-closed fraud signal). fields.height, fields.merkle_root (the proof's root)."
+            "RootMismatch": "Refuse: the header at the proof's height carries a different merkle root (fail-closed fraud signal). fields.height, fields.merkle_root (the proof's root).",
+            "Unverifiable": "Refuse: the header service could not answer for a root's height, so the proof was not checked (fail-closed, the ruling of 2026-10-08; transient, 5xx). fields.height (the first root, lowest height first, whose lookup failed)."
         },
         "derivation": {
             "brc": "BRC-29 over BRC-42/BRC-43",
@@ -645,6 +634,15 @@ async fn build_vectors() -> String {
             "locking_script": "P2PKH: 76a914 <hash160(compressed child pubkey)> 88ac"
         },
         "cases": cases,
+        "rulings": [
+            {
+                "date": "2026-10-08",
+                "case": "spv-lookup-error",
+                "word": "Unverifiable",
+                "by": "the owner",
+                "why": "fail closed on a header lookup error: a root that could not be checked leaves the payment as unanchored as no header service at all; the Cloudflare crate fails closed in 0.3.9"
+            }
+        ],
     });
     let mut text = serde_json::to_string_pretty(&doc).unwrap();
     text.push('\n');

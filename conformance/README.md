@@ -13,7 +13,7 @@ reserved names.
 ## Schema (`brc29-payment-vectors/1`)
 
 Top level: `schema`, `producer`, `description`, `words` (the six outcome words, defined below), `derivation` (how the
-expected script is derived), `cases`.
+expected script is derived), `cases`, `rulings` (owner rulings that set a case's word: date, case, word, by, why).
 
 Each case:
 
@@ -41,16 +41,15 @@ Each case:
 | Word | Accept? | `fields` | crate (`PaymentVerifyError`) |
 |---|---|---|---|
 | `Verified` | yes | `satoshis` (the output's amount, which may exceed the price) | `Ok(satoshis)` |
-| `AcceptedUnverified` | yes, root **not** checked | `satoshis` | `Ok(satoshis)` + a logged warning |
 | `Underpaid` | no | `paid`, `required` | `Underpaid { satoshis, required }` |
 | `WrongScript` | no | `expected_script`, `actual_script` | `WrongScript { expected, actual }` |
 | `NoHeaderService` | no (server misconfigured, 500-class) | none | `NoHeaderService` |
 | `RootMismatch` | no (fraud signal) | `height`, `merkle_root` (the proof's root) | `RootMismatch { height, root }` |
+| `Unverifiable` | no (header service could not answer; transient, 5xx) | `height` (the first root, lowest height first, whose lookup failed) | `Unverifiable { height, reason }` |
 
-`AcceptedUnverified` is the fail-open path: the header service could not answer, so the payment is accepted on the
-script, amount and BEEF structure alone. The crate's API returns the same `Ok(satoshis)` as `Verified`; the runner
-tells them apart by whether every lookup it was asked failed. An implementation that fails closed on lookup errors
-instead would answer a refusal here, which is a deliberate, visible divergence.
+`Unverifiable` is the fail-closed lookup error, by the owner's ruling of 2026-10-08 (the `rulings` list): a root that
+could not be checked leaves the payment unanchored, so it is refused, never accepted on the script, amount and BEEF
+structure alone. It replaces `AcceptedUnverified` (fail-open, 0.3.8 and earlier), which is retired.
 
 ## Order of checks
 
@@ -60,8 +59,8 @@ instead would answer a refusal here, which is a deliberate, visible divergence.
 2. **output**: parse the BEEF, take output `output_index`; its script must equal `expected_locking_script`
    (`WrongScript`), then its satoshis must be `>= required_satoshis` (`Underpaid`). Script is checked before amount.
 3. **spv**: the BEEF must be structurally complete; for each merkle root (lowest height first) ask the header
-   service; a different root is `RootMismatch`, an error is fail-open (`AcceptedUnverified`), a case-insensitive
-   match continues. All roots matched is `Verified`.
+   service; a different root is `RootMismatch`, an error is `Unverifiable` (fail-closed), a case-insensitive match
+   continues. The first root that does not match decides. All roots matched is `Verified`.
 
 ## Running it from a second implementation
 
@@ -85,7 +84,7 @@ Only these four (`stage: "spv"`, `requires_merkle_lookup: true`):
 
 - `spv-root-match`, `spv-root-match-uppercase` → `Verified`
 - `spv-root-mismatch` → `RootMismatch`
-- `spv-lookup-error` → `AcceptedUnverified`
+- `spv-lookup-error` → `Unverifiable`
 
 The six `no-header-service-*` cases need a configuration gate but no lookup. The other ten need neither.
 

@@ -21,11 +21,13 @@
 //! adds that: BEEF structural completeness (rejects missing inputs / txid-only
 //! gaps / broken proof chains) plus SPV: each merkle root in the proof is
 //! checked against block headers via a header service speaking the ChainTracks
-//! `findHeaderHexForHeight` API. SPV is **fail-open** on service errors (header
-//! service down / timeout / height not yet indexed): the payment is still
-//! accepted, with the upstream broadcast as the backstop, so a header-service
-//! outage never halts revenue. It is **fail-closed** on an explicit root
-//! MISMATCH, which is a fraud signal, not an outage.
+//! `findHeaderHexForHeight` API. SPV is **fail-closed** both ways: an explicit
+//! root MISMATCH is [`PaymentVerifyError::RootMismatch`] (a fraud signal), and
+//! a service error (header service down / timeout / HTTP error / height not
+//! yet indexed / unparseable answer) is [`PaymentVerifyError::Unverifiable`]:
+//! the root could not be checked, so the payment is refused as transient and
+//! the client retries. (0.3.8 and earlier failed open there, accepting with a
+//! logged warning; the owner's ruling of 2026-10-08 closed it in 0.3.9.)
 //!
 //! ## Header service: required
 //!
@@ -41,7 +43,8 @@
 //! dot stripped) before the placeholder comparison, and spellings that would
 //! need a URL parser to decode or rewrite (percent-encoding, backslashes,
 //! userinfo, whitespace, non-ASCII) are refused rather than guessed at, so
-//! no spelling of the placeholder reaches DNS and fails open. Adopters that
+//! no spelling of the placeholder reaches DNS and reads as an outage
+//! instead of a misconfiguration. Adopters that
 //! truly have no header service opt out *by name* with
 //! [`verify_brc29_payment_structural_only`].
 //!
@@ -51,7 +54,7 @@
 //! | the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host | `Err(NoHeaderService)` |
 //! | no `http://` / `https://` scheme, no host | `Err(NoHeaderService)` |
 //! | userinfo (`@`), `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
-//! | service unreachable, HTTP error, unparseable answer | `Ok`, warning logged (fail-open) |
+//! | service unreachable, HTTP error, unparseable answer | `Err(Unverifiable)` (fail-closed, transient) |
 //! | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 //! | the header carries the proof's root | `Ok(satoshis)` |
 //!
@@ -104,6 +107,8 @@ pub const DEFAULT_CHAINTRACKS_URL: &str = "https://chaintracks.invalid";
 /// Two are the SERVER's own: [`NoHeaderService`](Self::NoHeaderService) (no
 /// usable `header_url`) and a [`KeyDerivation`](Self::KeyDerivation) error
 /// naming the server key; answer those 500-class and fix the deployment.
+/// One is transient: [`Unverifiable`](Self::Unverifiable) (the header service
+/// could not answer); answer it 503 and keep the quote so the client retries.
 #[derive(Debug)]
 pub enum PaymentVerifyError {
     /// Transaction could not be parsed from BEEF bytes.
@@ -121,7 +126,7 @@ pub enum PaymentVerifyError {
     /// to be real and confirmable.
     BadBeef(String),
     /// A merkle root in the proof does NOT match the block header at that
-    /// height: a fraud signal. Rejected even in fail-open mode.
+    /// height: a fraud signal.
     RootMismatch { height: u32, root: String },
     /// No usable header service was configured (`header_url` was `None`,
     /// empty, the `.invalid` placeholder, or not an `http(s)://` URL), so SPV
@@ -129,6 +134,15 @@ pub enum PaymentVerifyError {
     /// skip. Pass your own header service, or opt out of SPV by name with
     /// [`verify_brc29_payment_structural_only`].
     NoHeaderService,
+    /// The header service could not answer for the root at `height`
+    /// (unreachable, timeout, HTTP error, height not yet indexed, unparseable
+    /// answer), so the proof could not be tied to the chain. Fail-closed by
+    /// the owner's ruling of 2026-10-08: refused, never accepted unchecked.
+    /// Transient and not the client's fault: answer 503 and keep the quote
+    /// (the middleware's own path answers `503 ERR_HEADER_SERVICE_UNAVAILABLE`).
+    /// `reason` is the lookup's error. Before 0.3.9 this case was `Ok` with a
+    /// logged warning.
+    Unverifiable { height: u32, reason: String },
 }
 
 impl std::fmt::Display for PaymentVerifyError {
@@ -173,6 +187,11 @@ impl std::fmt::Display for PaymentVerifyError {
                 f,
                 "No header service configured for SPV: pass your own ChainTracks-compatible base URL as header_url, or opt out by name with verify_brc29_payment_structural_only"
             ),
+            PaymentVerifyError::Unverifiable { height, reason } => write!(
+                f,
+                "Payment merkle root at height {} could not be checked (header service unavailable: {})",
+                height, reason
+            ),
         }
     }
 }
@@ -187,7 +206,7 @@ impl std::error::Error for PaymentVerifyError {}
 /// This is deliberately stricter than a WHATWG URL parse. The gate compares
 /// the host against the `.invalid` placeholder, so any spelling that a URL
 /// parser would decode or rewrite into a different host than this function
-/// sees could slip past that comparison and then fail open at lookup time
+/// sees could slip past that comparison and then read as an outage at lookup time
 /// (a trailing-dot FQDN, a percent-encoded dot, a backslash before an `@`).
 /// The rule is therefore: normalise what can be normalised, refuse what
 /// would need decoding, and never guess. After the scheme:
@@ -271,8 +290,8 @@ fn header_service_host(base: &str) -> Option<String> {
 /// covers [`DEFAULT_CHAINTRACKS_URL`] in any case, with or without a trailing
 /// slash or dot. The normalisation runs BEFORE the placeholder comparison, so
 /// no spelling of the placeholder reaches DNS. A real but wrong host is NOT
-/// caught here: that surfaces as a service error at lookup time and fails
-/// open, by design (see the module docs).
+/// caught here: that surfaces as a service error at lookup time, which is
+/// [`PaymentVerifyError::Unverifiable`] (see the module docs).
 fn resolve_header_service(
     header_url: Option<&str>,
 ) -> std::result::Result<&str, PaymentVerifyError> {
@@ -329,7 +348,7 @@ fn parse_header_response(body: &str, height: u32) -> std::result::Result<String,
 
 /// The network half of the header lookup: the merkle root the header service
 /// reports for the block at `height`, or why it could not answer (the caller
-/// decides fail-open vs fail-closed through [`decide_root`]).
+/// turns that into a verdict through [`decide_root`]).
 async fn fetch_header_root(base_url: &str, height: u32) -> std::result::Result<String, String> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{}/findHeaderHexForHeight?height={}", base, height);
@@ -374,24 +393,18 @@ enum RootDecision {
     /// The header at this height carries a DIFFERENT root: fraud, reject.
     Mismatch,
     /// The service could not answer (outage, timeout, HTTP error, height not
-    /// yet indexed, unparseable body): accept, and log the carried warning.
-    FailOpen(String),
+    /// yet indexed, unparseable body): refuse as unverifiable, carrying the
+    /// lookup's reason (fail-closed, the ruling of 2026-10-08).
+    Unanswered(String),
 }
 
-/// The per-root decision. `lookup` is the header service's answer for
-/// `height`: `Ok(root)` compares case-insensitively, `Err` fails open.
-fn decide_root(
-    height: u32,
-    root: &str,
-    lookup: std::result::Result<String, String>,
-) -> RootDecision {
+/// The per-root decision. `lookup` is the header service's answer for the
+/// root's height: `Ok(root)` compares case-insensitively, `Err` is unanswered.
+fn decide_root(root: &str, lookup: std::result::Result<String, String>) -> RootDecision {
     match lookup {
         Ok(header_root) if header_root.eq_ignore_ascii_case(root) => RootDecision::Match,
         Ok(_) => RootDecision::Mismatch,
-        Err(reason) => RootDecision::FailOpen(format!(
-            "[payment_verify] SPV fail-open (accepting) at height {}: {}",
-            height, reason
-        )),
+        Err(reason) => RootDecision::Unanswered(reason),
     }
 }
 
@@ -414,9 +427,11 @@ fn verify_beef_structure(
 }
 
 /// SPV over every root, lowest height first: `lookup(height)` is the header
-/// service (injected, so the loop is testable without a network). Fail-closed
-/// on the first mismatch; fail-open (warn, continue) on a lookup error, which
-/// never masks a mismatch at another height.
+/// service (injected, so the loop is testable without a network). Every root
+/// must match; the first that does not decides: a mismatch is
+/// [`PaymentVerifyError::RootMismatch`], a lookup error
+/// [`PaymentVerifyError::Unverifiable`] (fail-closed), and the loop stops
+/// there.
 async fn check_roots<F, Fut>(
     roots: &HashMap<u32, String>,
     lookup: F,
@@ -428,7 +443,7 @@ where
     let mut ordered: Vec<(&u32, &String)> = roots.iter().collect();
     ordered.sort_unstable();
     for (height, root) in ordered {
-        match decide_root(*height, root, lookup(*height).await) {
+        match decide_root(root, lookup(*height).await) {
             RootDecision::Match => {}
             RootDecision::Mismatch => {
                 return Err(PaymentVerifyError::RootMismatch {
@@ -436,7 +451,12 @@ where
                     root: root.clone(),
                 });
             }
-            RootDecision::FailOpen(warning) => warn_log(&warning),
+            RootDecision::Unanswered(reason) => {
+                return Err(PaymentVerifyError::Unverifiable {
+                    height: *height,
+                    reason,
+                });
+            }
         }
     }
     Ok(())
@@ -536,9 +556,10 @@ pub fn verify_brc29_payment_output(
 /// `lookup(height)` is your header service: `Ok(merkle_root_hex)` for the
 /// block at `height` (compared case-insensitively; a different root is
 /// [`PaymentVerifyError::RootMismatch`], fail-closed) or `Err(reason)` when it
-/// cannot answer (fail-open: the payment is accepted and a warning logged).
-/// There is no configuration gate here, since there is no URL to check: a
-/// lookup that always errors makes this the structural-only check. For a
+/// cannot answer ([`PaymentVerifyError::Unverifiable`], fail-closed since
+/// 0.3.9). There is no configuration gate here, since there is no URL to
+/// check; a caller with no header service uses
+/// [`verify_brc29_payment_structural_only`]. For a
 /// service binding, a cached header store, or a conformance runner
 /// (`conformance/brc29-payment-vectors.json`) that answers from a fixture.
 #[allow(clippy::too_many_arguments)]
@@ -593,9 +614,10 @@ where
 /// `http(s)://` scheme, or a value whose host cannot be classified as a real
 /// hostname (userinfo, percent-encoding, backslashes, whitespace) returns
 /// [`PaymentVerifyError::NoHeaderService`] before any other check: fail-closed,
-/// never a silent skip. Once a service is named, SPV is fail-open on a service
-/// error (unreachable, HTTP error, unparseable answer: accept and warn) and
-/// fail-closed on a root mismatch. Adopters with no header service opt out of
+/// never a silent skip. Once a service is named, SPV is fail-closed both ways:
+/// a service error (unreachable, HTTP error, unparseable answer) is
+/// [`PaymentVerifyError::Unverifiable`] (transient: answer 503, keep the
+/// quote), a root mismatch is [`PaymentVerifyError::RootMismatch`]. Adopters with no header service opt out of
 /// SPV by name with [`verify_brc29_payment_structural_only`].
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment(
@@ -1158,44 +1180,41 @@ mod tests {
     }
 
     /// The per-root decision, as a table: match (case-insensitive) accepts,
-    /// a different root rejects, a lookup error fails open with a warning
-    /// that names the height and the reason.
+    /// a different root rejects, a lookup error is unanswered (carrying the
+    /// reason), which the loop refuses as `Unverifiable`.
     #[test]
     fn test_decide_root_table() {
         assert_eq!(
-            decide_root(7, "abcd", Ok("abcd".to_string())),
+            decide_root("abcd", Ok("abcd".to_string())),
             RootDecision::Match
         );
         assert_eq!(
-            decide_root(7, "abcd", Ok("ABCD".to_string())),
+            decide_root("abcd", Ok("ABCD".to_string())),
             RootDecision::Match
         );
         assert_eq!(
-            decide_root(7, "abcd", Ok("abce".to_string())),
+            decide_root("abcd", Ok("abce".to_string())),
             RootDecision::Mismatch
         );
         assert_eq!(
-            decide_root(7, "abcd", Ok(String::new())),
+            decide_root("abcd", Ok(String::new())),
             RootDecision::Mismatch,
             "an empty root from the service is not a match"
         );
-        match decide_root(
-            7,
-            "abcd",
-            Err("header service HTTP 503 at height 7".to_string()),
-        ) {
-            RootDecision::FailOpen(warning) => {
-                assert!(warning.contains("fail-open"), "{warning}");
-                assert!(warning.contains("height 7"), "{warning}");
-                assert!(warning.contains("HTTP 503"), "{warning}");
-            }
-            other => panic!("expected FailOpen, got {other:?}"),
-        }
+        assert_eq!(
+            decide_root(
+                "abcd",
+                Err("header service HTTP 503 at height 7".to_string())
+            ),
+            RootDecision::Unanswered("header service HTTP 503 at height 7".to_string()),
+            "a lookup error is unanswered, never a match"
+        );
     }
 
     /// The SPV loop over several roots: all matching accepts; one mismatch
-    /// rejects naming its height and root; lookup errors fail open; and a
-    /// fail-open at one height never masks a mismatch at another.
+    /// rejects naming its height and root; a lookup error is `Unverifiable`
+    /// naming its height and reason (fail-closed, 0.3.9); and the first root
+    /// that does not match, lowest height first, decides.
     #[tokio::test]
     async fn test_check_roots_table() {
         let roots: HashMap<u32, String> =
@@ -1224,18 +1243,38 @@ mod tests {
             "{err}"
         );
 
-        check_roots(
+        let err = check_roots(
             &roots,
             answer(&[(100, Err("timeout")), (200, Err("HTTP 503"))]),
         )
         .await
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            matches!(&err, PaymentVerifyError::Unverifiable { height: 100, reason } if reason == "timeout"),
+            "{err}"
+        );
+
+        let err = check_roots(&roots, answer(&[(100, Ok("aa")), (200, Err("HTTP 503"))]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PaymentVerifyError::Unverifiable { height: 200, reason } if reason == "HTTP 503"),
+            "one matching root never carries another root that could not be checked: {err}"
+        );
 
         let err = check_roots(&roots, answer(&[(100, Err("timeout")), (200, Ok("zz"))]))
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, PaymentVerifyError::RootMismatch { height: 200, .. }),
+            matches!(&err, PaymentVerifyError::Unverifiable { height: 100, .. }),
+            "the lowest unmatched root decides: {err}"
+        );
+
+        let err = check_roots(&roots, answer(&[(100, Ok("zz")), (200, Err("HTTP 503"))]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PaymentVerifyError::RootMismatch { height: 100, .. }),
             "{err}"
         );
 
@@ -1247,7 +1286,8 @@ mod tests {
     /// End to end on a correct, proven payment with the header service
     /// injected: the lookup is asked exactly once, at the proof's height; a
     /// matching header accepts, a different one is `RootMismatch` naming the
-    /// height and root, and a service error fails open to the paid amount.
+    /// height and root, and a service error is `Unverifiable` naming the
+    /// height and the reason (fail-closed since 0.3.9).
     #[tokio::test]
     async fn test_full_verification_spv_outcomes_table() {
         let (_, txid) = beef_with_proven_payment(&our_script(), 1000);
@@ -1268,8 +1308,17 @@ mod tests {
         );
         assert_eq!(asked, vec![PROOF_HEIGHT]);
 
-        let (ok, asked) = verify_proven_with(Err("fetch height: timeout".to_string())).await;
-        assert_eq!(ok.unwrap(), 1000, "a service error fails open");
+        let (err, asked) = verify_proven_with(Err("fetch height: timeout".to_string())).await;
+        let err = err.unwrap_err();
+        assert!(
+            matches!(&err, PaymentVerifyError::Unverifiable { height, reason }
+                if *height == PROOF_HEIGHT && reason == "fetch height: timeout"),
+            "a service error fails closed: {err}"
+        );
+        assert!(
+            err.to_string().contains("header service unavailable"),
+            "{err}"
+        );
         assert_eq!(asked, vec![PROOF_HEIGHT]);
     }
 

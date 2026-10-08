@@ -828,15 +828,15 @@
       }
     },
     {
-      "crate_result": "Ok(1000)",
+      "crate_result": "Err(Unverifiable { height: 850000, reason: \"header service HTTP 503 at height 850000\" })",
       "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
       "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
       "description": "The header service cannot answer (HTTP 503).",
       "expected": {
         "fields": {
-          "satoshis": 1000
+          "height": 850000
         },
-        "word": "AcceptedUnverified"
+        "word": "Unverifiable"
       },
       "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
       "header_service": {
@@ -847,7 +847,7 @@
         "url": "https://headers.example"
       },
       "name": "spv-lookup-error",
-      "note": "Fail-open: the crate returns Ok(satoshis) and logs a warning; the root was NOT checked. The word says so; the API result alone cannot tell this from Verified.",
+      "note": "Fail-closed by the owner's ruling of 2026-10-08 (see rulings): the root could not be checked, so the payment is refused, never accepted unchecked. The crate returns Err(Unverifiable { height, reason }); a host answers it 5xx (transient, the quote kept).",
       "output_index": 0,
       "required_satoshis": 1000,
       "requires_merkle_lookup": true,
@@ -884,13 +884,22 @@
     "server_side": "child public key for (server_private_key, counterparty = sender_identity_key, for_self = true)"
   },
   "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
-  "producer": "bsv-middleware-cloudflare 0.3.8 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+  "producer": "bsv-middleware-cloudflare 0.3.9 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+  "rulings": [
+    {
+      "by": "the owner",
+      "case": "spv-lookup-error",
+      "date": "2026-10-08",
+      "why": "fail closed on a header lookup error: a root that could not be checked leaves the payment as unanchored as no header service at all; the Cloudflare crate fails closed in 0.3.9",
+      "word": "Unverifiable"
+    }
+  ],
   "schema": "brc29-payment-vectors/1",
   "words": {
-    "AcceptedUnverified": "Accept, but the header service could not answer so the merkle root was NOT checked (fail-open). fields.satoshis.",
     "NoHeaderService": "Refuse before any other check: no usable header service is configured (fail-closed misconfiguration).",
     "RootMismatch": "Refuse: the header at the proof's height carries a different merkle root (fail-closed fraud signal). fields.height, fields.merkle_root (the proof's root).",
     "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
+    "Unverifiable": "Refuse: the header service could not answer for a root's height, so the proof was not checked (fail-closed, the ruling of 2026-10-08; transient, 5xx). fields.height (the first root, lowest height first, whose lookup failed).",
     "Verified": "Accept. fields.satoshis = the output's satoshis.",
     "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script."
   }

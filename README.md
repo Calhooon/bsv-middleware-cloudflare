@@ -153,8 +153,10 @@ proves, offline and before any wallet call, that the payment *pays this server c
    other key, a transaction built for another quote nonce, and a transaction built for another server.
 2. **BEEF completeness + SPV**: the BEEF parses and verifies structurally (no missing inputs, no txid-only gaps, an
    intact proof chain), then each merkle root is checked against block headers from a ChainTracks-compatible service
-   (`GET {header_url}/findHeaderHexForHeight?height=N`). SPV is **fail-open** on a service error (outage, timeout, height
-   not yet indexed) and **fail-closed** on a root mismatch.
+   (`GET {header_url}/findHeaderHexForHeight?height=N`). SPV is **fail-closed** both ways: a root mismatch is
+   `RootMismatch`, and a service error (outage, timeout, height not yet indexed) is `Unverifiable { height, reason }`
+   (0.3.9, the owner's ruling of 2026-10-08; 0.3.8 and earlier accepted with a logged warning). `Unverifiable` is
+   transient: answer it 503 and keep the quote; the middleware's own path answers `503 ERR_HEADER_SERVICE_UNAVAILABLE`.
 
 > **Warning: a header service URL is required.** The crate ships no header service and never skips SPV silently.
 > Pass the base URL of your own ChainTracks-compatible service as `header_url` (for example a ChainTracks deployment
@@ -163,7 +165,7 @@ proves, offline and before any wallet call, that the payment *pays this server c
 > gate cannot classify as a real hostname (userinfo, percent-encoding, backslashes, whitespace, non-ASCII, a
 > non-numeric port) is refused with `PaymentVerifyError::NoHeaderService` before any other check: fail-closed, never
 > a silent skip. The host is normalised before the placeholder comparison, so no spelling of the placeholder reaches
-> DNS and fails open. Adopters with no header service opt out of SPV *by name* with
+> DNS and reads as an outage instead of a misconfiguration. Adopters with no header service opt out of SPV *by name* with
 > `verify_brc29_payment_structural_only(..)` (script + amount + BEEF structure, no root check).
 
 | `header_url` | result |
@@ -171,12 +173,13 @@ proves, offline and before any wallet call, that the payment *pays this server c
 | `None`, `Some("")`, whitespace only | `Err(NoHeaderService)` |
 | the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host, no `http(s)://` scheme | `Err(NoHeaderService)` |
 | userinfo, `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
-| service unreachable, HTTP error, unparseable answer | `Ok(satoshis)`, warning logged (fail-open) |
+| service unreachable, HTTP error, unparseable answer | `Err(Unverifiable)` (fail-closed, transient: 503, quote kept) |
 | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 | the header carries the proof's root | `Ok(satoshis)` |
 
 Every `PaymentVerifyError` means reject without internalizing, no refund owed. Most are client-fault; `NoHeaderService`
 (and a `KeyDerivation` error on the server key) is the deployment's own: answer 500-class and fix the configuration.
+`Unverifiable` is neither: the header service could not answer, so answer 503 and keep the quote for a retry.
 
 With the `d1-claims` feature, `claim_payment_nonce(&db, nonce, agent)` is an atomic `INSERT OR IGNORE` on a D1
 `payment_claims` table (schema in `PAYMENT_CLAIMS_SCHEMA`): `Ok(true)` won, `Ok(false)` already used, `Err` storage

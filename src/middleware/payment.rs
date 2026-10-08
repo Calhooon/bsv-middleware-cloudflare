@@ -192,7 +192,11 @@ where
 ///    this path). The check is [`verify_brc29_payment_output`]. A short or
 ///    misdirected payment gets a 402 `ERR_INVALID_PAYMENT` with a fresh
 ///    challenge (the reference answers 400); `satoshis_paid` is the amount
-///    read, not the price.
+///    read, not the price. A verifier answer of
+///    [`PaymentVerifyError::Unverifiable`] (the header service could not
+///    answer) is `503 ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept:
+///    transient, the prefix not consumed, the wallet not called, no fresh
+///    challenge (0.3.9, the owner's ruling of 2026-10-08: fail closed).
 ///
 /// Consumption ordering (money path):
 /// - The prefix is consumed **before** `internalizeAction`, so concurrent
@@ -351,6 +355,14 @@ enum PaymentDecision {
     /// `ERR_INVALID_PAYMENT`; the prefix is not consumed
     /// ([`PaymentResult::Failed`]).
     InvalidPayment { description: String },
+    /// The verifier answered [`PaymentVerifyError::Unverifiable`]: the header
+    /// service could not answer, so the payment's proof was not checked →
+    /// 503 `ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept (the prefix
+    /// not consumed, the wallet not called, no fresh challenge: the client
+    /// retries the same payment). Transient, distinct from the 500
+    /// misconfiguration and the 400 invalid payment
+    /// ([`PaymentResult::Failed`]).
+    HeaderServiceUnavailable { description: String },
     /// Wallet accepted → [`PaymentResult::Verified`]; `satoshis_paid` is
     /// read from the paying output.
     Verified { satoshis_paid: u64, tx: String },
@@ -469,11 +481,7 @@ where
                 description: e.to_string(),
             });
         }
-        Err(e) => {
-            return Ok(PaymentDecision::InvalidPayment {
-                description: e.to_string(),
-            })
-        }
+        Err(e) => return Ok(verify_refusal(e)),
     };
 
     // Step 6b (hardening divergence from the TS reference — audit #44):
@@ -552,6 +560,32 @@ where
             })
         }
     }
+}
+
+/// The decision for a verifier refusal that carries no fresh challenge:
+/// [`PaymentVerifyError::Unverifiable`] is the transient 503 with the quote
+/// kept, every other one an invalid payment.
+fn verify_refusal(e: PaymentVerifyError) -> PaymentDecision {
+    match e {
+        PaymentVerifyError::Unverifiable { .. } => PaymentDecision::HeaderServiceUnavailable {
+            description: e.to_string(),
+        },
+        _ => PaymentDecision::InvalidPayment {
+            description: e.to_string(),
+        },
+    }
+}
+
+/// Status, code and description of the 503 for
+/// [`PaymentDecision::HeaderServiceUnavailable`], shared by both renderers.
+fn header_service_unavailable_reply(detail: &str) -> (u16, &'static str, String) {
+    (
+        503,
+        "ERR_HEADER_SERVICE_UNAVAILABLE",
+        format!(
+            "The payment could not be verified because the header service is unavailable ({detail}). The quote stands: retry the same payment."
+        ),
+    )
 }
 
 /// Renders a [`PaymentDecision`] into the [`PaymentResult`] (and its HTTP
@@ -633,6 +667,10 @@ fn decision_into_result(decision: PaymentDecision) -> Result<PaymentResult> {
         }
         PaymentDecision::InvalidPayment { description } => {
             failed_json_response(400, "ERR_INVALID_PAYMENT", &description)
+        }
+        PaymentDecision::HeaderServiceUnavailable { description } => {
+            let (status, code, description) = header_service_unavailable_reply(&description);
+            failed_json_response(status, code, &description)
         }
         PaymentDecision::Verified { satoshis_paid, tx } => {
             Ok(PaymentResult::Verified(PaymentContext {
@@ -729,6 +767,10 @@ fn decision_into_result_signed(
         }
         PaymentDecision::InvalidPayment { description } => {
             signed_failed(400, "ERR_INVALID_PAYMENT", &description)
+        }
+        PaymentDecision::HeaderServiceUnavailable { description } => {
+            let (status, code, description) = header_service_unavailable_reply(&description);
+            signed_failed(status, code, &description)
         }
         PaymentDecision::Verified { satoshis_paid, tx } => {
             Ok(PaymentResult::Verified(PaymentContext {
@@ -1951,6 +1993,62 @@ mod tests {
                     satoshis_paid: PRICE,
                     tx: exact_payment_b64(&prefix)
                 }
+            );
+        }
+
+        /// A header lookup error from the verifier is the transient refusal
+        /// with the quote kept (no fresh prefix in the decision), never the
+        /// 400 invalid payment; every other refusal without a challenge
+        /// stays 400.
+        #[test]
+        fn unverifiable_is_header_service_unavailable_not_invalid() {
+            let decision = verify_refusal(PaymentVerifyError::Unverifiable {
+                height: 850_000,
+                reason: "header service HTTP 503 at height 850000".to_string(),
+            });
+            match &decision {
+                PaymentDecision::HeaderServiceUnavailable { description } => {
+                    assert!(description.contains("height 850000"), "{description}");
+                    assert!(description.contains("HTTP 503"), "{description}");
+                }
+                other => panic!("expected HeaderServiceUnavailable, got {other:?}"),
+            }
+            assert!(
+                matches!(
+                    verify_refusal(PaymentVerifyError::BadTransaction("x".into())),
+                    PaymentDecision::InvalidPayment { .. }
+                ),
+                "other refusals stay 400"
+            );
+            assert!(matches!(
+                verify_refusal(PaymentVerifyError::MissingOutput {
+                    index: 0,
+                    output_count: 0
+                }),
+                PaymentDecision::InvalidPayment { .. }
+            ));
+        }
+
+        /// The 503 both renderers send: status, code, and a description that
+        /// carries the verifier's reason and says the quote stands.
+        #[test]
+        fn header_service_unavailable_renders_503_with_the_quote_kept() {
+            let detail = PaymentVerifyError::Unverifiable {
+                height: 7,
+                reason: "fetch height 7: timeout".to_string(),
+            }
+            .to_string();
+            let (status, code, description) = header_service_unavailable_reply(&detail);
+            assert_eq!(status, 503);
+            assert_eq!(code, "ERR_HEADER_SERVICE_UNAVAILABLE");
+            assert!(
+                description.contains("fetch height 7: timeout"),
+                "{description}"
+            );
+            assert!(description.contains("The quote stands"), "{description}");
+            assert!(
+                !description.contains("fresh payment challenge"),
+                "{description}"
             );
         }
     }
