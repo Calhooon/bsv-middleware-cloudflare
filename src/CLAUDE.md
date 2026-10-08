@@ -70,7 +70,7 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `sign_json_response` | Sign a JSON response with body bytes included in signed payload (recommended over `sign_response`) |
 | `WorkerStorageClient` | Storage server RPC client with BRC-103/104 authentication (re-exported from `client`) |
 | `init_panic_hook` | Initialize WASM panic hook for better error messages |
-| `verify_brc29_payment` / `verify_brc29_payment_output` / `expected_brc29_locking_script` | Pre-internalize payment verification for callers with their own payment flow (`payment_verify`) |
+| `verify_brc29_payment` / `verify_brc29_payment_output` / `expected_brc29_locking_script` | Pre-internalize payment verification (`payment_verify`); the middleware's own flow runs `verify_brc29_payment_output` on output 0 before internalizing (0.3.7), the full `verify_brc29_payment` is for callers with their own payment flow |
 | `claim_payment_nonce` / `release_payment_nonce` | Feature `d1-claims`: atomic single-use payment-nonce claim on D1 (`payment_claims`) |
 
 ### Middleware Types

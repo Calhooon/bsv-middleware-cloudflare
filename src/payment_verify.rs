@@ -62,13 +62,17 @@
 //! ## Relation to the payment middleware
 //!
 //! [`process_payment_with_storage`](crate::process_payment_with_storage)
-//! verifies the derivation-prefix HMAC, consumes the prefix once, and hands
-//! the transaction to the wallet storage server, which does its own script
-//! and amount checks when it internalizes. The functions here are for callers
-//! that run their **own** payment flow (a custom 402 handler, a pre-charge +
-//! refund model, a non-wallet settlement path) and want the same guarantees
-//! locally, before any remote call: an output that pays this server's derived
-//! key, carrying at least the quoted satoshis, inside a complete proof.
+//! verifies the derivation-prefix HMAC, runs [`verify_brc29_payment_output`]
+//! on output 0 (script and amount; 0.3.7), consumes the prefix once, and
+//! hands the transaction to the wallet storage server. The storage server's
+//! `internalizeAction` checks neither the script nor the amount (the
+//! reference keeps the script check in its signer, which is not on this
+//! path), so the middleware's check is the only one on it. The middleware
+//! does not run BEEF structure or SPV. The full [`verify_brc29_payment`] is
+//! for callers that run their **own** payment flow (a custom 402 handler, a
+//! pre-charge + refund model, a non-wallet settlement path) and want, locally
+//! and before any remote call, an output that pays this server's derived key,
+//! carrying at least the quoted satoshis, inside a complete proof.
 
 use std::collections::HashMap;
 use std::future::Future;
