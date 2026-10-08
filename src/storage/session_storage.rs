@@ -109,8 +109,8 @@ pub trait SessionStorage {
 
     /// The hot path's two questions — "is this session live?" and "has this
     /// request nonce been seen?" — in ONE storage round trip, for a backend
-    /// that can answer both from one place (the Durable Object backend,
-    /// bsv-low W-D). The default says "not supported" (`None`) and the
+    /// that can answer both from one place (the Durable Object backend).
+    /// The default says "not supported" (`None`) and the
     /// middleware falls back to `get_session` then `try_consume_nonce`, in
     /// that order, so a backend that does not override this is byte-for-byte
     /// unchanged. An override consumes the request nonce BEFORE the signature
@@ -284,7 +284,7 @@ impl SessionStorage for MemorySessionStorage {
 mod tests {
     use super::*;
 
-    /// bsv-low W-D: a backend that does not override the combined hot-path
+    /// A backend that does not override the combined hot-path
     /// call answers "not supported", and the middleware keeps its two-step
     /// order (`get_session`, then `try_consume_nonce`) for it.
     #[test]

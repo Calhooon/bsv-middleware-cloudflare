@@ -11,7 +11,7 @@ Port of [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-m
 - **`sign_json_response`** — signs outbound JSON responses so BRC-103/104 clients (e.g. `AuthFetch`) can verify server identity and message integrity. Equivalent to Express's `res.json` hijacking, but explicit.
 - **`WorkerStorageClient`** — WASM-compatible RPC client for a wallet storage server (e.g. `storage.babbage.systems`), used by `process_payment` and optional refund flows.
 - **Optional `refund` feature** — BRC-41 refund transaction builder for partial-refund scenarios (e.g. AI agents that pre-charge and refund on failure). Not present in the Express reference.
-- **`verify_brc29_payment`** / **`verify_brc29_payment_output`** (0.3.6) — checks, before anything is internalized, that a BRC-29 payment output pays *this* server's derived key at least the quoted amount inside a structurally complete BEEF, with merkle roots checked against a header service you run. For callers with their own payment flow.
+- **`verify_brc29_payment`** / **`verify_brc29_payment_output`** (0.3.6) — checks, before anything is internalized, that a BRC-29 payment output pays *this* server's derived key at least the quoted amount inside a structurally complete BEEF, with merkle roots checked against a header service you run (required: no service, no verdict; `verify_brc29_payment_structural_only` is the named opt-out without SPV). For callers with their own payment flow.
 - **Optional `d1-claims` feature** (0.3.6) — `claim_payment_nonce` / `release_payment_nonce`: an atomic, globally consistent single-use claim on a payment nonce in a D1 table, for callers outside the stock middleware or on the eventually-consistent KV backend.
 
 ## Why Cloudflare Workers
@@ -139,7 +139,7 @@ and the server's session nonce. Seal a laned answer with
 `malformed`; 503 `lane-unavailable` when the store cannot be asked). The KV backend keeps no lanes (never offers
 one, answers a laned call 503 `lane-unsupported`). The pure rules live in `middleware::session_lane`; the MAC
 vectors are `tests/fixtures/session_lane.vectors.json` (emitted by the module's own test, sha256-pinned; a client
-pins the same bytes). Designed for bsv-low (#441, register row D12: the relay's D10 lane generalized).
+pins the same bytes). Designed for the relay adopter: its lane, generalized to HTTP-only servers.
 
 ## Payment verification before internalize (0.3.6)
 
@@ -155,9 +155,24 @@ proves, offline and before any wallet call, that the payment *pays this server c
    (`GET {header_url}/findHeaderHexForHeight?height=N`). SPV is **fail-open** on a service error (outage, timeout, height
    not yet indexed) and **fail-closed** on a root mismatch.
 
-The crate ships no header service: `header_url = None` resolves to `DEFAULT_CHAINTRACKS_URL`, a reserved `.invalid`
-placeholder under which the root check is skipped with a logged warning. **Set your own header service.** Every error
-(`PaymentVerifyError`) is client-fault: reject without internalizing, no refund owed.
+> **Warning: a header service URL is required.** The crate ships no header service and never skips SPV silently.
+> Pass the base URL of your own ChainTracks-compatible service as `header_url` (for example a ChainTracks deployment
+> you run). `None`, `Some("")`, the `DEFAULT_CHAINTRACKS_URL` `.invalid` placeholder (with or without a trailing
+> slash), any other `.invalid` host, or a value without an `http(s)://` scheme is refused with
+> `PaymentVerifyError::NoHeaderService` before any other check: fail-closed, never a silent skip. Adopters with no
+> header service opt out of SPV *by name* with `verify_brc29_payment_structural_only(..)` (script + amount + BEEF
+> structure, no root check).
+
+| `header_url` | result |
+|---|---|
+| `None`, `Some("")`, whitespace only | `Err(NoHeaderService)` |
+| the `.invalid` placeholder (trailing slash or not), any `.invalid` host, no `http(s)://` scheme | `Err(NoHeaderService)` |
+| service unreachable, HTTP error, unparseable answer | `Ok(satoshis)`, warning logged (fail-open) |
+| the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
+| the header carries the proof's root | `Ok(satoshis)` |
+
+Every `PaymentVerifyError` means reject without internalizing, no refund owed. Most are client-fault; `NoHeaderService`
+(and a `KeyDerivation` error on the server key) is the deployment's own: answer 500-class and fix the configuration.
 
 With the `d1-claims` feature, `claim_payment_nonce(&db, nonce, agent)` is an atomic `INSERT OR IGNORE` on a D1
 `payment_claims` table (schema in `PAYMENT_CLAIMS_SCHEMA`): `Ok(true)` won, `Ok(false)` already used, `Err` storage

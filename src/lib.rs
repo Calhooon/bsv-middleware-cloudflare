@@ -16,8 +16,10 @@
 //!   [`middleware::auth`] for the precise residual window under Cloudflare KV)
 //! - **Payment verification before internalize**: [`verify_brc29_payment`]
 //!   checks that a BRC-29 payment output pays this server's derived key the
-//!   quoted amount inside a complete BEEF proof (merkle roots against your own
-//!   header service), for callers running their own payment flow
+//!   quoted amount inside a complete BEEF proof, merkle roots against your own
+//!   header service (required: no service, no verdict;
+//!   [`verify_brc29_payment_structural_only`] is the named opt-out without
+//!   SPV), for callers running their own payment flow
 //! - **Atomic payment-nonce claims on D1** (feature `d1-claims`):
 //!   [`claim_payment_nonce`] / [`release_payment_nonce`], a globally
 //!   consistent put-if-absent for callers outside the stock middleware
@@ -156,7 +158,7 @@ pub use middleware::session_lane;
 pub use payment_claims::{claim_payment_nonce, release_payment_nonce, PAYMENT_CLAIMS_SCHEMA};
 pub use payment_verify::{
     expected_brc29_locking_script, verify_brc29_payment, verify_brc29_payment_output,
-    PaymentVerifyError, DEFAULT_CHAINTRACKS_URL,
+    verify_brc29_payment_structural_only, PaymentVerifyError, DEFAULT_CHAINTRACKS_URL,
 };
 pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
 pub use storage::{KvPaymentStorage, KvSessionStorage, LaneVerdict, LaneVerifyAsk, SessionStorage};

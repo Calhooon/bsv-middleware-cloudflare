@@ -1,5 +1,5 @@
 //! Storage implementations: Cloudflare KV (the default) and the Durable Object
-//! session backend (`do_session`, bsv-low W-D).
+//! session backend (`do_session`).
 
 pub mod do_session;
 pub mod kv_payment;

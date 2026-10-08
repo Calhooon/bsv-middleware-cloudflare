@@ -226,7 +226,7 @@ pub async fn process_auth(
     process_auth_with_storage(req, &session_storage, options).await
 }
 
-/// `process_auth` over the Durable Object session backend (bsv-low W-D): the
+/// `process_auth` over the Durable Object session backend: the
 /// session record and the replay guard live in one object per session nonce
 /// (`AuthSessionStore`, bound as `do_binding`), KV the cold path. See
 /// `storage::do_session`.
@@ -315,7 +315,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         .as_ref()
         .or(auth_message.nonce.as_ref());
 
-    // bsv-low W-D: a backend that answers "is this session live?" and "has
+    // The combined hot path: a backend that answers "is this session live?" and "has
     // this request nonce been seen?" from ONE place (the Durable Object
     // backend) answers both in one round trip here; every other backend says
     // "unsupported" and takes the two-step path below, unchanged. The nonce
@@ -868,7 +868,7 @@ async fn mint_lane_offer<S: SessionStorage + ?Sized>(
     }
 }
 
-/// bsv-low #443 step 4 (2026-09-14): mint a lane for an identity a first-party
+/// The attested mint (2026-09-14): mint a lane for an identity a first-party
 /// AUTHORITY has proven (the relay's hub mirror, asked by the door through its
 /// service binding) — the same `LaneRecord::mint` as the signed-read mint, the
 /// same label, idle window and lifetime; only the proof differs, and the door

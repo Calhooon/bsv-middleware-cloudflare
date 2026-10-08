@@ -1,4 +1,4 @@
-//! The Durable Object session backend (bsv-low W-D, 2026-09-10).
+//! The Durable Object session backend (2026-09-10).
 //!
 //! # Why
 //!

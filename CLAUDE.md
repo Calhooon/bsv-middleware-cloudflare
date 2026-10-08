@@ -41,7 +41,8 @@ src/
 ├── transport/
 │   └── cloudflare.rs   — CloudflareTransport: BRC-104 header extraction, payload build
 ├── payment_verify.rs   — verify_brc29_payment[_output](): pre-internalize script + amount,
-│                         BEEF completeness, SPV via a caller-supplied header service
+│                         BEEF completeness, SPV via a caller-supplied header service (required;
+│                         verify_brc29_payment_structural_only() is the named opt-out)
 ├── payment_claims.rs   — feature `d1-claims`: atomic single-use payment-nonce claim on D1
 ├── refund/             — feature-gated BRC-41 refund builder
 └── utils/

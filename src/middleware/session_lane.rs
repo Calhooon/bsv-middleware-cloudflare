@@ -1,5 +1,5 @@
-//! THE SESSION LANE (0.3.4; bsv-low #441 — the relay's register row D10
-//! generalized to HTTP-only servers).
+//! THE SESSION LANE (0.3.4; the relay adopter's lane, generalized to
+//! HTTP-only servers).
 //!
 //! One BRC-103/104 handshake per origin and tab, then a LANE: when the client's
 //! FIRST BRC-104-signed general message carries the explicit ask
@@ -24,7 +24,7 @@
 //! unit-pinned here; the store (`storage::do_session`) and the door
 //! (`middleware::auth::process_auth_lane`) only wire it. The MAC vectors are
 //! PRODUCED here (`emit_session_lane_vectors`) and pinned byte-for-byte by the
-//! client (bsv-low `app/src/lib/fixtures/session_lane.vectors.json`): the
+//! client (the relay adopter's copy of `session_lane.vectors.json`): the
 //! artifact is shared, never the convention.
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub const SESSION_IDENTITY_HEADER: &str = "x-low-session-identity";
 pub const SESSION_COUNTER_HEADER: &str = "x-low-session-n";
 /// The largest counter a laned call may carry: `Number.MAX_SAFE_INTEGER`. Above
 /// it a JSON number no longer survives the JavaScript side of the store's
-/// boundary (0.3.5, bsv-low #493); a lane makes nowhere near 2^53 calls.
+/// boundary (0.3.5); a lane makes nowhere near 2^53 calls.
 pub const MAX_SAFE_COUNTER: u64 = (1u64 << 53) - 1;
 pub const SESSION_MAC_HEADER: &str = "x-low-session-mac";
 /// The client's explicit ask, a header on its FIRST BRC-104-signed general
@@ -87,7 +87,7 @@ pub struct LaneRecord {
     #[serde(with = "u64_as_string")]
     pub last_h: u64,
     /// Bit `k` set ⇔ `last_h - k` was accepted (k < 64). Rides as a DECIMAL
-    /// STRING (0.3.5, bsv-low #493): the store persists the whole cell through
+    /// STRING (0.3.5): the store persists the whole cell through
     /// the Durable Object's `storage().put`, whose serializer carries a `u64`
     /// as a JavaScript number and THROWS past 2^53. Bit 53 is set as soon as an
     /// accepted counter sits 53 above the one before it — the 54th of a dense
@@ -433,7 +433,7 @@ pub fn parse_lane_headers(
     let Some(h) = h.and_then(|v| v.trim().parse::<u64>().ok()) else {
         return Err(Refusal::Malformed);
     };
-    // 0.3.5 (bsv-low #493, the review's MED): the counter rides to the store as
+    // 0.3.5 (the review's MED): the counter rides to the store as
     // a JSON number (`req.json()` = JSON.parse + serde-wasm-bindgen), which
     // faults above 2^53 — a crafted header would turn into an uncaught store
     // fault (a 503 the client retries) instead of a refusal by name.
@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(parsed.last_h, 3);
     }
 
-    /// bsv-low #493 (0.3.5): the store persists the whole cell through the
+    /// 0.3.5: the store persists the whole cell through the
     /// Durable Object's `storage().put`, whose serializer carries a `u64` as a
     /// JavaScript number and throws past 2^53; a full replay window reaches
     /// that on the 54th accepted call. The mask rides as a decimal string on
@@ -1017,7 +1017,7 @@ mod tests {
         assert_eq!(
             digest_hex, SESSION_LANE_VECTORS_SHA256,
             "session_lane.vectors.json changed. It is a CROSS-REPO agreement: copy it to \
-             bsv-low unchanged and update the constant in BOTH repos' tests."
+             the adopting client unchanged and update the constant in BOTH repos' tests."
         );
         let v: serde_json::Value = serde_json::from_str(SESSION_LANE_VECTORS).unwrap();
         let (lane, offer) = minted();
@@ -1145,7 +1145,7 @@ mod tests {
 
     /// `cargo test session_lane::tests::emit_session_lane_vectors -- --ignored`
     /// rewrites the artifact from the fixed inputs; then update the sha256 pin
-    /// above and copy the file to bsv-low unchanged.
+    /// above and copy the file to the adopting client unchanged.
     #[test]
     #[ignore = "writes tests/fixtures/session_lane.vectors.json on purpose"]
     fn emit_session_lane_vectors() {
@@ -1192,7 +1192,7 @@ mod tests {
     }
 }
 
-// ── bsv-low #443 step 4 (2026-09-14): the ATTESTED mint ─────────────────────
+// ── The ATTESTED mint (2026-09-14) ─────────────────────
 //
 // A first-party door (the app-layer, the tower) mints a lane for an identity
 // the RELAY's hub mirror proved, instead of a signed read: the client presents
