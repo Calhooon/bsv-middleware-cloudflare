@@ -44,8 +44,9 @@ const PAYMENT_VERSION: &str = "1.0";
 const ORIGINATOR: &str = "bsv-auth-cloudflare";
 
 /// Nonce scope under which consumed BRC-29 payment derivation prefixes are
-/// recorded in the [`SessionStorage`] nonce store.
-pub const PAYMENT_NONCE_SCOPE: &str = "payment-derivation-prefix";
+/// recorded in the [`SessionStorage`] nonce store
+/// (`bsv_middleware_core::store::PAYMENT_NONCE_SCOPE`).
+pub use bsv_middleware_core::store::PAYMENT_NONCE_SCOPE;
 
 /// Options for payment middleware.
 ///

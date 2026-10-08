@@ -95,6 +95,20 @@ impl From<bsv_sdk::Error> for AuthCloudflareError {
     }
 }
 
+/// The core's auth errors, variant for variant, message for message: the
+/// wire bodies an adopter saw in 0.3 are unchanged.
+impl From<bsv_middleware_core::AuthError> for AuthCloudflareError {
+    fn from(e: bsv_middleware_core::AuthError) -> Self {
+        use bsv_middleware_core::AuthError;
+        match e {
+            AuthError::InvalidAuthentication(m) => AuthCloudflareError::InvalidAuthentication(m),
+            AuthError::Config(m) => AuthCloudflareError::ConfigError(m),
+            AuthError::Sdk(m) => AuthCloudflareError::SdkError(m),
+            AuthError::Serialization(m) => AuthCloudflareError::SerializationError(m),
+        }
+    }
+}
+
 impl From<worker::Error> for AuthCloudflareError {
     fn from(e: worker::Error) -> Self {
         AuthCloudflareError::KvError(e.to_string())

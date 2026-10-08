@@ -1,107 +1,21 @@
 //! Cloudflare Workers transport implementation for BRC-103/104.
 //!
 //! This module provides utilities for extracting and constructing BRC-104
-//! authenticated HTTP requests and responses in Cloudflare Workers.
+//! authenticated HTTP requests and responses in Cloudflare Workers. The
+//! wire shapes (header names, the signed request and response payloads, the
+//! header pairs a message is sent as) are `bsv_middleware_core::brc104`,
+//! re-exported here at their 0.3 paths; what stays is the reading of a
+//! `worker::Request` into them.
 
 use crate::error::{AuthCloudflareError, Result};
 use bsv_sdk::auth::types::{AuthMessage, MessageType, AUTH_VERSION};
 use bsv_sdk::primitives::{from_base64, PublicKey};
 use worker::{Headers, Request};
 
-/// BRC-104 header names for authenticated requests.
-pub mod auth_headers {
-    /// Auth protocol version.
-    pub const VERSION: &str = "x-bsv-auth-version";
-    /// Sender's identity public key (hex, 66 chars compressed).
-    pub const IDENTITY_KEY: &str = "x-bsv-auth-identity-key";
-    /// Sender's nonce (base64).
-    pub const NONCE: &str = "x-bsv-auth-nonce";
-    /// Initial nonce for handshake (base64).
-    pub const INITIAL_NONCE: &str = "x-bsv-auth-initial-nonce";
-    /// Recipient's nonce from previous message (base64).
-    pub const YOUR_NONCE: &str = "x-bsv-auth-your-nonce";
-    /// Message signature (hex or base64).
-    pub const SIGNATURE: &str = "x-bsv-auth-signature";
-    /// Message type.
-    pub const MESSAGE_TYPE: &str = "x-bsv-auth-message-type";
-    /// Request ID for correlating requests/responses (base64, 32 bytes).
-    pub const REQUEST_ID: &str = "x-bsv-auth-request-id";
-    /// Requested certificates specification (JSON).
-    pub const REQUESTED_CERTIFICATES: &str = "x-bsv-auth-requested-certificates";
-}
-
-/// Deserialized HTTP request data from General message payload.
-#[derive(Debug, Clone)]
-pub struct HttpRequestData {
-    /// Request ID (32 bytes, for correlation).
-    pub request_id: [u8; 32],
-    /// HTTP method (GET, POST, PUT, DELETE, etc.).
-    pub method: String,
-    /// URL path (e.g., "/api/users").
-    pub path: String,
-    /// URL query string (e.g., "?foo=bar").
-    pub search: String,
-    /// HTTP headers (key-value pairs) - only signed headers.
-    pub headers: Vec<(String, String)>,
-    /// Request body.
-    pub body: Vec<u8>,
-}
-
-impl HttpRequestData {
-    /// Returns the combined URL (path + search).
-    pub fn url(&self) -> String {
-        format!("{}{}", self.path, self.search)
-    }
-}
-
-/// HTTP response data to be serialized as General message payload.
-#[derive(Debug, Clone)]
-pub struct HttpResponseData {
-    /// Request ID (32 bytes, from the request).
-    pub request_id: [u8; 32],
-    /// HTTP status code.
-    pub status: u16,
-    /// HTTP headers (only x-bsv-* and authorization, excluding x-bsv-auth-*).
-    pub headers: Vec<(String, String)>,
-    /// Response body.
-    pub body: Vec<u8>,
-}
-
-impl HttpResponseData {
-    /// Serializes this HTTP response into payload bytes for an AuthMessage.
-    ///
-    /// Format: `[request_id: 32][status: varint][headers: varint+pairs][body: varint+bytes]`
-    pub fn to_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::new();
-
-        // Write request ID (32 bytes)
-        payload.extend_from_slice(&self.request_id);
-
-        // Write status (varint)
-        payload.extend(write_varint(self.status as i64));
-
-        // Write headers (varint count, then pairs)
-        payload.extend(write_varint(self.headers.len() as i64));
-        for (key, value) in &self.headers {
-            let key_bytes = key.as_bytes();
-            payload.extend(write_varint(key_bytes.len() as i64));
-            payload.extend_from_slice(key_bytes);
-            let val_bytes = value.as_bytes();
-            payload.extend(write_varint(val_bytes.len() as i64));
-            payload.extend_from_slice(val_bytes);
-        }
-
-        // Write body (varint length + bytes, or -1 if empty)
-        if self.body.is_empty() {
-            payload.extend(write_varint(-1));
-        } else {
-            payload.extend(write_varint(self.body.len() as i64));
-            payload.extend_from_slice(&self.body);
-        }
-
-        payload
-    }
-}
+pub use bsv_middleware_core::brc104::{auth_headers, HttpRequestData, HttpResponseData};
+use bsv_middleware_core::brc104::{
+    build_request_payload, message_to_headers, signable_request_headers,
+};
 
 /// Transport utilities for Cloudflare Workers.
 ///
@@ -271,7 +185,7 @@ impl CloudflareTransport {
             // Extract signable headers from the request.
             // Must match SimplifiedFetchTransport rules: include x-bsv-* (excluding
             // x-bsv-auth-*) and authorization, sorted alphabetically by key.
-            let signable_headers = extract_signable_headers(req);
+            let signable_headers = signable_request_headers(req.headers());
 
             // Build payload with HTTP metadata
             let payload = build_request_payload(
@@ -321,46 +235,10 @@ impl CloudflareTransport {
         Ok((msg, raw_body_bytes))
     }
 
-    /// Builds response headers from an AuthMessage.
+    /// Builds response headers from an AuthMessage
+    /// (`bsv_middleware_core::brc104::message_to_headers`).
     pub fn message_to_headers(message: &AuthMessage) -> Vec<(String, String)> {
-        let mut headers = Vec::new();
-
-        headers.push((auth_headers::VERSION.to_string(), message.version.clone()));
-        headers.push((
-            auth_headers::IDENTITY_KEY.to_string(),
-            message.identity_key.to_hex(),
-        ));
-        headers.push((
-            auth_headers::MESSAGE_TYPE.to_string(),
-            message.message_type.as_str().to_string(),
-        ));
-
-        if let Some(ref nonce) = message.nonce {
-            headers.push((auth_headers::NONCE.to_string(), nonce.clone()));
-        }
-
-        if let Some(ref initial_nonce) = message.initial_nonce {
-            headers.push((
-                auth_headers::INITIAL_NONCE.to_string(),
-                initial_nonce.clone(),
-            ));
-        }
-
-        if let Some(ref your_nonce) = message.your_nonce {
-            headers.push((auth_headers::YOUR_NONCE.to_string(), your_nonce.clone()));
-        }
-
-        if let Some(ref sig) = message.signature {
-            headers.push((auth_headers::SIGNATURE.to_string(), hex::encode(sig)));
-        }
-
-        if let Some(ref requested) = message.requested_certificates {
-            if let Ok(json) = serde_json::to_string(requested) {
-                headers.push((auth_headers::REQUESTED_CERTIFICATES.to_string(), json));
-            }
-        }
-
-        headers
+        message_to_headers(message)
     }
 
     /// Creates Worker response headers from a list of header pairs.
@@ -373,128 +251,10 @@ impl CloudflareTransport {
     }
 }
 
-/// Extracts signable headers from a request, matching SimplifiedFetchTransport rules.
-///
-/// Includes:
-///   - Headers starting with `x-bsv-` (but NOT `x-bsv-auth-*`)
-///   - The `authorization` header
-///   - The `content-type` header (value stripped to media type, no params)
-///
-/// Sorted alphabetically by lowercase key.
-fn extract_signable_headers(req: &Request) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-
-    // worker::Headers implements IntoIterator
-    for (key, value) in req.headers() {
-        let key_lower = key.to_lowercase();
-        if key_lower == "authorization"
-            || (key_lower.starts_with("x-bsv-") && !key_lower.starts_with("x-bsv-auth-"))
-        {
-            headers.push((key_lower, value));
-        } else if key_lower == "content-type" {
-            // Match TS SDK: include content-type but strip parameters (e.g. "; charset=utf-8")
-            let media_type = value.split(';').next().unwrap_or(&value).trim().to_string();
-            headers.push((key_lower, media_type));
-        }
-    }
-
-    headers.sort_by(|a, b| a.0.cmp(&b.0));
-    headers
-}
-
-/// Builds the payload for a general message request.
-fn build_request_payload(
-    request_id: &[u8; 32],
-    method: &str,
-    path: &str,
-    search: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-
-    // Write request ID (32 bytes)
-    payload.extend_from_slice(request_id);
-
-    // Write method
-    let method_bytes = method.as_bytes();
-    payload.extend(write_varint(method_bytes.len() as i64));
-    payload.extend_from_slice(method_bytes);
-
-    // Write path (or -1 if empty)
-    if path.is_empty() {
-        payload.extend(write_varint(-1));
-    } else {
-        let path_bytes = path.as_bytes();
-        payload.extend(write_varint(path_bytes.len() as i64));
-        payload.extend_from_slice(path_bytes);
-    }
-
-    // Write search (or -1 if empty)
-    if search.is_empty() {
-        payload.extend(write_varint(-1));
-    } else {
-        let search_bytes = search.as_bytes();
-        payload.extend(write_varint(search_bytes.len() as i64));
-        payload.extend_from_slice(search_bytes);
-    }
-
-    // Write headers
-    payload.extend(write_varint(headers.len() as i64));
-    for (key, value) in headers {
-        let key_bytes = key.as_bytes();
-        payload.extend(write_varint(key_bytes.len() as i64));
-        payload.extend_from_slice(key_bytes);
-        let val_bytes = value.as_bytes();
-        payload.extend(write_varint(val_bytes.len() as i64));
-        payload.extend_from_slice(val_bytes);
-    }
-
-    // Write body (or -1 if empty)
-    if body.is_empty() {
-        payload.extend(write_varint(-1));
-    } else {
-        payload.extend(write_varint(body.len() as i64));
-        payload.extend_from_slice(body);
-    }
-
-    payload
-}
-
-/// Writes a Bitcoin-style varint.
-///
-/// This matches the TS SDK's Writer.writeVarIntNum / toVarInt:
-/// - value < 0 (i.e. -1): 9 bytes of 0xFF (means "missing/empty")
-/// - value < 253: single byte
-/// - value < 0x10000: 0xFD + 2 bytes LE
-/// - value < 0x100000000: 0xFE + 4 bytes LE
-/// - else: 0xFF + 8 bytes LE
-fn write_varint(value: i64) -> Vec<u8> {
-    if value < 0 {
-        // -1 means "empty/missing" - write as 0xFF followed by 8 bytes of 0xFF
-        vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
-    } else if value < 253 {
-        vec![value as u8]
-    } else if value < 0x10000 {
-        let v = value as u16;
-        let bytes = v.to_le_bytes();
-        vec![0xFD, bytes[0], bytes[1]]
-    } else if value < 0x100000000 {
-        let v = value as u32;
-        let bytes = v.to_le_bytes();
-        vec![0xFE, bytes[0], bytes[1], bytes[2], bytes[3]]
-    } else {
-        let v = value as u64;
-        let bytes = v.to_le_bytes();
-        vec![
-            0xFF, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsv_middleware_core::brc104::{build_request_payload, write_varint};
 
     // ===========================================
     // Varint encoding tests

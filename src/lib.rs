@@ -6,6 +6,17 @@
 //! Cloudflare Workers, allowing you to build authenticated and paid APIs with
 //! BSV blockchain-based identity and payments.
 //!
+//! ## Shape (0.4.0)
+//!
+//! The rules (BRC-103/104 message build and verify, BRC-29 derivation and
+//! payment verification, the SPV decision through a header-service trait,
+//! the single-use store traits, the session lane, refund signing) are
+//! [`bsv_middleware_core`], re-exported here as [`core`]. This crate is the
+//! Workers adapter: `worker::Request` in, the core's data through, HTTP out;
+//! KV, Durable Object and D1 implementations of the core's traits; the
+//! URL-configured header service; CORS. Every 0.3 item keeps its name, path
+//! and signature.
+//!
 //! ## Features
 //!
 //! - **BRC-103/104 Mutual Authentication**: Cryptographic authentication using BSV keys
@@ -135,7 +146,13 @@ pub mod transport;
 pub mod types;
 pub mod utils;
 
+
 // Re-exports for convenient access
+/// The runtime-free rules this crate adapts: `bsv_middleware_core`, as a
+/// module, so an adopter can reach the words and the traits without a second
+/// dependency line (`bsv_middleware_cloudflare::core::PaymentVerdict`).
+pub use bsv_middleware_core as core;
+pub use bsv_middleware_core::{HeaderService, PaymentFault, PaymentVerdict};
 pub use client::{ClientSessionSnapshot, WorkerStorageClient};
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
@@ -157,12 +174,16 @@ pub use middleware::session_lane;
 #[cfg(feature = "d1-claims")]
 pub use payment_claims::{claim_payment_nonce, release_payment_nonce, PAYMENT_CLAIMS_SCHEMA};
 pub use payment_verify::{
-    expected_brc29_locking_script, verify_brc29_payment, verify_brc29_payment_output,
-    verify_brc29_payment_structural_only, verify_brc29_payment_with_header_lookup,
-    PaymentVerifyError, DEFAULT_CHAINTRACKS_URL,
+    accept_verdict, expected_brc29_locking_script, verify_brc29_payment,
+    verify_brc29_payment_output, verify_brc29_payment_structural_only,
+    verify_brc29_payment_verdict, verify_brc29_payment_with_header_lookup, PaymentVerifyError,
+    UrlHeaderService, DEFAULT_CHAINTRACKS_URL,
 };
 pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
-pub use storage::{KvPaymentStorage, KvSessionStorage, LaneVerdict, LaneVerifyAsk, SessionStorage};
+pub use storage::{
+    KvPaymentStorage, KvSessionStorage, LaneVerdict, LaneVerifyAsk, SessionNonceStore,
+    SessionStorage,
+};
 pub use transport::{auth_headers, CloudflareTransport, HttpRequestData, HttpResponseData};
 pub use types::{AuthContext, BsvPayment, PaymentContext};
 

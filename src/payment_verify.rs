@@ -1,31 +1,39 @@
-//! BRC-29 payment verification before internalize.
+//! BRC-29 payment verification before internalize: the Workers adapter over
+//! `bsv_middleware_core`.
 //!
-//! Verifies that an incoming BRC-29 payment transaction actually pays the
-//! server's derived key at least the quoted amount BEFORE the payment is
-//! internalized and service is rendered.
+//! The rules live in the core: the pays-us-correctly check
+//! ([`bsv_middleware_core::brc29`]), BEEF completeness and the SPV decision
+//! ([`bsv_middleware_core::spv`]), and the six-word verdict
+//! ([`PaymentVerdict`]). This module keeps what is bound to this runtime and
+//! to the 0.3 API:
 //!
-//! The expected locking script commits to the server identity, the sender
-//! identity, and this request's derivation prefix + suffix, so a transaction
-//! built for any other (server, sender, nonce) tuple fails the byte-compare.
-//! This closes four holes in one check:
-//!   - underpaid / zero-sat outputs (amount check)
-//!   - outputs paying a key the server can't spend, e.g. the client's own
-//!     key (script check)
-//!   - replaying an already-internalized tx against a fresh quote nonce
-//!     (prefix is part of the invoice number, so the expected script differs)
-//!   - replaying one payment across multiple servers (server identity is part
-//!     of the derivation, so the expected script differs per server)
+//! - [`UrlHeaderService`]: the core's [`HeaderService`] over a
+//!   ChainTracks-compatible base URL fetched with Workers `fetch`, behind the
+//!   0.3.6 configuration gate (below);
+//! - [`PaymentVerifyError`], the 0.3 error type, and [`accept_verdict`], the
+//!   one visible match that maps the core's words onto it;
+//! - the 0.3 functions, name for name and signature for signature.
 //!
-//! The script/amount check proves the payment *pays us correctly*; it does not
-//! prove the payment transaction is *real and confirmable*. [`verify_brc29_payment`]
-//! adds that: BEEF structural completeness (rejects missing inputs / txid-only
-//! gaps / broken proof chains) plus SPV: each merkle root in the proof is
-//! checked against block headers via a header service speaking the ChainTracks
-//! `findHeaderHexForHeight` API. SPV is **fail-open** on service errors (header
-//! service down / timeout / height not yet indexed): the payment is still
-//! accepted, with the upstream broadcast as the backstop, so a header-service
-//! outage never halts revenue. It is **fail-closed** on an explicit root
-//! MISMATCH, which is a fraud signal, not an outage.
+//! ## What the words map to (0.4 policy)
+//!
+//! | core | adapter |
+//! |---|---|
+//! | `Verified { satoshis }` | `Ok(satoshis)` |
+//! | `Unverifiable { satoshis, reason }` | `Ok(satoshis)`, warning logged (**fail-open**, see below) |
+//! | `Underpaid { paid, required }` | `Err(Underpaid { satoshis: paid, required })` |
+//! | `WrongScript { expected, actual }` | `Err(WrongScript { expected, actual })` |
+//! | `NoHeaderService` | `Err(NoHeaderService)` |
+//! | `RootMismatch { height, root }` | `Err(RootMismatch { height, root })` |
+//! | `PaymentFault::BadTransaction` / `MissingOutput` / `KeyDerivation` / `BadBeef` | the same-named `Err` |
+//!
+//! **Fail-open on a service error stays this adapter's documented policy in
+//! 0.4**, unchanged from 0.3.6: once a header service is named, a lookup it
+//! cannot answer (unreachable, HTTP error, unparseable body, height not yet
+//! indexed) still accepts the payment with a logged warning, the upstream
+//! broadcast as the backstop. The core hands that case to the host as the
+//! word `Unverifiable`; hosts that want to decide it themselves call the
+//! core (or [`verify_brc29_payment_verdict`]) and match the word. A root
+//! that differs from the header is `RootMismatch`, fail-closed, as before.
 //!
 //! ## Header service: required
 //!
@@ -55,9 +63,9 @@
 //! | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 //! | the header carries the proof's root | `Ok(satoshis)` |
 //!
-//! The configuration gate (`resolve_header_service`) and the per-root
-//! decision (`decide_root`) are pure functions, pinned by table tests; the
-//! network call is injected into the loop that runs them.
+//! The configuration gate (`resolve_header_service`) is a pure function,
+//! pinned by table tests; the per-root decision is the core's
+//! (`bsv_middleware_core::spv::decide_root`), pinned there.
 //!
 //! ## Relation to the payment middleware
 //!
@@ -70,17 +78,12 @@
 //! locally, before any remote call: an output that pays this server's derived
 //! key, carrying at least the quoted satoshis, inside a complete proof.
 
-use std::collections::HashMap;
 use std::future::Future;
 
-use bsv_sdk::primitives::hash::hash160;
-use bsv_sdk::primitives::{PrivateKey, PublicKey};
-use bsv_sdk::transaction::{Beef, Transaction};
-use bsv_sdk::wallet::{Counterparty, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel};
+use bsv_middleware_core::{
+    HeaderService, LookupFn, MerkleRoot, PaymentFault, PaymentVerdict, ServiceError,
+};
 use serde::Deserialize;
-
-/// BRC-29 payment protocol ID (security level 2, counterparty-scoped).
-const BRC29_PROTOCOL_ID: &str = "3241645161d8";
 
 /// Placeholder header-service base URL: **never a working default.**
 ///
@@ -100,6 +103,10 @@ pub const DEFAULT_CHAINTRACKS_URL: &str = "https://chaintracks.invalid";
 /// Two are the SERVER's own: [`NoHeaderService`](Self::NoHeaderService) (no
 /// usable `header_url`) and a [`KeyDerivation`](Self::KeyDerivation) error
 /// naming the server key; answer those 500-class and fix the deployment.
+///
+/// Since 0.4.0 this is the adapter's rendering of the core's
+/// [`PaymentVerdict`] and [`PaymentFault`] (see the module docs for the
+/// mapping); the variants and their messages are the 0.3 ones.
 #[derive(Debug)]
 pub enum PaymentVerifyError {
     /// Transaction could not be parsed from BEEF bytes.
@@ -174,6 +181,53 @@ impl std::fmt::Display for PaymentVerifyError {
 }
 
 impl std::error::Error for PaymentVerifyError {}
+
+/// The core's faults, variant for variant.
+impl From<PaymentFault> for PaymentVerifyError {
+    fn from(fault: PaymentFault) -> Self {
+        match fault {
+            PaymentFault::BadTransaction(m) => PaymentVerifyError::BadTransaction(m),
+            PaymentFault::MissingOutput {
+                index,
+                output_count,
+            } => PaymentVerifyError::MissingOutput {
+                index,
+                output_count,
+            },
+            PaymentFault::KeyDerivation(m) => PaymentVerifyError::KeyDerivation(m),
+            PaymentFault::BadBeef(m) => PaymentVerifyError::BadBeef(m),
+        }
+    }
+}
+
+/// The one visible match that collapses the core's words to
+/// this adapter's 0.3 result: `Verified` is `Ok(satoshis)`; `Unverifiable` is
+/// `Ok(satoshis)` with the reason logged as a warning (the adapter's
+/// documented **fail-open** policy in 0.4; see the module docs); every other
+/// word is the same-named `Err`.
+pub fn accept_verdict(verdict: PaymentVerdict) -> std::result::Result<u64, PaymentVerifyError> {
+    match verdict {
+        PaymentVerdict::Verified { satoshis } => Ok(satoshis),
+        PaymentVerdict::Unverifiable { satoshis, reason } => {
+            warn_log(&format!(
+                "[payment_verify] SPV fail-open (accepting {} satoshis): {}",
+                satoshis, reason
+            ));
+            Ok(satoshis)
+        }
+        PaymentVerdict::Underpaid { paid, required } => Err(PaymentVerifyError::Underpaid {
+            satoshis: paid,
+            required,
+        }),
+        PaymentVerdict::WrongScript { expected, actual } => {
+            Err(PaymentVerifyError::WrongScript { expected, actual })
+        }
+        PaymentVerdict::NoHeaderService => Err(PaymentVerifyError::NoHeaderService),
+        PaymentVerdict::RootMismatch { height, root } => {
+            Err(PaymentVerifyError::RootMismatch { height, root })
+        }
+    }
+}
 
 // ─── Header-service configuration (pure) ────────────────────────────
 
@@ -286,7 +340,7 @@ fn resolve_header_service(
     Ok(base)
 }
 
-// ─── Header-service response types ──────────────────────────────────
+// ─── The URL-configured header service ──────────────────────────────
 
 /// `{"status":"success","value":{...}}`
 #[derive(Deserialize)]
@@ -324,8 +378,7 @@ fn parse_header_response(body: &str, height: u32) -> std::result::Result<String,
 }
 
 /// The network half of the header lookup: the merkle root the header service
-/// reports for the block at `height`, or why it could not answer (the caller
-/// decides fail-open vs fail-closed through [`decide_root`]).
+/// reports for the block at `height`, or why it could not answer.
 async fn fetch_header_root(base_url: &str, height: u32) -> std::result::Result<String, String> {
     let base = base_url.trim_end_matches('/');
     let url = format!("{}/findHeaderHexForHeight?height={}", base, height);
@@ -351,6 +404,47 @@ async fn fetch_header_root(base_url: &str, height: u32) -> std::result::Result<S
     parse_header_response(&body, height)
 }
 
+/// The core's [`HeaderService`] over a ChainTracks-compatible base URL,
+/// fetched with Workers `fetch`: `GET {base}/findHeaderHexForHeight?height={h}`.
+///
+/// Built only through [`UrlHeaderService::resolve`], which is the 0.3.6
+/// configuration gate: a value the gate refuses (see the module docs) is
+/// `Err(NoHeaderService)`, so no unclassifiable URL ever becomes a service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlHeaderService {
+    base_url: String,
+}
+
+impl UrlHeaderService {
+    /// The gate: a header service for `header_url`, or
+    /// [`PaymentVerifyError::NoHeaderService`] for every shape of "no
+    /// service" (`None`, blank, the `.invalid` placeholder in any spelling, no
+    /// `http(s)://` scheme, a host the gate cannot classify).
+    pub fn resolve(header_url: Option<&str>) -> std::result::Result<Self, PaymentVerifyError> {
+        let base = resolve_header_service(header_url)?;
+        Ok(Self {
+            base_url: base.to_string(),
+        })
+    }
+
+    /// The base URL SPV queries: trimmed, without trailing slashes.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl HeaderService for UrlHeaderService {
+    async fn merkle_root(
+        &self,
+        height: u32,
+    ) -> std::result::Result<Option<MerkleRoot>, ServiceError> {
+        fetch_header_root(&self.base_url, height)
+            .await
+            .map(|root| Some(MerkleRoot::new(root)))
+            .map_err(ServiceError::new)
+    }
+}
+
 /// Logs through the Workers console on wasm32; a no-op under native tests.
 fn warn_log(message: &str) {
     #[cfg(target_arch = "wasm32")]
@@ -359,124 +453,29 @@ fn warn_log(message: &str) {
     let _ = message;
 }
 
-// ─── SPV decision (pure) and the loop that runs it ──────────────────
-
-/// What one merkle root's header lookup means for the payment: the pure half
-/// of SPV, pinned by table tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RootDecision {
-    /// The header at this height carries the proof's root: it ties to the chain.
-    Match,
-    /// The header at this height carries a DIFFERENT root: fraud, reject.
-    Mismatch,
-    /// The service could not answer (outage, timeout, HTTP error, height not
-    /// yet indexed, unparseable body): accept, and log the carried warning.
-    FailOpen(String),
-}
-
-/// The per-root decision. `lookup` is the header service's answer for
-/// `height`: `Ok(root)` compares case-insensitively, `Err` fails open.
-fn decide_root(
-    height: u32,
-    root: &str,
-    lookup: std::result::Result<String, String>,
-) -> RootDecision {
-    match lookup {
-        Ok(header_root) if header_root.eq_ignore_ascii_case(root) => RootDecision::Match,
-        Ok(_) => RootDecision::Mismatch,
-        Err(reason) => RootDecision::FailOpen(format!(
-            "[payment_verify] SPV fail-open (accepting) at height {}: {}",
-            height, reason
-        )),
-    }
-}
-
-/// Parse the BEEF and check it is structurally complete: offline and
-/// deterministic. Rejects missing inputs, txid-only gaps, and a proof chain
-/// that does not verify. Returns the merkle roots the proofs compute, by
-/// block height, for SPV.
-fn verify_beef_structure(
-    tx_bytes: &[u8],
-) -> std::result::Result<HashMap<u32, String>, PaymentVerifyError> {
-    let mut beef = Beef::from_binary(tx_bytes)
-        .map_err(|e| PaymentVerifyError::BadBeef(format!("BEEF parse: {}", e)))?;
-    let validation = beef.verify_valid(false);
-    if !validation.valid {
-        return Err(PaymentVerifyError::BadBeef(
-            "missing inputs, txid-only gaps, or broken proof chain".to_string(),
-        ));
-    }
-    Ok(validation.roots)
-}
-
-/// SPV over every root, lowest height first: `lookup(height)` is the header
-/// service (injected, so the loop is testable without a network). Fail-closed
-/// on the first mismatch; fail-open (warn, continue) on a lookup error, which
-/// never masks a mismatch at another height.
-async fn check_roots<F, Fut>(
-    roots: &HashMap<u32, String>,
-    lookup: F,
-) -> std::result::Result<(), PaymentVerifyError>
-where
-    F: Fn(u32) -> Fut,
-    Fut: Future<Output = std::result::Result<String, String>>,
-{
-    let mut ordered: Vec<(&u32, &String)> = roots.iter().collect();
-    ordered.sort_unstable();
-    for (height, root) in ordered {
-        match decide_root(*height, root, lookup(*height).await) {
-            RootDecision::Match => {}
-            RootDecision::Mismatch => {
-                return Err(PaymentVerifyError::RootMismatch {
-                    height: *height,
-                    root: root.clone(),
-                });
-            }
-            RootDecision::FailOpen(warning) => warn_log(&warning),
-        }
-    }
-    Ok(())
-}
+// ─── The 0.3 functions over the core ────────────────────────────────
 
 /// Compute the P2PKH locking script (hex) the sender must have paid for a
-/// BRC-29 payment to (`server_key`, `sender_identity_key`, prefix, suffix).
+/// BRC-29 payment to (`server_key`, `sender_identity_key`, prefix, suffix)
+/// (`bsv_middleware_core::brc29::expected_locking_script`).
 pub fn expected_brc29_locking_script(
     server_key: &str,
     sender_identity_key: &str,
     derivation_prefix: &str,
     derivation_suffix: &str,
 ) -> std::result::Result<String, PaymentVerifyError> {
-    let private_key = PrivateKey::from_hex(server_key)
-        .map_err(|e| PaymentVerifyError::KeyDerivation(format!("Invalid server key: {}", e)))?;
-    let wallet = ProtoWallet::new(Some(private_key));
-    let sender_pubkey = PublicKey::from_hex(sender_identity_key)
-        .map_err(|e| PaymentVerifyError::KeyDerivation(format!("Invalid sender key: {}", e)))?;
-
-    // The sender derived OUR child key with themselves as sender
-    // (for_self=false from their side); we derive the same key from our
-    // side with for_self=true. BRC-42 guarantees both derivations agree.
-    let derived = wallet
-        .get_public_key(GetPublicKeyArgs {
-            identity_key: false,
-            protocol_id: Some(Protocol::new(
-                SecurityLevel::Counterparty,
-                BRC29_PROTOCOL_ID,
-            )),
-            key_id: Some(format!("{} {}", derivation_prefix, derivation_suffix)),
-            counterparty: Some(Counterparty::Other(sender_pubkey)),
-            for_self: Some(true),
-        })
-        .map_err(|e| PaymentVerifyError::KeyDerivation(e.to_string()))?;
-
-    let pubkey_bytes = hex::decode(&derived.public_key).map_err(|e| {
-        PaymentVerifyError::KeyDerivation(format!("Invalid derived pubkey hex: {}", e))
-    })?;
-    let pkh = hash160(&pubkey_bytes);
-    Ok(format!("76a914{}88ac", hex::encode(pkh)))
+    Ok(bsv_middleware_core::expected_locking_script(
+        server_key,
+        sender_identity_key,
+        derivation_prefix,
+        derivation_suffix,
+    )?)
 }
 
 /// Verify that output `output_index` of the BEEF-encoded payment transaction
-/// pays the server's BRC-29 derived key at least `required_satoshis`.
+/// pays the server's BRC-29 derived key at least `required_satoshis`
+/// (`bsv_middleware_core::brc29::verify_payment_output`, rendered through
+/// [`accept_verdict`]).
 ///
 /// Call this AFTER nonce/quote verification and BEFORE `internalizeAction`.
 /// Returns the actual satoshis carried by the output on success.
@@ -489,40 +488,44 @@ pub fn verify_brc29_payment_output(
     output_index: usize,
     required_satoshis: u64,
 ) -> std::result::Result<u64, PaymentVerifyError> {
-    let tx = Transaction::from_beef(tx_bytes, None)
-        .map_err(|e| PaymentVerifyError::BadTransaction(e.to_string()))?;
-
-    let output = tx
-        .outputs
-        .get(output_index)
-        .ok_or(PaymentVerifyError::MissingOutput {
-            index: output_index,
-            output_count: tx.outputs.len(),
-        })?;
-
-    let expected_script = expected_brc29_locking_script(
+    accept_verdict(bsv_middleware_core::verify_payment_output(
         server_key,
         sender_identity_key,
         derivation_prefix,
         derivation_suffix,
-    )?;
-    let actual_script = output.locking_script.to_hex();
-    if actual_script != expected_script {
-        return Err(PaymentVerifyError::WrongScript {
-            expected: expected_script,
-            actual: actual_script,
-        });
-    }
+        tx_bytes,
+        output_index,
+        required_satoshis,
+    )?)
+}
 
-    let satoshis = output.satoshis.unwrap_or(0);
-    if satoshis < required_satoshis {
-        return Err(PaymentVerifyError::Underpaid {
-            satoshis,
-            required: required_satoshis,
-        });
-    }
-
-    Ok(satoshis)
+/// The core's verdict on a payment through `service`
+/// (`bsv_middleware_core::verify_brc29_payment`), for callers that want to
+/// decide the words themselves (in particular `Unverifiable`) instead of
+/// taking this adapter's [`accept_verdict`] policy. `None` is
+/// `NoHeaderService`.
+#[allow(clippy::too_many_arguments)]
+pub async fn verify_brc29_payment_verdict<H: HeaderService + ?Sized>(
+    server_key: &str,
+    sender_identity_key: &str,
+    derivation_prefix: &str,
+    derivation_suffix: &str,
+    tx_bytes: &[u8],
+    output_index: usize,
+    required_satoshis: u64,
+    service: Option<&H>,
+) -> std::result::Result<PaymentVerdict, PaymentVerifyError> {
+    Ok(bsv_middleware_core::verify_brc29_payment(
+        server_key,
+        sender_identity_key,
+        derivation_prefix,
+        derivation_suffix,
+        tx_bytes,
+        output_index,
+        required_satoshis,
+        service,
+    )
+    .await?)
 }
 
 /// Steps 1 and 2 of [`verify_brc29_payment`] with the header lookup supplied
@@ -552,8 +555,16 @@ where
     F: Fn(u32) -> Fut,
     Fut: Future<Output = std::result::Result<String, String>>,
 {
-    // 1. Cheap, offline, deterministic: does it pay us the quoted amount?
-    let satoshis = verify_brc29_payment_output(
+    let service = LookupFn(|height| {
+        let answer = lookup(height);
+        async move {
+            answer
+                .await
+                .map(|root| Some(MerkleRoot::new(root)))
+                .map_err(ServiceError::new)
+        }
+    });
+    let verdict = verify_brc29_payment_verdict(
         server_key,
         sender_identity_key,
         derivation_prefix,
@@ -561,13 +572,10 @@ where
         tx_bytes,
         output_index,
         required_satoshis,
-    )?;
-
-    // 2. Is the payment real and confirmable? (structural, then SPV)
-    let roots = verify_beef_structure(tx_bytes)?;
-    check_roots(&roots, lookup).await?;
-
-    Ok(satoshis)
+        Some(&service),
+    )
+    .await?;
+    accept_verdict(verdict)
 }
 
 /// Full pre-service payment verification: pays-us-correctly **and**
@@ -604,10 +612,11 @@ pub async fn verify_brc29_payment(
     required_satoshis: u64,
     header_url: Option<&str>,
 ) -> std::result::Result<u64, PaymentVerifyError> {
-    // 0. No header service, no verdict: refuse before any other work so a
-    //    misconfigured deployment never looks like one that verifies.
-    let base = resolve_header_service(header_url)?;
-    verify_brc29_payment_with_header_lookup(
+    // 0. No header service, no verdict: the gate classifies the URL, and the
+    //    core refuses `None` before any other work, so a misconfigured
+    //    deployment never looks like one that verifies.
+    let service = UrlHeaderService::resolve(header_url).ok();
+    let verdict = verify_brc29_payment_verdict(
         server_key,
         sender_identity_key,
         derivation_prefix,
@@ -615,9 +624,10 @@ pub async fn verify_brc29_payment(
         tx_bytes,
         output_index,
         required_satoshis,
-        move |height| fetch_header_root(base, height),
+        service.as_ref(),
     )
-    .await
+    .await?;
+    accept_verdict(verdict)
 }
 
 /// [`verify_brc29_payment`] **without SPV**: script + amount and BEEF
@@ -630,7 +640,8 @@ pub async fn verify_brc29_payment(
 /// parent transaction with a made-up proof passes this function and is caught
 /// only by whatever your broadcast or internalize step does later. Callers
 /// that serve before those steps are exposed to that forgery. A warning is
-/// logged whenever roots go unchecked.
+/// logged whenever roots go unchecked (the core answers `Unverifiable`, which
+/// [`accept_verdict`] accepts by this adapter's policy).
 pub fn verify_brc29_payment_structural_only(
     server_key: &str,
     sender_identity_key: &str,
@@ -640,7 +651,7 @@ pub fn verify_brc29_payment_structural_only(
     output_index: usize,
     required_satoshis: u64,
 ) -> std::result::Result<u64, PaymentVerifyError> {
-    let satoshis = verify_brc29_payment_output(
+    accept_verdict(bsv_middleware_core::verify_brc29_payment_structural_only(
         server_key,
         sender_identity_key,
         derivation_prefix,
@@ -648,22 +659,20 @@ pub fn verify_brc29_payment_structural_only(
         tx_bytes,
         output_index,
         required_satoshis,
-    )?;
-    let roots = verify_beef_structure(tx_bytes)?;
-    if !roots.is_empty() {
-        warn_log(&format!(
-            "[payment_verify] structural-only verification: {} merkle root(s) NOT checked against block headers (no SPV)",
-            roots.len()
-        ));
-    }
-    Ok(satoshis)
+    )?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsv_middleware_core::BRC29_PROTOCOL_ID;
+    use bsv_sdk::primitives::hash::hash160;
+    use bsv_sdk::primitives::{PrivateKey, PublicKey};
     use bsv_sdk::script::LockingScript;
-    use bsv_sdk::transaction::{MerklePath, MerklePathLeaf, TransactionInput, TransactionOutput};
+    use bsv_sdk::transaction::{
+        Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
+    };
+    use bsv_sdk::wallet::{Counterparty, GetPublicKeyArgs, ProtoWallet, Protocol, SecurityLevel};
     use std::cell::RefCell;
 
     const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
@@ -1153,91 +1162,104 @@ mod tests {
         }
     }
 
-    /// The per-root decision, as a table: match (case-insensitive) accepts,
-    /// a different root rejects, a lookup error fails open with a warning
-    /// that names the height and the reason.
+    /// The one visible match, as a table: every core word lands on its 0.3
+    /// result, and `Unverifiable` is accepted (this adapter's documented
+    /// fail-open policy) with the amount the core carried.
     #[test]
-    fn test_decide_root_table() {
+    fn test_accept_verdict_table() {
         assert_eq!(
-            decide_root(7, "abcd", Ok("abcd".to_string())),
-            RootDecision::Match
+            accept_verdict(PaymentVerdict::Verified { satoshis: 7 }).unwrap(),
+            7
         );
         assert_eq!(
-            decide_root(7, "abcd", Ok("ABCD".to_string())),
-            RootDecision::Match
+            accept_verdict(PaymentVerdict::Unverifiable {
+                satoshis: 9,
+                reason: "HTTP 503".into()
+            })
+            .unwrap(),
+            9,
+            "fail-open: the host serves on the carried amount"
         );
-        assert_eq!(
-            decide_root(7, "abcd", Ok("abce".to_string())),
-            RootDecision::Mismatch
-        );
-        assert_eq!(
-            decide_root(7, "abcd", Ok(String::new())),
-            RootDecision::Mismatch,
-            "an empty root from the service is not a match"
-        );
-        match decide_root(
-            7,
-            "abcd",
-            Err("header service HTTP 503 at height 7".to_string()),
-        ) {
-            RootDecision::FailOpen(warning) => {
-                assert!(warning.contains("fail-open"), "{warning}");
-                assert!(warning.contains("height 7"), "{warning}");
-                assert!(warning.contains("HTTP 503"), "{warning}");
-            }
-            other => panic!("expected FailOpen, got {other:?}"),
+        assert!(matches!(
+            accept_verdict(PaymentVerdict::Underpaid {
+                paid: 5,
+                required: 10
+            }),
+            Err(PaymentVerifyError::Underpaid {
+                satoshis: 5,
+                required: 10
+            })
+        ));
+        assert!(matches!(
+            accept_verdict(PaymentVerdict::WrongScript {
+                expected: "a".into(),
+                actual: "b".into()
+            }),
+            Err(PaymentVerifyError::WrongScript { expected, actual }) if expected == "a" && actual == "b"
+        ));
+        assert!(matches!(
+            accept_verdict(PaymentVerdict::NoHeaderService),
+            Err(PaymentVerifyError::NoHeaderService)
+        ));
+        assert!(matches!(
+            accept_verdict(PaymentVerdict::RootMismatch {
+                height: 4,
+                root: "r".into()
+            }),
+            Err(PaymentVerifyError::RootMismatch { height: 4, root }) if root == "r"
+        ));
+    }
+
+    /// The core's faults land on the same-named 0.3 errors, message intact.
+    #[test]
+    fn test_fault_mapping_table() {
+        let faults = [
+            PaymentFault::BadTransaction("x".into()),
+            PaymentFault::MissingOutput {
+                index: 2,
+                output_count: 1,
+            },
+            PaymentFault::KeyDerivation("k".into()),
+            PaymentFault::BadBeef("b".into()),
+        ];
+        for fault in faults {
+            let text = fault.to_string();
+            let err = PaymentVerifyError::from(fault.clone());
+            let same_variant = match (&fault, &err) {
+                (PaymentFault::BadTransaction(a), PaymentVerifyError::BadTransaction(b)) => a == b,
+                (
+                    PaymentFault::MissingOutput {
+                        index: a,
+                        output_count: b,
+                    },
+                    PaymentVerifyError::MissingOutput {
+                        index: c,
+                        output_count: d,
+                    },
+                ) => a == c && b == d,
+                (PaymentFault::KeyDerivation(a), PaymentVerifyError::KeyDerivation(b)) => a == b,
+                (PaymentFault::BadBeef(a), PaymentVerifyError::BadBeef(b)) => a == b,
+                _ => false,
+            };
+            assert!(same_variant, "{fault:?} -> {err:?}");
+            assert_eq!(err.to_string(), text, "the message is the core's");
         }
     }
 
-    /// The SPV loop over several roots: all matching accepts; one mismatch
-    /// rejects naming its height and root; lookup errors fail open; and a
-    /// fail-open at one height never masks a mismatch at another.
-    #[tokio::test]
-    async fn test_check_roots_table() {
-        let roots: HashMap<u32, String> =
-            HashMap::from([(100, "aa".to_string()), (200, "bb".to_string())]);
-        let answer =
-            |table: &'static [(u32, std::result::Result<&'static str, &'static str>)]| {
-                move |height: u32| {
-                    let found = table
-                        .iter()
-                        .find(|(h, _)| *h == height)
-                        .map(|(_, r)| r.map(str::to_string).map_err(str::to_string))
-                        .unwrap_or_else(|| Err(format!("no fixture at height {height}")));
-                    async move { found }
-                }
-            };
-
-        check_roots(&roots, answer(&[(100, Ok("aa")), (200, Ok("bb"))]))
-            .await
-            .unwrap();
-
-        let err = check_roots(&roots, answer(&[(100, Ok("aa")), (200, Ok("zz"))]))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, PaymentVerifyError::RootMismatch { height: 200, root } if root == "bb"),
-            "{err}"
-        );
-
-        check_roots(
-            &roots,
-            answer(&[(100, Err("timeout")), (200, Err("HTTP 503"))]),
-        )
-        .await
-        .unwrap();
-
-        let err = check_roots(&roots, answer(&[(100, Err("timeout")), (200, Ok("zz"))]))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, PaymentVerifyError::RootMismatch { height: 200, .. }),
-            "{err}"
-        );
-
-        check_roots(&HashMap::new(), answer(&[]))
-            .await
-            .expect("no roots: nothing to check");
+    /// The URL service is built only through the gate, and keeps the trimmed
+    /// base the gate resolved.
+    #[test]
+    fn test_url_header_service_is_gated() {
+        let service = UrlHeaderService::resolve(Some("  https://headers.example/v1/ ")).unwrap();
+        assert_eq!(service.base_url(), "https://headers.example/v1");
+        assert!(matches!(
+            UrlHeaderService::resolve(Some(DEFAULT_CHAINTRACKS_URL)),
+            Err(PaymentVerifyError::NoHeaderService)
+        ));
+        assert!(matches!(
+            UrlHeaderService::resolve(None),
+            Err(PaymentVerifyError::NoHeaderService)
+        ));
     }
 
     /// End to end on a correct, proven payment with the header service
