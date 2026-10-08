@@ -42,9 +42,23 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
   core's package); the adapter's runner re-pins the root file with the 0.4.0 producer line, writes both copies on
   `emit`, and pins the core's copy byte-identical to the root one.
 
+### Changed
+
+- **A short or misdirected payment on the middleware's own path is refused with `400 ERR_INVALID_PAYMENT` and the
+  quote is kept** (`process_payment_with_storage`, `process_payment_with_storage_signed`, the deprecated
+  `process_payment`; the core's `Underpaid` / `WrongScript` on output 0). 0.3.8 answered `402 ERR_INVALID_PAYMENT`
+  with a fresh challenge. Now: no fresh challenge, the derivation prefix not consumed, the wallet not called, and the
+  body says the challenge is unchanged, so an honest client corrects the payment and retries under the same prefix.
+  Why: the Express reference (`payment-express-middleware`) answers 400 for every refusal after the challenge and
+  reserves 402 for "pay now"; a 402 re-arms automated payers (AuthFetch-class clients) into a second payment for the
+  same request while the first sits un-internalized; one live quote per request keeps the single-use rule simple;
+  and existing hosts built on this crate's `verify_brc29_payment` already answer 400 and keep the quote. `NoHeaderService` stays `500 ERR_SERVER_MISCONFIGURED`,
+  `RootMismatch` and a `PaymentFault` `400 ERR_INVALID_PAYMENT`, `Unverifiable` the documented `accept_verdict`
+  policy. The conformance vectors do not change: the words did not change, only the HTTP rendering of two of them.
+
 ### Behaviour
 
-- Unchanged on the wire. The verdict mapping is documented in `payment_verify`: `Verified` and `Unverifiable`
+- Unchanged on the wire, except the refusal under Changed. The verdict mapping is documented in `payment_verify`: `Verified` and `Unverifiable`
   are `Ok(satoshis)` (**fail-open on a header-service error stays this adapter's documented policy in 0.4**, with
   the reason logged; a later release changes the hosts), every other word is the same-named `Err`.
 - `verify_brc29_payment_structural_only` now answers through the core's `Unverifiable` word when a proof carries
@@ -52,13 +66,14 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 - **The middleware's own payment path decides from the core's words.** `process_payment_with_storage`,
   `process_payment_with_storage_signed` and the deprecated `process_payment` run the core's output check
   (`bsv_middleware_core::verify_payment_output`) on output 0 and match its `PaymentVerdict` once
-  (`judge_paying_output`): `Verified` serves and records the amount read; `Underpaid` / `WrongScript` keep the
-  0.3.8 answer (`402 ERR_INVALID_PAYMENT` with a fresh challenge, the prefix not consumed, the wallet not called);
-  a `PaymentFault` or `RootMismatch` is `400 ERR_INVALID_PAYMENT`, the prefix kept; `NoHeaderService` is
+  (`judge_paying_output`): `Verified` serves and records the amount read; `Underpaid` / `WrongScript` are
+  `400 ERR_INVALID_PAYMENT` with the quote kept (the prefix not consumed, no fresh challenge, the wallet not called;
+  see Changed); a `PaymentFault` or `RootMismatch` is `400 ERR_INVALID_PAYMENT`, the prefix kept; `NoHeaderService` is
   `500 ERR_SERVER_MISCONFIGURED` (the server's own fault, never a client error); `Unverifiable` takes the adapter's
   `accept_verdict` policy (accepted, logged). The output check answers three of the six words today (no SPV on
   this path); the other arms are the path's standing answer should the check grow a proof step. Every payment
-  0.3.8 could see gets the same wire answer.
+  0.3.8 served is served, with the same `satoshis_paid`; the one wire answer that changed is the refusal under
+  Changed.
 
 ### Removed from the dependency list
 

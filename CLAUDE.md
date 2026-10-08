@@ -84,9 +84,10 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
   documented 0.4 policy; a later release changes the hosts. `NoHeaderService` is a server fault (5xx at the host).
   Code that wants the words uses `verify_brc29_payment_verdict` or `bsv_middleware_cloudflare::core` directly.
   The middleware's own payment path (`middleware/payment.rs`, `judge_paying_output`) matches the words once more,
-  into its decisions: `Verified` serves (`satoshis_paid` is the amount read); `Underpaid` / `WrongScript` 402
-  `ERR_INVALID_PAYMENT` with a fresh challenge, the prefix kept and the wallet not called (0.3.8); a
-  `PaymentFault` or `RootMismatch` 400 `ERR_INVALID_PAYMENT`; `NoHeaderService` 500 `ERR_SERVER_MISCONFIGURED`;
+  into its decisions: `Verified` serves (`satoshis_paid` is the amount read); `Underpaid` / `WrongScript` 400
+  `ERR_INVALID_PAYMENT` with the quote kept: no fresh challenge, the prefix not consumed, the wallet not called
+  (0.4.0; 0.3.8 answered 402 with a fresh challenge); a `PaymentFault` or `RootMismatch` 400
+  `ERR_INVALID_PAYMENT`; `NoHeaderService` 500 `ERR_SERVER_MISCONFIGURED`;
   `Unverifiable` through `accept_verdict`. The output check answers three of the six today (no SPV on this path).
 
 - **Raw body passthrough.** `process_auth` returns the original request bytes via

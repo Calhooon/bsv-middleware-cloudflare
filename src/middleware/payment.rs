@@ -194,12 +194,25 @@ where
 ///    this path). The check is the core's
 ///    (`bsv_middleware_core::verify_payment_output`), answered in its words
 ///    and decided here in one match (`judge_paying_output`): a short or
-///    misdirected payment (`Underpaid`, `WrongScript`) gets a 402
-///    `ERR_INVALID_PAYMENT` with a fresh challenge (the reference answers
-///    400); an unreadable one, or a proof contradicting a block header, 400;
-///    a server that cannot judge (`NoHeaderService`) 500; `Unverifiable`
+///    misdirected payment (`Underpaid`, `WrongScript`) is refused with 400
+///    `ERR_INVALID_PAYMENT`, as the reference does, and the quote is kept:
+///    no fresh challenge, the prefix not consumed, the wallet not called,
+///    so the client corrects the payment and retries under the same prefix
+///    (0.4.0; 0.3.8 answered 402 with a fresh challenge). An unreadable
+///    payment, or a proof contradicting a block header, is 400 as well; a
+///    server that cannot judge (`NoHeaderService`) 500; `Unverifiable`
 ///    takes the adapter's [`accept_verdict`] policy. `satoshis_paid` is the
 ///    amount read, not the price.
+///
+///    This path runs no SPV of its own: output 0's script and amount are
+///    checked here, and nothing on this path checks the transaction's
+///    merkle proof against a block header. Whether the payment is real and
+///    confirmable is left to the wallet storage server when it
+///    internalizes the transaction, which this crate does not verify. A
+///    caller that wants the proof checked through a header service before
+///    internalize runs
+///    [`verify_brc29_payment`](crate::payment_verify::verify_brc29_payment)
+///    first.
 ///
 /// Consumption ordering (money path):
 /// - The prefix is consumed **before** `internalizeAction`, so concurrent
@@ -346,14 +359,11 @@ enum PaymentDecision {
     /// best-effort) → 400 `ERR_PAYMENT_FAILED` ([`PaymentResult::Failed`]).
     InternalizeError { description: String },
     /// The paying output carries less than the price or is not locked to
-    /// the server's BRC-29 key → 402 `ERR_INVALID_PAYMENT` with a fresh
-    /// challenge; the wallet is never called, the prefix never consumed
-    /// ([`PaymentResult::Failed`]).
-    NotCovered {
-        price: u64,
-        fresh_prefix: String,
-        description: String,
-    },
+    /// the server's BRC-29 key → 400 `ERR_INVALID_PAYMENT`, the quote kept:
+    /// no fresh challenge, the prefix never consumed, the wallet never
+    /// called ([`PaymentResult::Failed`]). The client corrects the payment
+    /// and retries under the same prefix.
+    NotCovered { description: String },
     /// The payment transaction cannot be read, has no output 0, or carries a
     /// proof that contradicts a block header → 400 `ERR_INVALID_PAYMENT`;
     /// the prefix is not consumed ([`PaymentResult::Failed`]).
@@ -373,8 +383,8 @@ enum PaymentDecision {
 enum OutputJudgement {
     /// Serve; `satoshis_paid` is the amount the output carries.
     Covered { satoshis_paid: u64 },
-    /// 402 `ERR_INVALID_PAYMENT` with a fresh challenge; the prefix is kept
-    /// and the wallet never called.
+    /// 400 `ERR_INVALID_PAYMENT`, the quote kept: no fresh challenge, the
+    /// prefix not consumed, the wallet never called.
     NotCovered { description: String },
     /// 400 `ERR_INVALID_PAYMENT`; the prefix is kept.
     Invalid { description: String },
@@ -388,7 +398,7 @@ enum OutputJudgement {
 /// | the core says | this path answers |
 /// |---|---|
 /// | `Verified { satoshis }` | serve; `satoshis_paid = satoshis` |
-/// | `Underpaid` / `WrongScript` | 402 with a fresh challenge; prefix kept, wallet not called |
+/// | `Underpaid` / `WrongScript` | 400, the quote kept: no fresh challenge, prefix not consumed, wallet not called |
 /// | `NoHeaderService` | 500: the server's own fault |
 /// | `RootMismatch` | 400: a proof that contradicts a block header is a fraud signal, refused |
 /// | `Unverifiable` | the adapter's documented policy, [`accept_verdict`] (0.4: accepted, logged) |
@@ -524,7 +534,8 @@ where
     // server checks neither the amount nor the script, so this is the only
     // check on the path. The core answers in its words; `judge_paying_output`
     // is this path's one match over them. Before consumption: a refusal
-    // here is deterministic, so it must not burn the prefix.
+    // here is deterministic, so it must not burn the prefix, and the quote
+    // stays whole (no fresh challenge) for the corrected retry.
     let satoshis_paid = match judge_paying_output(verify_payment_output(
         server_private_key,
         &auth_context.identity_key,
@@ -536,12 +547,7 @@ where
     )) {
         OutputJudgement::Covered { satoshis_paid } => satoshis_paid,
         OutputJudgement::NotCovered { description } => {
-            let fresh_prefix = create_nonce(&wallet, None, ORIGINATOR).await?;
-            return Ok(PaymentDecision::NotCovered {
-                price,
-                fresh_prefix,
-                description,
-            });
+            return Ok(PaymentDecision::NotCovered { description })
         }
         OutputJudgement::Invalid { description } => {
             return Ok(PaymentDecision::InvalidPayment { description })
@@ -692,19 +698,9 @@ fn decision_into_result(decision: PaymentDecision) -> Result<PaymentResult> {
         PaymentDecision::InternalizeError { description } => {
             failed_json_response(400, "ERR_PAYMENT_FAILED", &description)
         }
-        PaymentDecision::NotCovered {
-            price,
-            fresh_prefix,
-            description,
-        } => {
-            let response = Response::from_json(&ErrorResponse::new(
-                "ERR_INVALID_PAYMENT",
-                not_covered_description(&description),
-            ))
-            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
-            .with_status(402)
-            .with_headers(challenge_headers(price, &fresh_prefix));
-            Ok(PaymentResult::Failed(add_cors_headers(response)))
+        PaymentDecision::NotCovered { description } => {
+            let text = not_covered_description(&description);
+            failed_json_response(400, "ERR_INVALID_PAYMENT", &text)
         }
         PaymentDecision::InvalidPayment { description } => {
             failed_json_response(400, "ERR_INVALID_PAYMENT", &description)
@@ -792,18 +788,9 @@ fn decision_into_result_signed(
         PaymentDecision::InternalizeError { description } => {
             signed_failed(400, "ERR_PAYMENT_FAILED", &description)
         }
-        PaymentDecision::NotCovered {
-            price,
-            fresh_prefix,
-            description,
-        } => {
-            let response = sign_json_response(
-                &ErrorResponse::new("ERR_INVALID_PAYMENT", not_covered_description(&description)),
-                402,
-                &challenge_header_pairs(price, &fresh_prefix),
-                session,
-            )?;
-            Ok(PaymentResult::Failed(response))
+        PaymentDecision::NotCovered { description } => {
+            let text = not_covered_description(&description);
+            signed_failed(400, "ERR_INVALID_PAYMENT", &text)
         }
         PaymentDecision::InvalidPayment { description } => {
             signed_failed(400, "ERR_INVALID_PAYMENT", &description)
@@ -821,10 +808,11 @@ fn decision_into_result_signed(
     }
 }
 
-/// The 402 body description for a payment that does not cover the price.
+/// The 400 body description for a payment that does not cover the price:
+/// the quote stands, so the client is told to retry under the same prefix.
 fn not_covered_description(detail: &str) -> String {
     format!(
-        "The BSV payment does not pay the required amount to the server ({detail}). A fresh payment challenge is provided in the response headers."
+        "The BSV payment does not pay the required amount to the server ({detail}). The payment challenge is unchanged: correct the payment and retry with the same derivation prefix."
     )
 }
 
@@ -1357,7 +1345,7 @@ mod tests {
         }
 
         #[test]
-        fn underpaid_and_wrong_script_get_a_fresh_challenge() {
+        fn underpaid_and_wrong_script_are_refused_with_the_quote_kept() {
             let j = judge_paying_output(Ok(PaymentVerdict::Underpaid {
                 paid: 499,
                 required: 500,
@@ -1997,21 +1985,13 @@ mod tests {
             }
         }
 
-        /// A refusal that carries the price and a fresh, verifiable prefix.
-        async fn assert_fresh_402(decision: PaymentDecision, detail: &str) {
+        /// A refusal that keeps the quote: the decision carries the reason
+        /// and no fresh prefix (none is minted), so the client retries under
+        /// the prefix it already holds.
+        fn assert_refused_quote_kept(decision: PaymentDecision, detail: &str) {
             match decision {
-                PaymentDecision::NotCovered {
-                    price,
-                    fresh_prefix,
-                    description,
-                } => {
-                    assert_eq!(price, PRICE);
+                PaymentDecision::NotCovered { description } => {
                     assert!(description.contains(detail), "{description}");
-                    assert!(
-                        verify_nonce(&fresh_prefix, &server_wallet(), None, ORIGINATOR)
-                            .await
-                            .unwrap()
-                    );
                 }
                 other => panic!("expected NotCovered, got {other:?}"),
             }
@@ -2035,7 +2015,7 @@ mod tests {
                 calls, 0,
                 "the wallet was asked to internalize an underpaid payment"
             );
-            assert_fresh_402(decision, "carries 499 satoshis but 500 are required").await;
+            assert_refused_quote_kept(decision, "carries 499 satoshis but 500 are required");
         }
 
         #[tokio::test]
@@ -2056,7 +2036,7 @@ mod tests {
                 calls, 0,
                 "the wallet was asked to internalize a payment to another script"
             );
-            assert_fresh_402(decision, "does not pay this server's BRC-29 derived key").await;
+            assert_refused_quote_kept(decision, "does not pay this server's BRC-29 derived key");
         }
 
         #[tokio::test]
@@ -2067,7 +2047,7 @@ mod tests {
                 decide_crafted(|p| vec![(PRICE, p2pkh(&[9u8; 20])), (PRICE, derived_script(p))])
                     .await;
             assert_eq!(calls, 0);
-            assert_fresh_402(decision, "does not pay this server's BRC-29 derived key").await;
+            assert_refused_quote_kept(decision, "does not pay this server's BRC-29 derived key");
         }
 
         #[tokio::test]
