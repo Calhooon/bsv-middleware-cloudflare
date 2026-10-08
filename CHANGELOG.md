@@ -3,6 +3,17 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## Unreleased
+
+### Added
+
+- `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
+  (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
+  fail-open service error. For a service binding, a cached header store, or a conformance runner.
+- `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
+  verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
+  by `tests/conformance_brc29.rs`.
+
 ## 0.3.6 — 2026-10-08
 
 ### Added

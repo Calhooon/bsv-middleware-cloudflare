@@ -525,10 +525,20 @@ pub fn verify_brc29_payment_output(
     Ok(satoshis)
 }
 
-/// Steps 1 and 2 of the full verification with the header lookup injected:
-/// script + amount, BEEF structure, then SPV through `lookup`.
+/// Steps 1 and 2 of [`verify_brc29_payment`] with the header lookup supplied
+/// by the caller instead of a `header_url`: script + amount, BEEF structure,
+/// then SPV through `lookup`.
+///
+/// `lookup(height)` is your header service: `Ok(merkle_root_hex)` for the
+/// block at `height` (compared case-insensitively; a different root is
+/// [`PaymentVerifyError::RootMismatch`], fail-closed) or `Err(reason)` when it
+/// cannot answer (fail-open: the payment is accepted and a warning logged).
+/// There is no configuration gate here, since there is no URL to check: a
+/// lookup that always errors makes this the structural-only check. For a
+/// service binding, a cached header store, or a conformance runner
+/// (`conformance/brc29-payment-vectors.json`) that answers from a fixture.
 #[allow(clippy::too_many_arguments)]
-async fn verify_with_lookup<F, Fut>(
+pub async fn verify_brc29_payment_with_header_lookup<F, Fut>(
     server_key: &str,
     sender_identity_key: &str,
     derivation_prefix: &str,
@@ -597,7 +607,7 @@ pub async fn verify_brc29_payment(
     // 0. No header service, no verdict: refuse before any other work so a
     //    misconfigured deployment never looks like one that verifies.
     let base = resolve_header_service(header_url)?;
-    verify_with_lookup(
+    verify_brc29_payment_with_header_lookup(
         server_key,
         sender_identity_key,
         derivation_prefix,
@@ -728,7 +738,7 @@ mod tests {
     ) -> (std::result::Result<u64, PaymentVerifyError>, Vec<u32>) {
         let (beef, _) = beef_with_proven_payment(&our_script(), 1000);
         let asked = RefCell::new(Vec::new());
-        let result = verify_with_lookup(
+        let result = verify_brc29_payment_with_header_lookup(
             SERVER_KEY,
             &sender_identity(),
             "prefix",

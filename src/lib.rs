@@ -158,7 +158,8 @@ pub use middleware::session_lane;
 pub use payment_claims::{claim_payment_nonce, release_payment_nonce, PAYMENT_CLAIMS_SCHEMA};
 pub use payment_verify::{
     expected_brc29_locking_script, verify_brc29_payment, verify_brc29_payment_output,
-    verify_brc29_payment_structural_only, PaymentVerifyError, DEFAULT_CHAINTRACKS_URL,
+    verify_brc29_payment_structural_only, verify_brc29_payment_with_header_lookup,
+    PaymentVerifyError, DEFAULT_CHAINTRACKS_URL,
 };
 pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
 pub use storage::{KvPaymentStorage, KvSessionStorage, LaneVerdict, LaneVerifyAsk, SessionStorage};
