@@ -6,7 +6,8 @@
 //! 2. Calculates request price via user-provided function
 //! 3. If price = 0: free pass
 //! 4. If no x-bsv-payment header: returns 402 with derivation prefix (nonce)
-//! 5. If payment header present: verifies nonce, internalizes payment via storage server
+//! 5. If payment header present: verifies nonce, reads the paying output and
+//!    compares it with the price, internalizes payment via storage server
 //!
 //! Payment internalization uses `WorkerStorageClient` to talk to a remote storage
 //! server (e.g. `storage.babbage.systems`) over BRC-103/104, matching how the TypeScript
@@ -15,6 +16,7 @@
 use crate::client::WorkerStorageClient;
 use crate::error::{AuthCloudflareError, Result};
 use crate::middleware::auth::{add_cors_headers, sign_json_response, AuthSession};
+use crate::payment_verify::{verify_brc29_payment_output, PaymentVerifyError};
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::types::{AuthContext, BsvPayment, ErrorResponse, PaymentContext};
 use bsv_sdk::auth::utils::{create_nonce, verify_nonce};
@@ -181,6 +183,16 @@ where
 ///    with **no expiry** (the HMAC itself never expires); a reused prefix is
 ///    rejected with `400 ERR_INVALID_DERIVATION_PREFIX` before touching the
 ///    wallet.
+/// 3. **The paying output is read.** Like the reference (2.1.9's
+///    `parseAtomicPayment` reads output 0's satoshis and refuses below the
+///    price), output 0 is read and compared with the price before
+///    internalizing; unlike it, the output must also be locked to the
+///    server's BRC-29 key, because the storage server checks neither (the
+///    reference leaves the script to its wallet's signer, which is not on
+///    this path). The check is [`verify_brc29_payment_output`]. A short or
+///    misdirected payment gets a 402 `ERR_INVALID_PAYMENT` with a fresh
+///    challenge (the reference answers 400); `satoshis_paid` is the amount
+///    read, not the price.
 ///
 /// Consumption ordering (money path):
 /// - The prefix is consumed **before** `internalizeAction`, so concurrent
@@ -432,6 +444,38 @@ where
         AuthCloudflareError::MalformedPayment("Invalid base64 transaction data".to_string())
     })?;
 
+    // Step 6a: read the output that will be internalized and compare it
+    // with the price before anyone is asked to record it. The storage
+    // server checks neither the amount nor the script, so this is the only
+    // check on the path. Before consumption: the refusal is deterministic,
+    // so it must not burn the prefix.
+    let satoshis_paid = match verify_brc29_payment_output(
+        server_private_key,
+        &auth_context.identity_key,
+        &payment.derivation_prefix,
+        &payment.derivation_suffix,
+        &tx_bytes,
+        PAYMENT_OUTPUT_INDEX,
+        price,
+    ) {
+        Ok(paid) => paid,
+        Err(
+            e @ (PaymentVerifyError::Underpaid { .. } | PaymentVerifyError::WrongScript { .. }),
+        ) => {
+            let fresh_prefix = create_nonce(&wallet, None, ORIGINATOR).await?;
+            return Ok(PaymentDecision::NotCovered {
+                price,
+                fresh_prefix,
+                description: e.to_string(),
+            });
+        }
+        Err(e) => {
+            return Ok(PaymentDecision::InvalidPayment {
+                description: e.to_string(),
+            })
+        }
+    };
+
     // Step 6b (hardening divergence from the TS reference — audit #44):
     // consume the derivation prefix BEFORE internalizing, so a
     // captured X-BSV-Payment header cannot be internalized twice.
@@ -479,7 +523,7 @@ where
 
             // Success - matches Express: req.payment = { satoshisPaid, accepted, tx }
             Ok(PaymentDecision::Verified {
-                satoshis_paid: price,
+                satoshis_paid,
                 tx: payment.transaction,
             })
         }

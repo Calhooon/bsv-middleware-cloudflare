@@ -3,6 +3,29 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## 0.3.7 — unreleased
+
+### Fixed
+
+- **The middleware's own payment flow reads the paying output.** `process_payment_with_storage`,
+  `process_payment_with_storage_signed` and the deprecated `process_payment` now run `verify_brc29_payment_output` on
+  output 0 before the derivation prefix is consumed and before `internalizeAction`. Until now nothing on this path
+  compared the output with the price or checked that it pays this server's BRC-29 derived key; the storage server
+  checks neither, so an underpaid payment, or one paying another key, was served.
+
+### Behaviour
+
+- A payment whose output 0 carries less than the price, or is not locked to the server's derived key for (prefix,
+  suffix, the authenticated identity), is refused with `402 ERR_INVALID_PAYMENT` and a fresh challenge; the storage
+  is not called and the prefix is not consumed, so the client may retry it.
+- An unreadable payment transaction, or one with no output 0, is refused with `400 ERR_INVALID_PAYMENT`; the prefix
+  is not consumed.
+- `PaymentContext::satoshis_paid` (and so `x-bsv-payment-satoshis-paid`) is the amount read from output 0, not the
+  price: an overpayment records what was paid.
+- The middleware does not run BEEF structure or SPV (`verify_brc29_payment` stays the caller's choice).
+- Exact-price payers to the key derived from the same `server_private_key` see no change. A deployment whose payment
+  key differs from the key its clients derive for will now be refused instead of recording outputs it cannot spend.
+
 ## 0.3.6 — 2026-10-08
 
 ### Added
