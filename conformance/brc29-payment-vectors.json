@@ -884,7 +884,7 @@
     "server_side": "child public key for (server_private_key, counterparty = sender_identity_key, for_self = true)"
   },
   "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
-  "producer": "bsv-middleware-cloudflare 0.3.7 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+  "producer": "bsv-middleware-cloudflare 0.3.8 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
   "schema": "brc29-payment-vectors/1",
   "words": {
     "AcceptedUnverified": "Accept, but the header service could not answer so the merkle root was NOT checked (fail-open). fields.satoshis.",

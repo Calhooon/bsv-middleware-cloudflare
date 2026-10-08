@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.8 — 2026-10-08
+
+### Fixed
+
+- **The middleware's own payment flow reads the paying output** (P0-3b, bsv-stack-lean #50): `verify_brc29_payment_output` runs on output 0 before the derivation prefix is consumed and before `internalizeAction`; `Underpaid` and `WrongScript` answer 402 with a fresh challenge; the amount read is recorded as `satoshis_paid`. 0.3.7 shipped the conformance vectors without this wiring.
+
 ## 0.3.7 — 2026-10-08
 
 - `conformance/brc29-payment-vectors.json`: the BRC-29 payment-verification conformance set (20 cases: output checks incl. the reference's first-output rule, no-header-service forms, merkle-root outcomes) with `tests/conformance_brc29.rs` pinning and running it. A second implementation runs the same file; see `conformance/README.md`.
@@ -18,7 +24,6 @@ patch versions are additive unless a line below says otherwise.
 - `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
   verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
   by `tests/conformance_brc29.rs`.
-## 0.3.7 — unreleased
 
 ### Fixed
 
