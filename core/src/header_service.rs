@@ -12,7 +12,8 @@ use std::future::Future;
 /// A block header's merkle root as the service reports it: hex, compared
 /// case-insensitively. Deliberately NOT validated on construction: a service
 /// that answers an unparseable root is treated as answering a DIFFERENT root
-/// (a mismatch, fail closed), never as an outage (fail open).
+/// (`RootMismatch`, a fraud signal), never as an outage (`Unverifiable`, a
+/// refusal the host may let the client retry).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MerkleRoot(String);
 
@@ -47,8 +48,9 @@ impl From<&str> for MerkleRoot {
 
 /// Why the service could not answer: an outage, a timeout, an HTTP error,
 /// an unparseable body. Carried into
-/// [`PaymentVerdict::Unverifiable`](crate::PaymentVerdict::Unverifiable) as
-/// the reason, so the host's log says what happened.
+/// [`PaymentVerdict::Unverifiable`](crate::PaymentVerdict::Unverifiable) (a
+/// refusal) as the reason, so the host's log and response body say what
+/// happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceError(String);
 
@@ -77,8 +79,9 @@ impl std::error::Error for ServiceError {}
 /// `Ok(Some(root))` is the header at `height`; `Ok(None)` means the service
 /// has no header at that height yet (not indexed); `Err` means it could not
 /// answer. The last two are the same to SPV: the root goes unchecked and the
-/// verdict is [`Unverifiable`](crate::PaymentVerdict::Unverifiable). A root
-/// that differs is [`RootMismatch`](crate::PaymentVerdict::RootMismatch).
+/// verdict is [`Unverifiable`](crate::PaymentVerdict::Unverifiable), a
+/// refusal (fail closed). A root that differs is
+/// [`RootMismatch`](crate::PaymentVerdict::RootMismatch).
 ///
 /// The future is whatever the implementation returns (no `Send` bound is
 /// imposed, so a single-threaded wasm host and a multi-threaded native host

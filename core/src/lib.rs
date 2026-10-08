@@ -36,9 +36,11 @@
 //!
 //! No HTTP request type, no fetch, no KV, no Durable Object, no SQL, no
 //! clock read, no logging. Every function takes what it needs as data and
-//! answers with data; the host owns every side effect and every policy
-//! decision, in particular what to do with
-//! [`PaymentVerdict::Unverifiable`].
+//! answers with data; the host owns every side effect and renders the words
+//! as HTTP. One rendering is fixed by rule, not by host policy: only
+//! [`PaymentVerdict::Verified`] serves, and [`PaymentVerdict::Unverifiable`]
+//! is a refusal (fail closed, 2026-10-08) rendered as a server-side 5xx with
+//! the quote kept.
 //!
 //! ## Conformance
 //!

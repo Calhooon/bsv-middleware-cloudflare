@@ -14,26 +14,33 @@
 //!   one visible match that maps the core's words onto it;
 //! - the 0.3 functions, name for name and signature for signature.
 //!
-//! ## What the words map to (0.4 policy)
+//! ## What the words map to (0.4.0)
 //!
 //! | core | adapter |
 //! |---|---|
 //! | `Verified { satoshis }` | `Ok(satoshis)` |
-//! | `Unverifiable { satoshis, reason }` | `Ok(satoshis)`, warning logged (**fail-open**, see below) |
+//! | `Unverifiable { satoshis, reason }` | `Err(Unverifiable { satoshis, reason })`, warning logged (**fail-closed**, see below) |
 //! | `Underpaid { paid, required }` | `Err(Underpaid { satoshis: paid, required })` |
 //! | `WrongScript { expected, actual }` | `Err(WrongScript { expected, actual })` |
 //! | `NoHeaderService` | `Err(NoHeaderService)` |
 //! | `RootMismatch { height, root }` | `Err(RootMismatch { height, root })` |
 //! | `PaymentFault::BadTransaction` / `MissingOutput` / `KeyDerivation` / `BadBeef` | the same-named `Err` |
 //!
-//! **Fail-open on a service error stays this adapter's documented policy in
-//! 0.4**, unchanged from 0.3.6: once a header service is named, a lookup it
-//! cannot answer (unreachable, HTTP error, unparseable body, height not yet
-//! indexed) still accepts the payment with a logged warning, the upstream
-//! broadcast as the backstop. The core hands that case to the host as the
-//! word `Unverifiable`; hosts that want to decide it themselves call the
-//! core (or [`verify_brc29_payment_verdict`]) and match the word. A root
-//! that differs from the header is `RootMismatch`, fail-closed, as before.
+//! **A header lookup the service cannot answer fails closed (0.4.0).** Once
+//! a header service is named, a lookup it cannot answer (unreachable, HTTP
+//! error, unparseable body, height not yet indexed) leaves the root
+//! unchecked, and an unchecked root is not evidence: the core answers
+//! `Unverifiable` and [`accept_verdict`] refuses it with
+//! [`PaymentVerifyError::Unverifiable`]. 0.3.x accepted that case with a
+//! logged warning; the rule adopted on 2026-10-08 ended that. The refusal is
+//! the server's condition, not the client's fault: render it 503-class
+//! (`ERR_HEADER_SERVICE_UNAVAILABLE` on the middleware's own path), keep the
+//! quote, and let the client retry the same payment once the service
+//! answers. A root that differs from the header is `RootMismatch`,
+//! fail-closed, as before. Hosts that want the words themselves call the
+//! core (or [`verify_brc29_payment_verdict`]) and match them; none of the
+//! six may be served on but `Verified`, except the named opt-out's own
+//! `Unverifiable` through [`verify_brc29_payment_structural_only`].
 //!
 //! ## Header service: required
 //!
@@ -49,7 +56,8 @@
 //! dot stripped) before the placeholder comparison, and spellings that would
 //! need a URL parser to decode or rewrite (percent-encoding, backslashes,
 //! userinfo, whitespace, non-ASCII) are refused rather than guessed at, so
-//! no spelling of the placeholder reaches DNS and fails open. Adopters that
+//! no spelling of the placeholder reaches DNS and surfaces as a lookup error
+//! instead of as the misconfiguration it is. Adopters that
 //! truly have no header service opt out *by name* with
 //! [`verify_brc29_payment_structural_only`].
 //!
@@ -59,7 +67,7 @@
 //! | the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host | `Err(NoHeaderService)` |
 //! | no `http://` / `https://` scheme, no host | `Err(NoHeaderService)` |
 //! | userinfo (`@`), `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
-//! | service unreachable, HTTP error, unparseable answer | `Ok`, warning logged (fail-open) |
+//! | service unreachable, HTTP error, unparseable answer, height not indexed | `Err(Unverifiable)`, warning logged (fail-closed; 503-class, the quote kept) |
 //! | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 //! | the header carries the proof's root | `Ok(satoshis)` |
 //!
@@ -73,8 +81,9 @@
 //! verifies the derivation-prefix HMAC, runs the core's output check
 //! (`bsv_middleware_core::verify_payment_output`: script and amount, 0.3.8)
 //! on output 0 and decides its words in one match of its own
-//! (`middleware::payment`; `Unverifiable` comes back to [`accept_verdict`]),
-//! consumes the prefix once, and hands the transaction to the wallet storage
+//! (`middleware::payment`; `Unverifiable` there is `503
+//! ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept), consumes the prefix
+//! once, and hands the transaction to the wallet storage
 //! server. The storage server's
 //! `internalizeAction` checks neither the script nor the amount (the
 //! reference keeps the script check in its signer, which is not on this
@@ -107,13 +116,18 @@ pub const DEFAULT_CHAINTRACKS_URL: &str = "https://chaintracks.invalid";
 ///
 /// Every variant means: reject without internalizing, and no refund is owed
 /// (no funds were accepted). Most are client-fault, a 400/402-class answer.
-/// Two are the SERVER's own: [`NoHeaderService`](Self::NoHeaderService) (no
-/// usable `header_url`) and a [`KeyDerivation`](Self::KeyDerivation) error
-/// naming the server key; answer those 500-class and fix the deployment.
+/// Three are the SERVER's own: [`NoHeaderService`](Self::NoHeaderService)
+/// (no usable `header_url`) and a [`KeyDerivation`](Self::KeyDerivation)
+/// error naming the server key, which are 500-class (fix the deployment);
+/// and [`Unverifiable`](Self::Unverifiable) (the header service could not
+/// answer), which is 503-class: transient, nothing charged, the quote kept,
+/// the client retries the same payment later.
 ///
 /// Since 0.4.0 this is the adapter's rendering of the core's
 /// [`PaymentVerdict`] and [`PaymentFault`] (see the module docs for the
-/// mapping); the variants and their messages are the 0.3 ones.
+/// mapping); the 0.3 variants keep their messages. `Unverifiable` is new in
+/// 0.4.0: a match that already has a `_` arm compiles unchanged, but that
+/// arm answers the client's 400, so hosts should add a 503 arm for it.
 #[derive(Debug)]
 pub enum PaymentVerifyError {
     /// Transaction could not be parsed from BEEF bytes.
@@ -131,7 +145,7 @@ pub enum PaymentVerifyError {
     /// to be real and confirmable.
     BadBeef(String),
     /// A merkle root in the proof does NOT match the block header at that
-    /// height: a fraud signal. Rejected even in fail-open mode.
+    /// height: a fraud signal, never an outage.
     RootMismatch { height: u32, root: String },
     /// No usable header service was configured (`header_url` was `None`,
     /// empty, the `.invalid` placeholder, or not an `http(s)://` URL), so SPV
@@ -139,6 +153,16 @@ pub enum PaymentVerifyError {
     /// skip. Pass your own header service, or opt out of SPV by name with
     /// [`verify_brc29_payment_structural_only`].
     NoHeaderService,
+    /// The output pays correctly and the proof is complete, but at least one
+    /// merkle root could NOT be checked against a block header: the header
+    /// service could not answer (unreachable, HTTP error, unparseable body,
+    /// height not yet indexed). Fail-closed since 0.4.0 (0.3.x accepted
+    /// with a warning): an unchecked root is not evidence. The server's
+    /// condition, not the client's fault: answer 503-class
+    /// (`ERR_HEADER_SERVICE_UNAVAILABLE`), keep the quote, and let the
+    /// client retry the same payment once the service answers. `satoshis`
+    /// is what the output carries, for the log and the body only.
+    Unverifiable { satoshis: u64, reason: String },
 }
 
 impl std::fmt::Display for PaymentVerifyError {
@@ -183,6 +207,11 @@ impl std::fmt::Display for PaymentVerifyError {
                 f,
                 "No header service configured for SPV: pass your own ChainTracks-compatible base URL as header_url, or opt out by name with verify_brc29_payment_structural_only"
             ),
+            PaymentVerifyError::Unverifiable { satoshis, reason } => write!(
+                f,
+                "Payment not verified: its merkle root could not be checked against a block header ({}); the output carries {} satoshis. Refused until the header service answers; the quote is unchanged",
+                reason, satoshis
+            ),
         }
     }
 }
@@ -207,20 +236,24 @@ impl From<PaymentFault> for PaymentVerifyError {
     }
 }
 
-/// The one visible match that collapses the core's words to
-/// this adapter's 0.3 result: `Verified` is `Ok(satoshis)`; `Unverifiable` is
-/// `Ok(satoshis)` with the reason logged as a warning (the adapter's
-/// documented **fail-open** policy in 0.4; see the module docs); every other
-/// word is the same-named `Err`.
+/// The one visible match that collapses the core's words to this adapter's
+/// 0.3 result: `Verified` is `Ok(satoshis)`, the only `Ok`; every other word
+/// is the same-named `Err`. `Unverifiable` is
+/// [`PaymentVerifyError::Unverifiable`] with the reason logged as a warning:
+/// a root that could not be checked is refused (**fail-closed**, 0.4.0; the
+/// rule of 2026-10-08), and the host renders it 503-class with the quote
+/// kept. No path through this function serves with a root unchecked; the
+/// named opt-out [`verify_brc29_payment_structural_only`] does not use it
+/// for its own `Unverifiable`.
 pub fn accept_verdict(verdict: PaymentVerdict) -> std::result::Result<u64, PaymentVerifyError> {
     match verdict {
         PaymentVerdict::Verified { satoshis } => Ok(satoshis),
         PaymentVerdict::Unverifiable { satoshis, reason } => {
             warn_log(&format!(
-                "[payment_verify] SPV fail-open (accepting {} satoshis): {}",
+                "[payment_verify] SPV refused, root unchecked ({} satoshis not served): {}",
                 satoshis, reason
             ));
-            Ok(satoshis)
+            Err(PaymentVerifyError::Unverifiable { satoshis, reason })
         }
         PaymentVerdict::Underpaid { paid, required } => Err(PaymentVerifyError::Underpaid {
             satoshis: paid,
@@ -244,8 +277,10 @@ pub fn accept_verdict(verdict: PaymentVerdict) -> std::result::Result<u64, Payme
 /// This is deliberately stricter than a WHATWG URL parse. The gate compares
 /// the host against the `.invalid` placeholder, so any spelling that a URL
 /// parser would decode or rewrite into a different host than this function
-/// sees could slip past that comparison and then fail open at lookup time
-/// (a trailing-dot FQDN, a percent-encoded dot, a backslash before an `@`).
+/// sees could slip past that comparison and surface at lookup time as a
+/// service error (`Unverifiable`, a retryable 503) instead of the
+/// misconfiguration it is (`NoHeaderService`, a 500 to fix) (a trailing-dot
+/// FQDN, a percent-encoded dot, a backslash before an `@`).
 /// The rule is therefore: normalise what can be normalised, refuse what
 /// would need decoding, and never guess. After the scheme:
 ///
@@ -328,8 +363,8 @@ fn header_service_host(base: &str) -> Option<String> {
 /// covers [`DEFAULT_CHAINTRACKS_URL`] in any case, with or without a trailing
 /// slash or dot. The normalisation runs BEFORE the placeholder comparison, so
 /// no spelling of the placeholder reaches DNS. A real but wrong host is NOT
-/// caught here: that surfaces as a service error at lookup time and fails
-/// open, by design (see the module docs).
+/// caught here: that surfaces as a service error at lookup time and is
+/// refused as `Unverifiable` (see the module docs).
 fn resolve_header_service(
     header_url: Option<&str>,
 ) -> std::result::Result<&str, PaymentVerifyError> {
@@ -542,10 +577,13 @@ pub async fn verify_brc29_payment_verdict<H: HeaderService + ?Sized>(
 /// `lookup(height)` is your header service: `Ok(merkle_root_hex)` for the
 /// block at `height` (compared case-insensitively; a different root is
 /// [`PaymentVerifyError::RootMismatch`], fail-closed) or `Err(reason)` when it
-/// cannot answer (fail-open: the payment is accepted and a warning logged).
-/// There is no configuration gate here, since there is no URL to check: a
-/// lookup that always errors makes this the structural-only check. For a
-/// service binding, a cached header store, or a conformance runner
+/// cannot answer ([`PaymentVerifyError::Unverifiable`], fail-closed as well:
+/// the payment is refused with the reason, 503-class at the host, the quote
+/// kept). There is no configuration gate here, since there is no URL to
+/// check; a lookup that always errors refuses every proven payment, so a
+/// host with no header service must opt out by name with
+/// [`verify_brc29_payment_structural_only`] instead. For a service binding,
+/// a cached header store, or a conformance runner
 /// (`conformance/brc29-payment-vectors.json`) that answers from a fixture.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment_with_header_lookup<F, Fut>(
@@ -604,10 +642,14 @@ where
 /// `http(s)://` scheme, or a value whose host cannot be classified as a real
 /// hostname (userinfo, percent-encoding, backslashes, whitespace) returns
 /// [`PaymentVerifyError::NoHeaderService`] before any other check: fail-closed,
-/// never a silent skip. Once a service is named, SPV is fail-open on a service
-/// error (unreachable, HTTP error, unparseable answer: accept and warn) and
-/// fail-closed on a root mismatch. Adopters with no header service opt out of
-/// SPV by name with [`verify_brc29_payment_structural_only`].
+/// never a silent skip. Once a service is named, a lookup it cannot answer
+/// (unreachable, HTTP error, unparseable answer, height not indexed) is
+/// [`PaymentVerifyError::Unverifiable`]: fail-closed since 0.4.0, refused
+/// with the reason, for the host to answer 503-class with the quote kept so
+/// the client retries once the service answers; a root that differs from
+/// the header is [`PaymentVerifyError::RootMismatch`]. Adopters with no
+/// header service opt out of SPV by name with
+/// [`verify_brc29_payment_structural_only`].
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment(
     server_key: &str,
@@ -646,9 +688,14 @@ pub async fn verify_brc29_payment(
 /// valid BEEF only proves its merkle paths compute *some* root, so a forged
 /// parent transaction with a made-up proof passes this function and is caught
 /// only by whatever your broadcast or internalize step does later. Callers
-/// that serve before those steps are exposed to that forgery. A warning is
-/// logged whenever roots go unchecked (the core answers `Unverifiable`, which
-/// [`accept_verdict`] accepts by this adapter's policy).
+/// that serve before those steps are exposed to that forgery.
+///
+/// This is the ONE function in this crate that answers `Ok` with merkle
+/// roots unchecked, and only because the caller named it: the core answers
+/// the skip as `Unverifiable` so it stays visible in the word, and this
+/// function (not [`accept_verdict`], which refuses that word) serves it with
+/// a warning logged. Every other word is [`accept_verdict`]'s same-named
+/// `Err`.
 pub fn verify_brc29_payment_structural_only(
     server_key: &str,
     sender_identity_key: &str,
@@ -658,7 +705,7 @@ pub fn verify_brc29_payment_structural_only(
     output_index: usize,
     required_satoshis: u64,
 ) -> std::result::Result<u64, PaymentVerifyError> {
-    accept_verdict(bsv_middleware_core::verify_brc29_payment_structural_only(
+    match bsv_middleware_core::verify_brc29_payment_structural_only(
         server_key,
         sender_identity_key,
         derivation_prefix,
@@ -666,7 +713,17 @@ pub fn verify_brc29_payment_structural_only(
         tx_bytes,
         output_index,
         required_satoshis,
-    )?)
+    )? {
+        // The skip the caller asked for by name: served, and said so.
+        PaymentVerdict::Unverifiable { satoshis, reason } => {
+            warn_log(&format!(
+                "[payment_verify] structural-only (named opt-out): serving {} satoshis with {}",
+                satoshis, reason
+            ));
+            Ok(satoshis)
+        }
+        verdict => accept_verdict(verdict),
+    }
 }
 
 #[cfg(test)]
@@ -1004,7 +1061,7 @@ mod tests {
     }
 
     /// The configuration gate, as a table: every shape of "no header service"
-    /// is `NoHeaderService` (never fail-open, never a skip), including the
+    /// is `NoHeaderService` (never a lookup error, never a skip), including the
     /// placeholder spellings a URL parser would have decoded or rewritten
     /// into the placeholder after our comparison (the re-review's R1: a
     /// trailing-dot FQDN, a percent-encoded dot, a backslash before an `@`)
@@ -1170,22 +1227,29 @@ mod tests {
     }
 
     /// The one visible match, as a table: every core word lands on its 0.3
-    /// result, and `Unverifiable` is accepted (this adapter's documented
-    /// fail-open policy) with the amount the core carried.
+    /// result; `Verified` is the only `Ok`, and `Unverifiable` is refused
+    /// (fail-closed, 0.4.0) as the same-named `Err` carrying the amount and
+    /// the reason, so no host serves on a root that was not checked.
     #[test]
     fn test_accept_verdict_table() {
         assert_eq!(
             accept_verdict(PaymentVerdict::Verified { satoshis: 7 }).unwrap(),
             7
         );
-        assert_eq!(
-            accept_verdict(PaymentVerdict::Unverifiable {
-                satoshis: 9,
-                reason: "HTTP 503".into()
-            })
-            .unwrap(),
-            9,
-            "fail-open: the host serves on the carried amount"
+        let refused = accept_verdict(PaymentVerdict::Unverifiable {
+            satoshis: 9,
+            reason: "HTTP 503".into(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&refused, PaymentVerifyError::Unverifiable { satoshis: 9, reason }
+                if reason == "HTTP 503"),
+            "fail-closed: {refused:?}"
+        );
+        let text = refused.to_string();
+        assert!(
+            text.contains("not verified") && text.contains("HTTP 503") && text.contains("quote"),
+            "{text}"
         );
         assert!(matches!(
             accept_verdict(PaymentVerdict::Underpaid {
@@ -1272,7 +1336,8 @@ mod tests {
     /// End to end on a correct, proven payment with the header service
     /// injected: the lookup is asked exactly once, at the proof's height; a
     /// matching header accepts, a different one is `RootMismatch` naming the
-    /// height and root, and a service error fails open to the paid amount.
+    /// height and root, and a service error is refused as `Unverifiable`
+    /// carrying the paid amount and the reason (fail-closed).
     #[tokio::test]
     async fn test_full_verification_spv_outcomes_table() {
         let (_, txid) = beef_with_proven_payment(&our_script(), 1000);
@@ -1293,9 +1358,48 @@ mod tests {
         );
         assert_eq!(asked, vec![PROOF_HEIGHT]);
 
-        let (ok, asked) = verify_proven_with(Err("fetch height: timeout".to_string())).await;
-        assert_eq!(ok.unwrap(), 1000, "a service error fails open");
+        let (refused, asked) = verify_proven_with(Err("fetch height: timeout".to_string())).await;
+        let refused = refused.unwrap_err();
+        assert!(
+            matches!(&refused, PaymentVerifyError::Unverifiable { satoshis: 1000, reason }
+                if reason.contains("timeout") && reason.contains(&PROOF_HEIGHT.to_string())),
+            "a service error fails closed: {refused:?}"
+        );
         assert_eq!(asked, vec![PROOF_HEIGHT]);
+    }
+
+    /// A lookup that never answers refuses every proven payment: there is
+    /// no accidental structural-only path through the lookup form. The named
+    /// opt-out is the one function that serves with roots unchecked, and it
+    /// says so in its log, not in its result.
+    #[test]
+    fn test_structural_only_is_the_named_opt_out_and_serves_by_name() {
+        let (proven, _) = beef_with_proven_payment(&our_script(), 1000);
+        let served = verify_brc29_payment_structural_only(
+            SERVER_KEY,
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &proven,
+            0,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(served, 1000, "opted out of SPV by name");
+
+        // The other words still refuse through the same function.
+        let short = beef_with_unproven_payment(&our_script(), 999);
+        let err = verify_brc29_payment_structural_only(
+            SERVER_KEY,
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &short,
+            0,
+            1000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PaymentVerifyError::Underpaid { .. }), "{err}");
     }
 
     /// `verify_brc29_payment` with no usable header service is

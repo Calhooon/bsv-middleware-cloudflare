@@ -828,7 +828,7 @@
       }
     },
     {
-      "crate_result": "Ok(1000)",
+      "crate_result": "Err(Unverifiable { satoshis: 1000, reason: \"the header service could not answer for 1 root(s): height 850000: header service HTTP 503 at height 850000\" })",
       "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
       "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
       "description": "The header service cannot answer (HTTP 503).",
@@ -836,7 +836,7 @@
         "fields": {
           "satoshis": 1000
         },
-        "word": "AcceptedUnverified"
+        "word": "Unverifiable"
       },
       "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
       "header_service": {
@@ -847,7 +847,7 @@
         "url": "https://headers.example"
       },
       "name": "spv-lookup-error",
-      "note": "Fail-open: the crate returns Ok(satoshis) and logs a warning; the root was NOT checked. The word says so; the API result alone cannot tell this from Verified.",
+      "note": "Fail-closed (ruled 2026-10-08): the root was NOT checked, so the crate refuses with Err(Unverifiable) carrying the output's satoshis and the reason; the host answers a 5xx and keeps the quote for a retry. 0.3.x accepted this case with a logged warning.",
       "output_index": 0,
       "required_satoshis": 1000,
       "requires_merkle_lookup": true,
@@ -893,5 +893,14 @@
     "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
     "Verified": "Accept. fields.satoshis = the output's satoshis.",
     "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script."
-  }
+  },
+  "rulings": [
+    {
+      "date": "2026-10-08",
+      "case": "spv-lookup-error",
+      "word": "Unverifiable",
+      "by": "the owner",
+      "why": "fail closed on a header lookup error: a merkle root that was not checked against a block header is not evidence, so the verifier refuses instead of accepting with a warning; the Cloudflare crate fails closed from 0.3.9 and 0.4.0"
+    }
+  ]
 }

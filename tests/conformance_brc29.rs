@@ -14,6 +14,13 @@
 //! `the_cores_copy_of_the_vectors_is_byte_identical` pins them equal, so
 //! the root copy stays canonical.
 //!
+//! The file is a cross-repository agreement whose canonical copy is owned by
+//! the stack review repository; this emitter reproduces that copy byte for
+//! byte except the `producer` line and, on the one ruled case, the fields
+//! that record this crate's own answer (`crate_result`, `note`). The
+//! `rulings` list (`RULINGS`) carries the owner's ruling: date, case, word
+//! and `by` verbatim, `why` in this crate's public wording.
+//!
 //! Regenerate (only when a case is added or the verifier's answer changes on
 //! purpose): `cargo test --test conformance_brc29 -- --ignored emit`.
 
@@ -132,23 +139,15 @@ async fn run_case(case: &Value) -> Outcome {
     }
 }
 
-/// The conformance word for an outcome. `Ok` is `AcceptedUnverified` when
-/// the lookup was asked and every answer failed (the fail-open path), else
-/// `Verified`.
-fn word_of(outcome: &Outcome, lookup: &Value) -> (String, Value) {
+/// The conformance word for an outcome. `Ok` is `Verified` and nothing
+/// else: since 0.4.0 the crate serves on no other word. A root the lookup
+/// could not answer is `Unverifiable`, an `Err` (fail-closed, the ruling of
+/// 2026-10-08), carrying the output's satoshis as the file's `fields`.
+fn word_of(outcome: &Outcome) -> (String, Value) {
     match &outcome.result {
-        Ok(sats) => {
-            let all_failed = !outcome.asked.is_empty()
-                && outcome
-                    .asked
-                    .iter()
-                    .all(|h| lookup_answer(lookup, *h).is_err());
-            let word = if all_failed {
-                "AcceptedUnverified"
-            } else {
-                "Verified"
-            };
-            (word.into(), json!({ "satoshis": sats }))
+        Ok(sats) => ("Verified".into(), json!({ "satoshis": sats })),
+        Err(PaymentVerifyError::Unverifiable { satoshis, .. }) => {
+            ("Unverifiable".into(), json!({ "satoshis": satoshis }))
         }
         Err(PaymentVerifyError::Underpaid { satoshis, required }) => (
             "Underpaid".into(),
@@ -223,12 +222,24 @@ async fn every_brc29_vector_gives_its_word() {
         check_case_is_self_consistent(case, name);
 
         let outcome = run_case(case).await;
-        let (word, fields) = word_of(&outcome, &case["header_service"]["lookup"]);
+        let (word, fields) = word_of(&outcome);
         let expected = &case["expected"];
         if word != s(expected, "word") || fields != expected["fields"] {
             mismatches.push(format!(
                 "{name}: intended {} {}, crate gave {word} {fields}",
                 expected["word"], expected["fields"]
+            ));
+        }
+        // The outcome, not only the spelling: `Verified` is the one word
+        // the 0.3 API answers `Ok`; every other word, `Unverifiable`
+        // included, is an `Err` (refused).
+        let serves = s(expected, "word") == "Verified";
+        if outcome.result.is_ok() != serves {
+            mismatches.push(format!(
+                "{name}: {} must {}, crate gave {}",
+                expected["word"],
+                if serves { "serve (Ok)" } else { "refuse (Err)" },
+                crate_result_of(&outcome.result)
             ));
         }
         let got = crate_result_of(&outcome.result);
@@ -259,13 +270,10 @@ async fn every_brc29_vector_gives_its_word() {
                 u(case, "output_index") as usize,
                 u(case, "required_satoshis"),
             );
-            let (pure_word, pure_fields) = word_of(
-                &Outcome {
-                    result: pure,
-                    asked: Vec::new(),
-                },
-                &Value::Null,
-            );
+            let (pure_word, pure_fields) = word_of(&Outcome {
+                result: pure,
+                asked: Vec::new(),
+            });
             if pure_word != word || pure_fields != fields {
                 mismatches.push(format!(
                     "{name}: output-only check gave {pure_word} {pure_fields}, full gave {word} {fields}"
@@ -278,6 +286,37 @@ async fn every_brc29_vector_gives_its_word() {
         "conformance mismatches:\n{}",
         mismatches.join("\n")
     );
+}
+
+/// The ruling the file records, as the owner's `rulings` list: the
+/// lookup-error case expects `Unverifiable`, the case agrees with its
+/// ruling, and the list is the verbatim text this emitter carries.
+#[test]
+fn the_lookup_error_case_is_ruled_unverifiable() {
+    let doc: Value = serde_json::from_str(PINNED).unwrap();
+    let rulings = doc["rulings"].as_array().expect("a rulings list");
+    assert_eq!(rulings.len(), 1);
+    let ruling = &rulings[0];
+    assert_eq!(s(ruling, "case"), "spv-lookup-error");
+    assert_eq!(s(ruling, "word"), "Unverifiable");
+    assert_eq!(s(ruling, "date"), "2026-10-08");
+    for key in ["date", "case", "word", "by", "why"] {
+        assert!(ruling[key].is_string(), "a ruling carries {key}");
+    }
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| s(c, "name") == "spv-lookup-error")
+        .expect("the ruled case");
+    assert_eq!(s(&case["expected"], "word"), "Unverifiable");
+    assert!(
+        s(case, "crate_result").starts_with("Err(Unverifiable"),
+        "{}",
+        case["crate_result"]
+    );
+    let words = doc["words"].as_object().unwrap();
+    assert_eq!(words.len(), 6, "six words in the glossary");
 }
 
 #[tokio::test]
@@ -579,9 +618,9 @@ fn case_defs() -> Vec<CaseDef> {
         (
             "spv-lookup-error",
             Lookup::Error,
-            "AcceptedUnverified",
+            "Unverifiable",
             "The header service cannot answer (HTTP 503).",
-            "Fail-open: the crate returns Ok(satoshis) and logs a warning; the root was NOT checked. The word says so; the API result alone cannot tell this from Verified.",
+            "Fail-closed (ruled 2026-10-08): the root was NOT checked, so the crate refuses with Err(Unverifiable) carrying the output's satoshis and the reason; the host answers a 5xx and keeps the quote for a retry. 0.3.x accepted this case with a logged warning.",
         ),
     ] {
         defs.push(CaseDef {
@@ -596,7 +635,7 @@ fn case_defs() -> Vec<CaseDef> {
 fn expected_fields(word: &str, def: &CaseDef, expected_script: &str, root: &str) -> Value {
     let out = &def.outputs[def.output_index as usize];
     match word {
-        "Verified" | "AcceptedUnverified" => json!({ "satoshis": out.1 }),
+        "Verified" | "Unverifiable" => json!({ "satoshis": out.1 }),
         "Underpaid" => json!({ "paid": out.1, "required": PRICE }),
         "WrongScript" => json!({ "expected_script": expected_script, "actual_script": out.0 }),
         "NoHeaderService" => json!({}),
@@ -689,6 +728,22 @@ async fn build_vectors() -> String {
         "cases": cases,
     });
     let mut text = serde_json::to_string_pretty(&doc).unwrap();
-    text.push('\n');
+    // The owner's rulings, appended after the sorted keys exactly as the
+    // canonical copy carries them (its own key order, not serde's).
+    let body = text
+        .strip_suffix("\n}")
+        .expect("a pretty-printed object ends with a newline and a brace");
+    text = format!("{body},\n{RULINGS}\n}}\n");
     text
 }
+
+/// The owner's `rulings` list, verbatim: date, case, word, by, why.
+const RULINGS: &str = r#"  "rulings": [
+    {
+      "date": "2026-10-08",
+      "case": "spv-lookup-error",
+      "word": "Unverifiable",
+      "by": "the owner",
+      "why": "fail closed on a header lookup error: a merkle root that was not checked against a block header is not evidence, so the verifier refuses instead of accepting with a warning; the Cloudflare crate fails closed from 0.3.9 and 0.4.0"
+    }
+  ]"#;

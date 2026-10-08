@@ -11,11 +11,14 @@
 //! are byte-identical, so the root copy stays the canonical one. This
 //! runner reads it the way a second implementation does: from
 //! JSON only, comparing `expected.word` and `expected.fields`. The six
-//! words are the core's [`PaymentVerdict`], with one spelling difference the
-//! file documents: its `AcceptedUnverified` is the core's `Unverifiable`
-//! (the fail-open case, which the core hands to the host as a word instead
-//! of accepting). `config` cases carry the adapter's URL gate's refusal: the
-//! core has no URL, so a refused configuration is `None` service.
+//! words are the core's [`PaymentVerdict`]; `spv-lookup-error` expects
+//! `Unverifiable`, a refusal (the ruling of 2026-10-08, recorded in the
+//! file's `rulings`), and this runner checks that the core's answer there
+//! is refused, not only spelled right. The file's `words` glossary still
+//! carries the retired spelling `AcceptedUnverified` for that word; it is
+//! the file owner's to rename. `config` cases carry the adapter's URL
+//! gate's refusal: the core has no URL, so a refused configuration is
+//! `None` service.
 
 use std::cell::RefCell;
 
@@ -64,7 +67,7 @@ fn word_of(answer: &Result<PaymentVerdict, PaymentFault>) -> (String, Value) {
             ("Verified".into(), json!({ "satoshis": satoshis }))
         }
         Ok(PaymentVerdict::Unverifiable { satoshis, .. }) => {
-            ("AcceptedUnverified".into(), json!({ "satoshis": satoshis }))
+            ("Unverifiable".into(), json!({ "satoshis": satoshis }))
         }
         Ok(PaymentVerdict::Underpaid { paid, required }) => (
             "Underpaid".into(),
@@ -203,6 +206,20 @@ async fn every_brc29_vector_gives_its_word_through_the_trait() {
                 expected["word"], expected["fields"]
             ));
         }
+        // The outcome, not only the spelling: `Verified` is the one word
+        // that serves; every other word, `Unverifiable` included, is refused.
+        if let Ok(verdict) = &answer {
+            let serves = s(expected, "word") == "Verified";
+            if verdict.is_verified() != serves || verdict.is_refused() == serves {
+                mismatches.push(format!(
+                    "{name}: {} must {} but the core's predicates say verified={} refused={}",
+                    expected["word"],
+                    if serves { "serve" } else { "refuse" },
+                    verdict.is_verified(),
+                    verdict.is_refused()
+                ));
+            }
+        }
         if !case["requires_merkle_lookup"].as_bool().unwrap() {
             assert!(
                 asked.is_empty() || word == "Verified",
@@ -245,8 +262,9 @@ async fn every_brc29_vector_gives_its_word_through_the_trait() {
     );
 }
 
-/// The file's six words are the core's six, with the one documented
-/// spelling (`AcceptedUnverified` ↔ `Unverifiable`).
+/// The file's six words are the core's six; the glossary still spells
+/// `Unverifiable` by its retired name `AcceptedUnverified` (the file
+/// owner's to rename), while the ruled case uses the core's word.
 #[test]
 fn the_vector_words_are_the_cores_words() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
@@ -293,4 +311,35 @@ fn the_vector_words_are_the_cores_words() {
         .collect();
     spelled.sort_unstable();
     assert_eq!(file_words, spelled);
+}
+
+/// The ruling the file records: `spv-lookup-error` expects `Unverifiable`
+/// (fail closed), the case agrees with its ruling, and the ruled word is one
+/// of the core's six. A second implementation reads the same list.
+#[test]
+fn the_lookup_error_case_is_ruled_unverifiable() {
+    let doc: Value = serde_json::from_str(VECTORS).unwrap();
+    let rulings = doc["rulings"].as_array().expect("a rulings list");
+    let ruling = rulings
+        .iter()
+        .find(|r| s(r, "case") == "spv-lookup-error")
+        .expect("the lookup-error ruling");
+    assert_eq!(s(ruling, "word"), "Unverifiable");
+    assert_eq!(s(ruling, "date"), "2026-10-08");
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| s(c, "name") == "spv-lookup-error")
+        .expect("the case");
+    assert_eq!(s(&case["expected"], "word"), "Unverifiable");
+    assert_eq!(s(&case["header_service"]["lookup"], "answer"), "error");
+    assert_eq!(
+        PaymentVerdict::Unverifiable {
+            satoshis: 0,
+            reason: String::new()
+        }
+        .word(),
+        s(ruling, "word")
+    );
 }

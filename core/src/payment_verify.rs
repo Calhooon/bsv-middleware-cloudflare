@@ -16,13 +16,15 @@
 //!   3. SPV through the [`HeaderService`]: a root that differs from its
 //!      header is [`RootMismatch`](PaymentVerdict::RootMismatch); a root the
 //!      service could not answer makes the verdict
-//!      [`Unverifiable`](PaymentVerdict::Unverifiable) (the host decides);
-//!      every root matched is [`Verified`](PaymentVerdict::Verified).
+//!      [`Unverifiable`](PaymentVerdict::Unverifiable), a refusal (the host
+//!      fails closed: rule of 2026-10-08); every root matched is
+//!      [`Verified`](PaymentVerdict::Verified).
 //!
 //! [`verify_brc29_payment_structural_only`] is the named opt-out: steps 1 and
 //! 2 only. A proof with roots is answered `Unverifiable` with a reason that
-//! says they went unchecked by choice; a host that serves on it does so by
-//! name.
+//! says they went unchecked by choice. That is the one `Unverifiable` a host
+//! may serve on, and only because its caller named the opt-out; through
+//! [`verify_brc29_payment`] the same word is always a refusal.
 
 use crate::brc29::verify_payment_output;
 use crate::header_service::HeaderService;
@@ -31,7 +33,9 @@ use crate::verdict::{PaymentFault, PaymentVerdict};
 
 /// Full pre-service payment verification: pays-us-correctly **and**
 /// real-and-confirmable, through `service`. See the module docs for the
-/// order of checks. `None` is `NoHeaderService` (fail closed).
+/// order of checks. `None` is `NoHeaderService` (fail closed); a service
+/// that cannot answer for a root is `Unverifiable` (fail closed as well: the
+/// host refuses and keeps the quote).
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment<H: HeaderService + ?Sized>(
     server_key: &str,
@@ -88,8 +92,10 @@ pub async fn verify_brc29_payment<H: HeaderService + ?Sized>(
 /// and is caught only by whatever the host's broadcast or internalize step
 /// does later. A proof carrying roots is therefore answered
 /// [`Unverifiable`](PaymentVerdict::Unverifiable), never
-/// [`Verified`](PaymentVerdict::Verified); a proof with no root to check is
-/// `Verified`, as it would be through a service.
+/// [`Verified`](PaymentVerdict::Verified), so the skip is visible in the
+/// word; a host that serves on this answer does so because its caller named
+/// this function. A proof with no root to check is `Verified`, as it would
+/// be through a service.
 pub fn verify_brc29_payment_structural_only(
     server_key: &str,
     sender_identity_key: &str,

@@ -16,7 +16,6 @@
 use crate::client::WorkerStorageClient;
 use crate::error::{AuthCloudflareError, Result};
 use crate::middleware::auth::{add_cors_headers, sign_json_response, AuthSession};
-use crate::payment_verify::accept_verdict;
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::types::{AuthContext, BsvPayment, ErrorResponse, PaymentContext};
 use bsv_middleware_core::{verify_payment_output, PaymentFault, PaymentVerdict};
@@ -200,9 +199,12 @@ where
 ///    so the client corrects the payment and retries under the same prefix
 ///    (0.4.0; 0.3.8 answered 402 with a fresh challenge). An unreadable
 ///    payment, or a proof contradicting a block header, is 400 as well; a
-///    server that cannot judge (`NoHeaderService`) 500; `Unverifiable`
-///    takes the adapter's [`accept_verdict`] policy. `satoshis_paid` is the
-///    amount read, not the price.
+///    server that cannot judge (`NoHeaderService`) 500; a root the header
+///    service could not check (`Unverifiable`) is refused with
+///    503 `ERR_HEADER_SERVICE_UNAVAILABLE` and the quote kept (fail-closed,
+///    0.4.0: nothing is served on an unchecked root; the client retries the
+///    same payment later). `satoshis_paid` is the amount read, not the
+///    price.
 ///
 ///    This path runs no SPV of its own: output 0's script and amount are
 ///    checked here, and nothing on this path checks the transaction's
@@ -373,6 +375,13 @@ enum PaymentDecision {
     /// fault, never a client error; the prefix is not consumed
     /// ([`PaymentResult::Failed`]).
     ServerFault { description: String },
+    /// The header service could not answer for a merkle root (the core
+    /// answered `Unverifiable`) → 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the
+    /// quote kept: a transient server-side condition, nothing served on an
+    /// unchecked root (fail-closed), no fresh challenge, the prefix not
+    /// consumed, the wallet not called; the client retries the same payment
+    /// later ([`PaymentResult::Failed`]).
+    HeaderServiceUnavailable { description: String },
     /// Wallet accepted → [`PaymentResult::Verified`]; `satoshis_paid` is
     /// read from the paying output.
     Verified { satoshis_paid: u64, tx: String },
@@ -390,7 +399,16 @@ enum OutputJudgement {
     Invalid { description: String },
     /// 500 `ERR_SERVER_MISCONFIGURED`; the prefix is kept.
     ServerFault { description: String },
+    /// 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: the root could
+    /// not be checked, so nothing is served (fail-closed); the client
+    /// retries the same payment once the service answers.
+    HeaderServiceUnavailable { description: String },
 }
+
+/// The wire pair for a root the header service could not check: a 503, the
+/// server's transient condition, distinct from the 500 of a server that has
+/// no header service at all and from the 400s of a payment that is wrong.
+const HEADER_SERVICE_UNAVAILABLE: (u16, &str) = (503, "ERR_HEADER_SERVICE_UNAVAILABLE");
 
 /// The one match on this path from the core's words (and faults) to what
 /// the middleware answers:
@@ -401,12 +419,12 @@ enum OutputJudgement {
 /// | `Underpaid` / `WrongScript` | 400, the quote kept: no fresh challenge, prefix not consumed, wallet not called |
 /// | `NoHeaderService` | 500: the server's own fault |
 /// | `RootMismatch` | 400: a proof that contradicts a block header is a fraud signal, refused |
-/// | `Unverifiable` | the adapter's documented policy, [`accept_verdict`] (0.4: accepted, logged) |
+/// | `Unverifiable` | 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: refused, fail-closed (0.4.0); the client retries later |
 /// | a `PaymentFault` | 400: unreadable, no such output, keys that do not derive, incomplete proof |
 ///
-/// The output check ([`verify_payment_output`]) answers `Verified`,
-/// `Underpaid`, `WrongScript` or a fault; the SPV words are the path's
-/// standing answer should the check grow a proof step.
+/// Only `Verified` serves. The output check ([`verify_payment_output`])
+/// answers `Verified`, `Underpaid`, `WrongScript` or a fault; the SPV words
+/// are the path's standing answer should the check grow a proof step.
 fn judge_paying_output(
     answer: std::result::Result<PaymentVerdict, PaymentFault>,
 ) -> OutputJudgement {
@@ -425,16 +443,14 @@ fn judge_paying_output(
         Ok(verdict @ PaymentVerdict::RootMismatch { .. }) => OutputJudgement::Invalid {
             description: verdict.to_string(),
         },
-        // The adapter's policy decides this word; were the policy to become
-        // a refusal, it is rendered here as an invalid payment.
-        Ok(verdict @ PaymentVerdict::Unverifiable { .. }) => match accept_verdict(verdict) {
-            Ok(satoshis) => OutputJudgement::Covered {
-                satoshis_paid: satoshis,
-            },
-            Err(refusal) => OutputJudgement::Invalid {
-                description: refusal.to_string(),
-            },
-        },
+        // A root that could not be checked is not evidence: refused, as the
+        // server's transient condition (503) with the quote kept, never
+        // served and never blamed on the client (fail-closed, 0.4.0).
+        Ok(verdict @ PaymentVerdict::Unverifiable { .. }) => {
+            OutputJudgement::HeaderServiceUnavailable {
+                description: verdict.to_string(),
+            }
+        }
         Err(fault) => OutputJudgement::Invalid {
             description: fault.to_string(),
         },
@@ -554,6 +570,9 @@ where
         }
         OutputJudgement::ServerFault { description } => {
             return Ok(PaymentDecision::ServerFault { description })
+        }
+        OutputJudgement::HeaderServiceUnavailable { description } => {
+            return Ok(PaymentDecision::HeaderServiceUnavailable { description })
         }
     };
 
@@ -708,6 +727,14 @@ fn decision_into_result(decision: PaymentDecision) -> Result<PaymentResult> {
         PaymentDecision::ServerFault { description } => {
             failed_json_response(500, "ERR_SERVER_MISCONFIGURED", &description)
         }
+        PaymentDecision::HeaderServiceUnavailable { description } => {
+            let (status, code) = HEADER_SERVICE_UNAVAILABLE;
+            failed_json_response(
+                status,
+                code,
+                &header_service_unavailable_description(&description),
+            )
+        }
         PaymentDecision::Verified { satoshis_paid, tx } => {
             Ok(PaymentResult::Verified(PaymentContext {
                 satoshis_paid,
@@ -798,6 +825,14 @@ fn decision_into_result_signed(
         PaymentDecision::ServerFault { description } => {
             signed_failed(500, "ERR_SERVER_MISCONFIGURED", &description)
         }
+        PaymentDecision::HeaderServiceUnavailable { description } => {
+            let (status, code) = HEADER_SERVICE_UNAVAILABLE;
+            signed_failed(
+                status,
+                code,
+                &header_service_unavailable_description(&description),
+            )
+        }
         PaymentDecision::Verified { satoshis_paid, tx } => {
             Ok(PaymentResult::Verified(PaymentContext {
                 satoshis_paid,
@@ -806,6 +841,15 @@ fn decision_into_result_signed(
             }))
         }
     }
+}
+
+/// The 503 body description for a root the header service could not check:
+/// nothing was charged, the quote stands, the client retries the SAME
+/// payment later (not a corrected one: the payment may well be right).
+fn header_service_unavailable_description(detail: &str) -> String {
+    format!(
+        "{detail}. The server could not check the payment's proof against a block header, so it was not accepted; nothing was charged and the challenge is unchanged. Retry the same payment later under the same derivation prefix."
+    )
 }
 
 /// The 400 body description for a payment that does not cover the price:
@@ -1389,14 +1433,33 @@ mod tests {
             );
         }
 
+        /// Fail-closed (0.4.0): a root the header service could not check
+        /// is never served. It is the server's transient condition, so the
+        /// answer is a 503 of its own (not the 500 of a missing service, not
+        /// a 400 blaming the client), the quote kept for a retry of the same
+        /// payment.
         #[test]
-        fn unverifiable_takes_the_adapters_accept_verdict_policy() {
-            // 0.4: accepted with the reason logged (`payment_verify::accept_verdict`).
+        fn unverifiable_is_refused_as_header_service_unavailable_with_the_quote_kept() {
             let j = judge_paying_output(Ok(PaymentVerdict::Unverifiable {
                 satoshis: 7,
                 reason: "HTTP 503".into(),
             }));
-            assert_eq!(covered(j), 7);
+            assert!(
+                matches!(&j, OutputJudgement::HeaderServiceUnavailable { description }
+                    if description.contains("HTTP 503") && description.contains("7 satoshis")),
+                "{j:?}"
+            );
+            assert_eq!(
+                HEADER_SERVICE_UNAVAILABLE,
+                (503, "ERR_HEADER_SERVICE_UNAVAILABLE")
+            );
+            let body = header_service_unavailable_description("detail");
+            assert!(
+                body.starts_with("detail.")
+                    && body.contains("nothing was charged")
+                    && body.contains("same derivation prefix"),
+                "{body}"
+            );
         }
 
         #[test]

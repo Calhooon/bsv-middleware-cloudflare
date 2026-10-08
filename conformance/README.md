@@ -15,7 +15,10 @@ reserved names.
 ## Schema (`brc29-payment-vectors/1`)
 
 Top level: `schema`, `producer`, `description`, `words` (the six outcome words, defined below), `derivation` (how the
-expected script is derived), `cases`.
+expected script is derived), `cases`, and `rulings` (the file owner's rulings on a case's word: `date`, `case`, `word`,
+`by`, `why`; a ruled case's `expected.word` is the ruled word). The canonical copy of this file is owned by the stack
+review repository; this crate's emitter reproduces it byte for byte except the `producer` line, the ruling's `why`
+(public wording here) and, on a ruled case, `crate_result` and `note`, which record this crate's own answer.
 
 Each case:
 
@@ -43,16 +46,18 @@ Each case:
 | Word | Accept? | `fields` | crate (`PaymentVerifyError`) |
 |---|---|---|---|
 | `Verified` | yes | `satoshis` (the output's amount, which may exceed the price) | `Ok(satoshis)` |
-| `AcceptedUnverified` | yes, root **not** checked | `satoshis` | `Ok(satoshis)` + a logged warning |
+| `Unverifiable` (the glossary still spells it `AcceptedUnverified`, its retired name) | **no**: the root could not be checked (fail-closed, ruled 2026-10-08; 503-class at the host, the quote kept) | `satoshis` | `Unverifiable { satoshis, reason }` + a logged warning |
 | `Underpaid` | no | `paid`, `required` | `Underpaid { satoshis, required }` |
 | `WrongScript` | no | `expected_script`, `actual_script` | `WrongScript { expected, actual }` |
 | `NoHeaderService` | no (server misconfigured, 500-class) | none | `NoHeaderService` |
 | `RootMismatch` | no (fraud signal) | `height`, `merkle_root` (the proof's root) | `RootMismatch { height, root }` |
 
-`AcceptedUnverified` is the fail-open path: the header service could not answer, so the payment is accepted on the
-script, amount and BEEF structure alone. The crate's API returns the same `Ok(satoshis)` as `Verified`; the runner
-tells them apart by whether every lookup it was asked failed. An implementation that fails closed on lookup errors
-instead would answer a refusal here, which is a deliberate, visible divergence.
+`Unverifiable` is the header service's failure to answer: the root was not checked, and an unchecked root is not
+evidence, so the payment is **refused** (the ruling of 2026-10-08, recorded in `rulings`). It is the server's
+condition, not the client's fault: a host answers 5xx (this crate's middleware: `503 ERR_HEADER_SERVICE_UNAVAILABLE`)
+and keeps the quote, so the client retries the same payment once the service answers. Until 0.3.8 this crate
+accepted the case with a logged warning under the word `AcceptedUnverified`; that word is retired, and the `words`
+glossary still carries its entry until the file owner renames it. `Verified` is the only word that serves.
 
 ## Order of checks
 
@@ -62,8 +67,8 @@ instead would answer a refusal here, which is a deliberate, visible divergence.
 2. **output**: parse the BEEF, take output `output_index`; its script must equal `expected_locking_script`
    (`WrongScript`), then its satoshis must be `>= required_satoshis` (`Underpaid`). Script is checked before amount.
 3. **spv**: the BEEF must be structurally complete; for each merkle root (lowest height first) ask the header
-   service; a different root is `RootMismatch`, an error is fail-open (`AcceptedUnverified`), a case-insensitive
-   match continues. All roots matched is `Verified`.
+   service; a different root is `RootMismatch`, an error (or a height the service has not indexed) is `Unverifiable`
+   (refused, fail-closed), a case-insensitive match continues. All roots matched is `Verified`.
 
 ## Running it from a second implementation
 
@@ -87,7 +92,7 @@ Only these four (`stage: "spv"`, `requires_merkle_lookup: true`):
 
 - `spv-root-match`, `spv-root-match-uppercase` → `Verified`
 - `spv-root-mismatch` → `RootMismatch`
-- `spv-lookup-error` → `AcceptedUnverified`
+- `spv-lookup-error` → `Unverifiable` (refused; ruled 2026-10-08)
 
 The six `no-header-service-*` cases need a configuration gate but no lookup. The other ten need neither.
 

@@ -4,10 +4,13 @@
 //! root it could not check.
 //!
 //! A host collapses the words to "serve" or "refuse" in ONE visible match.
-//! [`PaymentVerdict::NoHeaderService`] is the server's own fault and is
-//! answered as a 5xx, never as a client error; [`PaymentVerdict::Unverifiable`]
-//! is the word the host decides on (fail open with the carried amount, or
-//! fail closed): the core never serves on it.
+//! Only [`PaymentVerdict::Verified`] serves. [`PaymentVerdict::NoHeaderService`]
+//! is the server's own fault and is answered as a 5xx, never as a client
+//! error. [`PaymentVerdict::Unverifiable`] is a refusal too, by the rule
+//! adopted on 2026-10-08: a root that could not be checked is not evidence,
+//! so the host fails closed on it (a 5xx of its own: the payment may be good
+//! and the server could not check it, so the quote is kept for a retry). The
+//! core never serves on it, and neither may a host.
 
 use std::fmt;
 
@@ -35,10 +38,15 @@ pub enum PaymentVerdict {
     RootMismatch { height: u32, root: String },
     /// The output pays correctly and the proof is complete, but at least one
     /// merkle root was NOT checked against a block header: the service could
-    /// not answer, or the caller opted out of SPV by name
+    /// not answer (an outage, a timeout, an HTTP error, an unparseable body,
+    /// a height not yet indexed), or the caller opted out of SPV by name
     /// ([`verify_brc29_payment_structural_only`](crate::verify_brc29_payment_structural_only)).
-    /// `reason` says which. The host decides what to do with it; the core
-    /// never serves on it.
+    /// `reason` says which. A refusal (rule of 2026-10-08): a host fails
+    /// closed on it and answers a 5xx with the quote kept, since the payment
+    /// may be good and only the check is missing. `satoshis` is carried for
+    /// the log and the body, never to serve on. The one place a host may
+    /// serve with roots unchecked is the named opt-out, and only because the
+    /// caller named it.
     Unverifiable { satoshis: u64, reason: String },
 }
 
@@ -56,10 +64,21 @@ impl PaymentVerdict {
     }
 
     /// `true` only for [`Verified`](Self::Verified): the one word the core
-    /// itself stands behind. Every other word is a refusal or a decision the
-    /// host owns.
+    /// stands behind and the one word a host may serve on. Every other word
+    /// is a refusal, [`Unverifiable`](Self::Unverifiable) included (fail
+    /// closed, rule of 2026-10-08). This is the only accept predicate the
+    /// core offers; there is no `is_accepted` that answers differently.
     pub fn is_verified(&self) -> bool {
         matches!(self, PaymentVerdict::Verified { .. })
+    }
+
+    /// `true` for every word but [`Verified`](Self::Verified): the payment
+    /// is not served. [`Unverifiable`](Self::Unverifiable) is refused like
+    /// the rest; what differs is only how a host renders it (a 5xx with the
+    /// quote kept, since the server could not check rather than the client
+    /// having paid wrong).
+    pub fn is_refused(&self) -> bool {
+        !self.is_verified()
     }
 }
 
@@ -182,15 +201,37 @@ mod tests {
         );
     }
 
+    /// The one accept predicate: `Verified` alone. Every other word, the
+    /// carried-amount `Unverifiable` included, is refused: no helper in the
+    /// core answers "accepted" for a root that was not checked.
     #[test]
-    fn only_verified_is_verified() {
-        assert!(PaymentVerdict::Verified { satoshis: 5 }.is_verified());
-        assert!(!PaymentVerdict::Unverifiable {
-            satoshis: 5,
-            reason: "x".into()
+    fn only_verified_is_verified_every_other_word_is_refused() {
+        let verified = PaymentVerdict::Verified { satoshis: 5 };
+        assert!(verified.is_verified());
+        assert!(!verified.is_refused());
+        let refused = [
+            PaymentVerdict::Underpaid {
+                paid: 4,
+                required: 5,
+            },
+            PaymentVerdict::WrongScript {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+            PaymentVerdict::NoHeaderService,
+            PaymentVerdict::RootMismatch {
+                height: 1,
+                root: "c".into(),
+            },
+            PaymentVerdict::Unverifiable {
+                satoshis: 5,
+                reason: "HTTP 503".into(),
+            },
+        ];
+        for word in refused {
+            assert!(!word.is_verified(), "{word:?}");
+            assert!(word.is_refused(), "{word:?} is a refusal, fail closed");
         }
-        .is_verified());
-        assert!(!PaymentVerdict::NoHeaderService.is_verified());
     }
 
     #[test]

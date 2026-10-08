@@ -38,11 +38,26 @@ async fn the_fleet_payment_verify_call_sites_compile_unchanged() {
         }
         Err(e) => Err(e),
     };
-    let (status, code) = match answer.unwrap_err() {
+    let render = |err: PaymentVerifyError| match err {
         PaymentVerifyError::NoHeaderService => (500u16, "ERR_SERVER_MISCONFIGURED"),
         _ => (400u16, "ERR_PAYMENT_INVALID"),
     };
-    assert_eq!((status, code), (500, "ERR_SERVER_MISCONFIGURED"));
+    assert_eq!(
+        render(answer.unwrap_err()),
+        (500, "ERR_SERVER_MISCONFIGURED")
+    );
+    // 0.4.0 adds `Unverifiable` (a header lookup the service could not
+    // answer, refused: fail-closed). The fleet's match above compiles
+    // unchanged because of its `_` arm, and that arm answers the client's
+    // 400 today; the hosts' follow-up is a 503 arm for it, the quote kept.
+    assert_eq!(
+        render(PaymentVerifyError::Unverifiable {
+            satoshis: 1000,
+            reason: "header service HTTP 503".into(),
+        }),
+        (400, "ERR_PAYMENT_INVALID"),
+        "what a two-arm host answers today; a 503 arm is the hosts' change"
+    );
 
     let output: Result<u64, PaymentVerifyError> =
         verify_brc29_payment_output(KEY, "02", "prefix", "suffix", &tx, 0, 1000);
