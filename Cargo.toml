@@ -18,8 +18,8 @@ worker = "0.8"
 # BSV SDK
 bsv-sdk = { package = "bsv-rs", version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
 # The shared payment check (P0-3): the paying output compared with the price.
-# The path is the lane's worktree; replace it with the published 0.2.1.
-bsv-middleware-rs = { version = "0.2.1", path = "../payment-amount-check-middleware-rs" }
+# Pinned to the main commit that carries the check; replace with version = "0.2.1" once published.
+bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs.git", rev = "20c1a650dd7ad4e77d06c2127c62bc580015f82d" }
 
 # Async
 futures = "0.3"
