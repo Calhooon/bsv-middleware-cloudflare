@@ -17,7 +17,7 @@ patch versions are additive unless a line below says otherwise.
   `ERR_INVALID_AUTH` (the header's identity is not the session's; the signature is missing or does not verify; the
   session never completed its handshake; a general message without `x-bsv-auth-nonce`; headers that do not form a
   BRC-103 message; a handshake message refused: an unparseable body, a certificate message whose signature or
-  certificates fail), `ERR_REPLAYED_REQUEST` (the per-request nonce already used). 0.4.0 raised three of these as
+  certificates fail), `ERR_REPLAYED_REQUEST` (the per-request nonce already used). 0.4.0 raised four of these as
   `Err(AuthCloudflareError::InvalidAuthentication(..))` ("Message identity key is not the session's", "Invalid
   message signature", "Session not authenticated"), and the transport's header refusals and the handshake path's
   refusals likewise; every host rendered an `Err` as a generic 500, so the clients that re-handshake on 401 only
