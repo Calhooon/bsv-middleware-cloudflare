@@ -146,6 +146,8 @@ pub mod transport;
 pub mod types;
 pub mod utils;
 
+#[cfg(test)]
+mod api_surface_tests;
 
 // Re-exports for convenient access
 /// The runtime-free rules this crate adapts: `bsv_middleware_core`, as a
