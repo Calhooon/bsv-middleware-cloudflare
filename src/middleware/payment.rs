@@ -47,6 +47,9 @@ const ORIGINATOR: &str = "bsv-auth-cloudflare";
 /// recorded in the [`SessionStorage`] nonce store.
 pub const PAYMENT_NONCE_SCOPE: &str = "payment-derivation-prefix";
 
+/// The output of the payment transaction that is internalized (and read).
+const PAYMENT_OUTPUT_INDEX: usize = 0;
+
 /// Options for payment middleware.
 ///
 /// Mirrors payment-express-middleware's `PaymentMiddlewareOptions`:
@@ -323,8 +326,22 @@ enum PaymentDecision {
     /// `internalizeAction` errored (payment NOT processed; prefix released
     /// best-effort) → 400 `ERR_PAYMENT_FAILED` ([`PaymentResult::Failed`]).
     InternalizeError { description: String },
-    /// Wallet accepted → [`PaymentResult::Verified`].
-    Verified { price: u64, tx: String },
+    /// The paying output carries less than the price or is not locked to
+    /// the server's BRC-29 key → 402 `ERR_INVALID_PAYMENT` with a fresh
+    /// challenge; the wallet is never called, the prefix never consumed
+    /// ([`PaymentResult::Failed`]).
+    NotCovered {
+        price: u64,
+        fresh_prefix: String,
+        description: String,
+    },
+    /// The payment transaction cannot be read, or has no output 0 → 400
+    /// `ERR_INVALID_PAYMENT`; the prefix is not consumed
+    /// ([`PaymentResult::Failed`]).
+    InvalidPayment { description: String },
+    /// Wallet accepted → [`PaymentResult::Verified`]; `satoshis_paid` is
+    /// read from the paying output.
+    Verified { satoshis_paid: u64, tx: String },
 }
 
 /// Request/`Response`-free core of BRC-29 payment processing.
@@ -462,7 +479,7 @@ where
 
             // Success - matches Express: req.payment = { satoshisPaid, accepted, tx }
             Ok(PaymentDecision::Verified {
-                price,
+                satoshis_paid: price,
                 tx: payment.transaction,
             })
         }
@@ -556,11 +573,30 @@ fn decision_into_result(decision: PaymentDecision) -> Result<PaymentResult> {
         PaymentDecision::InternalizeError { description } => {
             failed_json_response(400, "ERR_PAYMENT_FAILED", &description)
         }
-        PaymentDecision::Verified { price, tx } => Ok(PaymentResult::Verified(PaymentContext {
-            satoshis_paid: price,
-            accepted: true,
-            tx: Some(tx),
-        })),
+        PaymentDecision::NotCovered {
+            price,
+            fresh_prefix,
+            description,
+        } => {
+            let response = Response::from_json(&ErrorResponse::new(
+                "ERR_INVALID_PAYMENT",
+                not_covered_description(&description),
+            ))
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+            .with_status(402)
+            .with_headers(challenge_headers(price, &fresh_prefix));
+            Ok(PaymentResult::Failed(add_cors_headers(response)))
+        }
+        PaymentDecision::InvalidPayment { description } => {
+            failed_json_response(400, "ERR_INVALID_PAYMENT", &description)
+        }
+        PaymentDecision::Verified { satoshis_paid, tx } => {
+            Ok(PaymentResult::Verified(PaymentContext {
+                satoshis_paid,
+                accepted: true,
+                tx: Some(tx),
+            }))
+        }
     }
 }
 
@@ -634,12 +670,37 @@ fn decision_into_result_signed(
         PaymentDecision::InternalizeError { description } => {
             signed_failed(400, "ERR_PAYMENT_FAILED", &description)
         }
-        PaymentDecision::Verified { price, tx } => Ok(PaymentResult::Verified(PaymentContext {
-            satoshis_paid: price,
-            accepted: true,
-            tx: Some(tx),
-        })),
+        PaymentDecision::NotCovered {
+            price,
+            fresh_prefix,
+            description,
+        } => {
+            let response = sign_json_response(
+                &ErrorResponse::new("ERR_INVALID_PAYMENT", not_covered_description(&description)),
+                402,
+                &challenge_header_pairs(price, &fresh_prefix),
+                session,
+            )?;
+            Ok(PaymentResult::Failed(response))
+        }
+        PaymentDecision::InvalidPayment { description } => {
+            signed_failed(400, "ERR_INVALID_PAYMENT", &description)
+        }
+        PaymentDecision::Verified { satoshis_paid, tx } => {
+            Ok(PaymentResult::Verified(PaymentContext {
+                satoshis_paid,
+                accepted: true,
+                tx: Some(tx),
+            }))
+        }
     }
+}
+
+/// The 402 body description for a payment that does not cover the price.
+fn not_covered_description(detail: &str) -> String {
+    format!(
+        "The BSV payment does not pay the required amount to the server ({detail}). A fresh payment challenge is provided in the response headers."
+    )
 }
 
 /// [`challenge_headers`] as owned pairs — the shape [`sign_json_response`]
@@ -763,7 +824,7 @@ fn internalize_args(
     let mut args = serde_json::json!({
         "tx": tx_bytes,
         "outputs": [{
-            "outputIndex": 0,
+            "outputIndex": PAYMENT_OUTPUT_INDEX,
             "protocol": "wallet payment",
             "paymentRemittance": {
                 "derivationPrefix": derivation_prefix,
@@ -1151,11 +1212,10 @@ mod tests {
         use crate::storage::session_storage::MemorySessionStorage;
         use crate::types::AuthContext;
 
-        /// Arbitrary but well-formed compressed pubkey for the paying client.
+        /// The paying client's identity key: 2·G, a point on the curve
+        /// (the BRC-29 derivation needs one).
         const CLIENT_IDENTITY: &str =
-            "028d37b941214cd53b6a1a02b4a9e1f0e0047e02f0acdb7bb0ac4a0212eab3ca10";
-        /// Arbitrary bytes; the core only base64-decodes, never parses BEEF.
-        const TX_B64: &str = "AQIDBA==";
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
         const PRICE: u64 = 500;
 
         fn server_wallet() -> ProtoWallet {
@@ -1174,15 +1234,13 @@ mod tests {
                 .unwrap()
         }
 
+        /// A payment of exactly the price to the server's derived key.
         fn header_for(prefix: &str) -> Option<String> {
-            Some(
-                serde_json::json!({
-                    "derivationPrefix": prefix,
-                    "derivationSuffix": "c3VmZml4",
-                    "transaction": TX_B64,
-                })
-                .to_string(),
-            )
+            header_paying(prefix, &[(PRICE, derived_script(prefix))])
+        }
+
+        fn exact_payment_b64(prefix: &str) -> String {
+            crafted_payment_b64(&[(PRICE, derived_script(prefix))])
         }
 
         /// Internalizer for paths that must reject BEFORE the wallet.
@@ -1374,7 +1432,11 @@ mod tests {
                     wallet_called.set(true);
                     assert_eq!(seen_prefix, prefix);
                     assert_eq!(seen_suffix, "c3VmZml4");
-                    assert_eq!(tx, vec![1, 2, 3, 4], "decoded base64 of TX_B64");
+                    assert_eq!(
+                        tx,
+                        from_base64(&exact_payment_b64(&prefix)).unwrap(),
+                        "decoded base64 of the payment"
+                    );
                     assert!(
                         store.is_consumed(PAYMENT_NONCE_SCOPE, &prefix),
                         "prefix must already be consumed when internalize runs \
@@ -1389,8 +1451,8 @@ mod tests {
             assert_eq!(
                 decision,
                 PaymentDecision::Verified {
-                    price: PRICE,
-                    tx: TX_B64.to_string()
+                    satoshis_paid: PRICE,
+                    tx: exact_payment_b64(&prefix)
                 }
             );
         }
@@ -1602,6 +1664,250 @@ mod tests {
                 .unwrap();
                 assert!(matches!(decision, PaymentDecision::Verified { .. }));
             }
+        }
+
+        // ---- P0-3b: the paying output is compared with the price ----
+        //
+        // Ported from P0-3 (bsv-stack-lean `docs/p0/p0-3.md`) onto the
+        // session-lane line, where the check is the crate's own
+        // `verify_brc29_payment_output`. Crafted payments only: one input
+        // from a crafted parent, never signed, never broadcast; the wallet
+        // is a stub that accepts anything well-formed (what the storage
+        // servers do, per that report).
+
+        use bsv_sdk::primitives::{to_base64, PublicKey};
+        use bsv_sdk::script::LockingScript;
+        use bsv_sdk::transaction::{Transaction, TransactionInput, TransactionOutput};
+        use bsv_sdk::wallet::{Counterparty, GetPublicKeyArgs, Protocol, SecurityLevel};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const SUFFIX: &str = "c3VmZml4";
+
+        fn p2pkh(hash: &[u8; 20]) -> Vec<u8> {
+            let mut s = vec![0x76, 0xa9, 0x14];
+            s.extend_from_slice(hash);
+            s.extend_from_slice(&[0x88, 0xac]);
+            s
+        }
+
+        /// The server's BRC-29 key for (prefix, SUFFIX, the client),
+        /// derived here with the SDK, independent of the code under test.
+        fn derived_script(prefix: &str) -> Vec<u8> {
+            let derived = server_wallet()
+                .get_public_key(GetPublicKeyArgs {
+                    identity_key: false,
+                    protocol_id: Some(Protocol::new(SecurityLevel::Counterparty, "3241645161d8")),
+                    key_id: Some(format!("{prefix} {SUFFIX}")),
+                    counterparty: Some(Counterparty::Other(
+                        PublicKey::from_hex(CLIENT_IDENTITY).unwrap(),
+                    )),
+                    for_self: Some(true),
+                })
+                .unwrap();
+            p2pkh(&PublicKey::from_hex(&derived.public_key).unwrap().hash160())
+        }
+
+        /// An Atomic BEEF (the shape a BRC-100 wallet's `createAction`
+        /// hands the client) whose subject spends a crafted parent.
+        fn crafted_payment_b64(outputs: &[(u64, Vec<u8>)]) -> String {
+            let mut parent = Transaction::new();
+            parent
+                .add_output(TransactionOutput::new(
+                    10_000,
+                    LockingScript::from_binary(&p2pkh(&[7u8; 20])).unwrap(),
+                ))
+                .unwrap();
+            let mut tx = Transaction::new();
+            tx.add_input(TransactionInput::with_source_transaction(parent, 0))
+                .unwrap();
+            for (satoshis, script) in outputs {
+                tx.add_output(TransactionOutput::new(
+                    *satoshis,
+                    LockingScript::from_binary(script).unwrap(),
+                ))
+                .unwrap();
+            }
+            to_base64(&tx.to_atomic_beef(true).unwrap())
+        }
+
+        fn header_paying(prefix: &str, outputs: &[(u64, Vec<u8>)]) -> Option<String> {
+            Some(
+                serde_json::json!({
+                    "derivationPrefix": prefix,
+                    "derivationSuffix": SUFFIX,
+                    "transaction": crafted_payment_b64(outputs),
+                })
+                .to_string(),
+            )
+        }
+
+        /// Runs the decision core for one crafted payment against a stub
+        /// wallet that accepts; returns the decision and the wallet calls.
+        async fn decide_crafted(
+            outputs: impl FnOnce(&str) -> Vec<(u64, Vec<u8>)>,
+        ) -> (PaymentDecision, usize) {
+            let store = MemorySessionStorage::default();
+            let prefix = issued_prefix().await;
+            let calls = AtomicUsize::new(0);
+            let decision = decide_payment(
+                &auth(),
+                || PRICE,
+                header_paying(&prefix, &outputs(&prefix)),
+                TEST_KEY_HEX,
+                Some(&store),
+                |_prefix: String, _suffix: String, _tx: Vec<u8>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(serde_json::json!({ "accepted": true })) }
+                },
+            )
+            .await
+            .unwrap();
+            (decision, calls.load(Ordering::SeqCst))
+        }
+
+        fn satoshis_paid(decision: PaymentDecision) -> u64 {
+            match decision_into_result(decision) {
+                Ok(PaymentResult::Verified(ctx)) => ctx.satoshis_paid,
+                _ => panic!("expected a verified payment"),
+            }
+        }
+
+        /// A refusal that carries the price and a fresh, verifiable prefix.
+        async fn assert_fresh_402(decision: PaymentDecision, detail: &str) {
+            match decision {
+                PaymentDecision::NotCovered {
+                    price,
+                    fresh_prefix,
+                    description,
+                } => {
+                    assert_eq!(price, PRICE);
+                    assert!(description.contains(detail), "{description}");
+                    assert!(
+                        verify_nonce(&fresh_prefix, &server_wallet(), None, ORIGINATOR)
+                            .await
+                            .unwrap()
+                    );
+                }
+                other => panic!("expected NotCovered, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn p0_3b_exact_price_is_served_and_records_the_price() {
+            let (decision, calls) = decide_crafted(|p| vec![(PRICE, derived_script(p))]).await;
+            assert_eq!(calls, 1);
+            assert_eq!(satoshis_paid(decision), PRICE);
+        }
+
+        #[tokio::test]
+        async fn p0_3b_one_satoshi_under_is_refused_before_the_wallet() {
+            let (decision, calls) = decide_crafted(|p| vec![(PRICE - 1, derived_script(p))]).await;
+            assert!(
+                !matches!(decision, PaymentDecision::Verified { .. }),
+                "an underpaid payment was served: {decision:?}"
+            );
+            assert_eq!(
+                calls, 0,
+                "the wallet was asked to internalize an underpaid payment"
+            );
+            assert_fresh_402(decision, "carries 499 satoshis but 500 are required").await;
+        }
+
+        #[tokio::test]
+        async fn p0_3b_one_satoshi_over_records_the_real_amount() {
+            let (decision, calls) = decide_crafted(|p| vec![(PRICE + 1, derived_script(p))]).await;
+            assert_eq!(calls, 1);
+            assert_eq!(satoshis_paid(decision), PRICE + 1);
+        }
+
+        #[tokio::test]
+        async fn p0_3b_output_at_another_script_is_refused_before_the_wallet() {
+            let (decision, calls) = decide_crafted(|_| vec![(PRICE, p2pkh(&[9u8; 20]))]).await;
+            assert!(
+                !matches!(decision, PaymentDecision::Verified { .. }),
+                "a payment to another script was served: {decision:?}"
+            );
+            assert_eq!(
+                calls, 0,
+                "the wallet was asked to internalize a payment to another script"
+            );
+            assert_fresh_402(decision, "does not pay this server's BRC-29 derived key").await;
+        }
+
+        #[tokio::test]
+        async fn p0_3b_derived_output_at_index_1_does_not_pay_output_0() {
+            // Output 0 is what is internalized; paying the derived key at
+            // index 1 while output 0 pays someone else is refused.
+            let (decision, calls) =
+                decide_crafted(|p| vec![(PRICE, p2pkh(&[9u8; 20])), (PRICE, derived_script(p))])
+                    .await;
+            assert_eq!(calls, 0);
+            assert_fresh_402(decision, "does not pay this server's BRC-29 derived key").await;
+        }
+
+        #[tokio::test]
+        async fn p0_3b_unreadable_transaction_is_invalid_and_keeps_the_prefix() {
+            let store = MemorySessionStorage::default();
+            let prefix = issued_prefix().await;
+            let header = serde_json::json!({
+                "derivationPrefix": prefix,
+                "derivationSuffix": SUFFIX,
+                "transaction": "AQIDBA==",
+            })
+            .to_string();
+            let decision = decide_payment(
+                &auth(),
+                || PRICE,
+                Some(header),
+                TEST_KEY_HEX,
+                Some(&store),
+                wallet_unreachable,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(decision, PaymentDecision::InvalidPayment { .. }),
+                "{decision:?}"
+            );
+            assert!(!store.is_consumed(PAYMENT_NONCE_SCOPE, &prefix));
+        }
+
+        #[tokio::test]
+        async fn p0_3b_a_refused_payment_keeps_the_prefix_for_a_correct_retry() {
+            let store = MemorySessionStorage::default();
+            let prefix = issued_prefix().await;
+            let short = decide_payment(
+                &auth(),
+                || PRICE,
+                header_paying(&prefix, &[(PRICE - 1, derived_script(&prefix))]),
+                TEST_KEY_HEX,
+                Some(&store),
+                wallet_unreachable,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(short, PaymentDecision::NotCovered { .. }),
+                "{short:?}"
+            );
+            assert!(!store.is_consumed(PAYMENT_NONCE_SCOPE, &prefix));
+            let paid = decide_payment(
+                &auth(),
+                || PRICE,
+                header_for(&prefix),
+                TEST_KEY_HEX,
+                Some(&store),
+                wallet_accepts,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                paid,
+                PaymentDecision::Verified {
+                    satoshis_paid: PRICE,
+                    tx: exact_payment_b64(&prefix)
+                }
+            );
         }
     }
 }
