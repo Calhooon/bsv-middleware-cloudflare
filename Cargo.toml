@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-cloudflare"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 description = "BSV BRC-103/104 authentication and BRC-29 payment middleware for Cloudflare Workers"
 license = "MIT OR Apache-2.0"
@@ -52,6 +52,11 @@ ripemd = { version = "0.1", optional = true }
 [features]
 default = []
 refund = ["ripemd"]
+# `payment_claims`: atomic single-use payment-nonce claims on a D1 table.
+d1-claims = ["worker/d1"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

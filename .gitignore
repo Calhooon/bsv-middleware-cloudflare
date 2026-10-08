@@ -28,4 +28,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local pre-publish audit output (never shipped)
+LEAK-CHECK-*.txt
 graphify-out/

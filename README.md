@@ -11,6 +11,8 @@ Port of [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-m
 - **`sign_json_response`** — signs outbound JSON responses so BRC-103/104 clients (e.g. `AuthFetch`) can verify server identity and message integrity. Equivalent to Express's `res.json` hijacking, but explicit.
 - **`WorkerStorageClient`** — WASM-compatible RPC client for a wallet storage server (e.g. `storage.babbage.systems`), used by `process_payment` and optional refund flows.
 - **Optional `refund` feature** — BRC-41 refund transaction builder for partial-refund scenarios (e.g. AI agents that pre-charge and refund on failure). Not present in the Express reference.
+- **`verify_brc29_payment`** / **`verify_brc29_payment_output`** (0.3.6) — checks, before anything is internalized, that a BRC-29 payment output pays *this* server's derived key at least the quoted amount inside a structurally complete BEEF, with merkle roots checked against a header service you run. For callers with their own payment flow.
+- **Optional `d1-claims` feature** (0.3.6) — `claim_payment_nonce` / `release_payment_nonce`: an atomic, globally consistent single-use claim on a payment nonce in a D1 table, for callers outside the stock middleware or on the eventually-consistent KV backend.
 
 ## Why Cloudflare Workers
 
@@ -84,6 +86,7 @@ Secret: `wrangler secret put SERVER_PRIVATE_KEY` (64-char hex secp256k1 private 
 | Feature | Default | Pulls in |
 |---|---|---|
 | `refund` | off | `sha2`, `ripemd` — enables `refund::issue_refund` for BRC-41 partial refunds |
+| `d1-claims` | off | `worker/d1` — enables `payment_claims::{claim_payment_nonce, release_payment_nonce}` (atomic single-use payment-nonce claims on a D1 table) |
 
 ## Parity with Express middleware
 
@@ -137,6 +140,35 @@ and the server's session nonce. Seal a laned answer with
 one, answers a laned call 503 `lane-unsupported`). The pure rules live in `middleware::session_lane`; the MAC
 vectors are `tests/fixtures/session_lane.vectors.json` (emitted by the module's own test, sha256-pinned; a client
 pins the same bytes). Designed for bsv-low (#441, register row D12: the relay's D10 lane generalized).
+
+## Payment verification before internalize (0.3.6)
+
+`verify_brc29_payment(server_key, sender_identity_key, derivation_prefix, derivation_suffix, &tx_bytes, output_index, required_satoshis, header_url)`
+proves, offline and before any wallet call, that the payment *pays this server correctly* and is *real and confirmable*:
+
+1. **Script + amount** (`verify_brc29_payment_output`, sync): the output's locking script equals the P2PKH script of the
+   BRC-29 key derived from (server identity, sender identity, prefix, suffix) via `expected_brc29_locking_script`, and
+   carries at least `required_satoshis`. One byte-compare rejects underpayment, zero-sat outputs, outputs paying any
+   other key, a transaction built for another quote nonce, and a transaction built for another server.
+2. **BEEF completeness + SPV**: the BEEF parses and verifies structurally (no missing inputs, no txid-only gaps, an
+   intact proof chain), then each merkle root is checked against block headers from a ChainTracks-compatible service
+   (`GET {header_url}/findHeaderHexForHeight?height=N`). SPV is **fail-open** on a service error (outage, timeout, height
+   not yet indexed) and **fail-closed** on a root mismatch.
+
+The crate ships no header service: `header_url = None` resolves to `DEFAULT_CHAINTRACKS_URL`, a reserved `.invalid`
+placeholder under which the root check is skipped with a logged warning. **Set your own header service.** Every error
+(`PaymentVerifyError`) is client-fault: reject without internalizing, no refund owed.
+
+With the `d1-claims` feature, `claim_payment_nonce(&db, nonce, agent)` is an atomic `INSERT OR IGNORE` on a D1
+`payment_claims` table (schema in `PAYMENT_CLAIMS_SCHEMA`): `Ok(true)` won, `Ok(false)` already used, `Err` storage
+fault. It is the single-use guard for callers that run their own payment flow and never reach the middleware's
+`try_consume_nonce`, and a second, globally consistent guard for the stock middleware on KV. Using both is safe. Claim
+after `verify_brc29_payment` succeeds and before internalizing; `release_payment_nonce` frees a claim after a
+pre-internalize failure.
+
+```toml
+bsv-middleware-cloudflare = { version = "0.3.6", features = ["d1-claims"] }
+```
 
 ## Session storage backends
 
