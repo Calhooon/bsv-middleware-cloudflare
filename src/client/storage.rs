@@ -269,7 +269,11 @@ impl WorkerStorageClient {
         match cache.kv.put(&cache.key, json) {
             Ok(put) => {
                 // Cloudflare KV enforces a 60 s minimum TTL — clamp up.
-                if let Err(e) = put.expiration_ttl(cache.ttl_seconds.max(60)).execute().await {
+                if let Err(e) = put
+                    .expiration_ttl(cache.ttl_seconds.max(60))
+                    .execute()
+                    .await
+                {
                     worker::console_warn!("client session KV persist skipped (non-fatal): {e:?}");
                 }
             }
@@ -558,7 +562,11 @@ impl WorkerStorageClient {
     /// 2. Wraps in HttpRequest payload for signing
     /// 3. Signs with BRC-42 key derivation
     /// 4. Sends via `worker::Fetch` with BRC-104 auth headers
-    async fn send_rpc_once(&mut self, method: &str, params: &[Value]) -> Result<(u16, u64, String)> {
+    async fn send_rpc_once(
+        &mut self,
+        method: &str,
+        params: &[Value],
+    ) -> Result<(u16, u64, String)> {
         // Build JSON-RPC request
         let id = self.next_id;
         self.next_id += 1;
@@ -871,8 +879,14 @@ mod tests {
             500,
             "D1_ERROR: database is locked"
         ));
-        assert!(!WorkerStorageClient::is_auth_layer_rejection(400, "bad request"));
+        assert!(!WorkerStorageClient::is_auth_layer_rejection(
+            400,
+            "bad request"
+        ));
         assert!(!WorkerStorageClient::is_auth_layer_rejection(200, "ok"));
-        assert!(!WorkerStorageClient::is_auth_layer_rejection(404, "not found"));
+        assert!(!WorkerStorageClient::is_auth_layer_rejection(
+            404,
+            "not found"
+        ));
     }
 }

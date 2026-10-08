@@ -14,6 +14,15 @@
 //!   prefixes are single-use via the pluggable [`SessionStorage`] nonce store
 //!   (a hardening divergence from the TS reference middleware — see
 //!   [`middleware::auth`] for the precise residual window under Cloudflare KV)
+//! - **Payment verification before internalize**: [`verify_brc29_payment`]
+//!   checks that a BRC-29 payment output pays this server's derived key the
+//!   quoted amount inside a complete BEEF proof, merkle roots against your own
+//!   header service (required: no service, no verdict;
+//!   [`verify_brc29_payment_structural_only`] is the named opt-out without
+//!   SPV), for callers running their own payment flow
+//! - **Atomic payment-nonce claims on D1** (feature `d1-claims`):
+//!   [`claim_payment_nonce`] / [`release_payment_nonce`], a globally
+//!   consistent put-if-absent for callers outside the stock middleware
 //! - **Cloudflare KV Storage**: Session and payment storage in Cloudflare KV
 //! - **CORS Handling**: Built-in CORS support for browser clients
 //!
@@ -116,6 +125,9 @@ pub mod client;
 pub mod env;
 pub mod error;
 pub mod middleware;
+#[cfg(feature = "d1-claims")]
+pub mod payment_claims;
+pub mod payment_verify;
 #[cfg(feature = "refund")]
 pub mod refund;
 pub mod storage;
@@ -127,8 +139,11 @@ pub mod utils;
 pub use client::{ClientSessionSnapshot, WorkerStorageClient};
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
-    add_cors_headers, process_auth, process_auth_do, process_auth_with_storage, sign_json_response,
-    sign_response, AuthMiddlewareOptions, AuthResult, AuthSession,
+    add_cors_headers, add_lane_cors_headers, mint_attested_lane, process_auth, process_auth_do,
+    process_auth_lane, process_auth_lane_with_storage, process_auth_with_storage,
+    request_presents_lane, seal_lane_response, seal_lane_response_text, sign_json_response,
+    sign_response, AuthMiddlewareOptions, AuthResult, AuthSession, LaneAuth, LaneAuthResult,
+    SessionLaneOptions,
 };
 pub use middleware::multipart::prepare_multipart_payment;
 #[allow(deprecated)] // re-exported for backward compatibility
@@ -138,8 +153,16 @@ pub use middleware::payment::{
     process_payment_with_storage_signed, PaymentMiddlewareOptions, PaymentResult,
     PAYMENT_NONCE_SCOPE,
 };
+pub use middleware::session_lane;
+#[cfg(feature = "d1-claims")]
+pub use payment_claims::{claim_payment_nonce, release_payment_nonce, PAYMENT_CLAIMS_SCHEMA};
+pub use payment_verify::{
+    expected_brc29_locking_script, verify_brc29_payment, verify_brc29_payment_output,
+    verify_brc29_payment_structural_only, verify_brc29_payment_with_header_lookup,
+    PaymentVerifyError, DEFAULT_CHAINTRACKS_URL,
+};
 pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
-pub use storage::{KvPaymentStorage, KvSessionStorage, SessionStorage};
+pub use storage::{KvPaymentStorage, KvSessionStorage, LaneVerdict, LaneVerifyAsk, SessionStorage};
 pub use transport::{auth_headers, CloudflareTransport, HttpRequestData, HttpResponseData};
 pub use types::{AuthContext, BsvPayment, PaymentContext};
 

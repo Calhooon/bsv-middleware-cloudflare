@@ -11,6 +11,8 @@ Port of [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-m
 - **`sign_json_response`** — signs outbound JSON responses so BRC-103/104 clients (e.g. `AuthFetch`) can verify server identity and message integrity. Equivalent to Express's `res.json` hijacking, but explicit.
 - **`WorkerStorageClient`** — WASM-compatible RPC client for a wallet storage server (e.g. `storage.babbage.systems`), used by `process_payment` and optional refund flows.
 - **Optional `refund` feature** — BRC-41 refund transaction builder for partial-refund scenarios (e.g. AI agents that pre-charge and refund on failure). Not present in the Express reference.
+- **`verify_brc29_payment`** / **`verify_brc29_payment_output`** (0.3.6) — checks, before anything is internalized, that a BRC-29 payment output pays *this* server's derived key at least the quoted amount inside a structurally complete BEEF, with merkle roots checked against a header service you run (required: no service, no verdict; `verify_brc29_payment_structural_only` is the named opt-out without SPV). For callers with their own payment flow.
+- **Optional `d1-claims` feature** (0.3.6) — `claim_payment_nonce` / `release_payment_nonce`: an atomic, globally consistent single-use claim on a payment nonce in a D1 table, for callers outside the stock middleware or on the eventually-consistent KV backend.
 
 ## Why Cloudflare Workers
 
@@ -84,6 +86,7 @@ Secret: `wrangler secret put SERVER_PRIVATE_KEY` (64-char hex secp256k1 private 
 | Feature | Default | Pulls in |
 |---|---|---|
 | `refund` | off | `sha2`, `ripemd` — enables `refund::issue_refund` for BRC-41 partial refunds |
+| `d1-claims` | off | `worker/d1` — enables `payment_claims::{claim_payment_nonce, release_payment_nonce}` (atomic single-use payment-nonce claims on a D1 table) |
 
 ## Parity with Express middleware
 
@@ -117,6 +120,73 @@ Known production consumers using BRC-103/104 auth + dynamic pricing + optional r
 ## License
 
 Dual-licensed under MIT or Apache-2.0 at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+## Session lane (0.3.4, opt-in)
+
+One BRC-103/104 handshake per origin, then a LANE: `process_auth_lane(req, &env, &options, "AUTH_SESSION_STORE")`
+serves calls that carry `x-low-session` (the lane id), `x-low-session-identity`, `x-low-session-n` (the client's
+counter) and `x-low-session-mac` (`HMAC-SHA256(K, n ‖ "METHOD path?query" ‖ 0x00 ‖ sha256(body))`) with ZERO wallet
+calls and one Durable Object round trip, and answers `LaneAuthResult::Laned { context, request, body, lane }`;
+everything else is `LaneAuthResult::Reference(AuthResult)` or `LaneAuthResult::Offered { auth, offer }`, the unchanged
+reference outcome. The client's FIRST BRC-104-signed general message carrying the explicit ask (`x-low-lane-ask`) on a
+server with `options.session_lane = Some(..)` is answered `Offered`: the server attaches the offer to that message's
+SIGNED reply as the `x-bsv-lane-offer` header (base64 JSON `{id, expiresAt, salt, ask}`, a header a reference client
+ignores, exposed cross-origin); the unsigned handshake never mints. Both sides derive
+`K = HMAC-SHA256(salt, label ‖ id ‖ clientMessageNonce ‖ serverSessionNonce)` from that message's own `x-bsv-auth-nonce`
+and the server's session nonce. Seal a laned answer with
+`seal_lane_response(&value, status, &lane)` (`x-low-session-n`, `x-low-session-mac`, `no-store`). Refusals are
+401 `{status:"error", code:"ERR_SESSION_REFUSED", reason}` (`unknown-session` / `expired` / `replay` / `bad-mac` /
+`malformed`; 503 `lane-unavailable` when the store cannot be asked). The KV backend keeps no lanes (never offers
+one, answers a laned call 503 `lane-unsupported`). The pure rules live in `middleware::session_lane`; the MAC
+vectors are `tests/fixtures/session_lane.vectors.json` (emitted by the module's own test, sha256-pinned; a client
+pins the same bytes). Designed for the relay adopter: its lane, generalized to HTTP-only servers.
+
+## Payment verification before internalize (0.3.6)
+
+`verify_brc29_payment(server_key, sender_identity_key, derivation_prefix, derivation_suffix, &tx_bytes, output_index, required_satoshis, header_url)`
+proves, offline and before any wallet call, that the payment *pays this server correctly* and is *real and confirmable*:
+
+1. **Script + amount** (`verify_brc29_payment_output`, sync): the output's locking script equals the P2PKH script of the
+   BRC-29 key derived from (server identity, sender identity, prefix, suffix) via `expected_brc29_locking_script`, and
+   carries at least `required_satoshis`. One byte-compare rejects underpayment, zero-sat outputs, outputs paying any
+   other key, a transaction built for another quote nonce, and a transaction built for another server.
+2. **BEEF completeness + SPV**: the BEEF parses and verifies structurally (no missing inputs, no txid-only gaps, an
+   intact proof chain), then each merkle root is checked against block headers from a ChainTracks-compatible service
+   (`GET {header_url}/findHeaderHexForHeight?height=N`). SPV is **fail-open** on a service error (outage, timeout, height
+   not yet indexed) and **fail-closed** on a root mismatch.
+
+> **Warning: a header service URL is required.** The crate ships no header service and never skips SPV silently.
+> Pass the base URL of your own ChainTracks-compatible service as `header_url` (for example a ChainTracks deployment
+> you run). `None`, `Some("")`, the `DEFAULT_CHAINTRACKS_URL` `.invalid` placeholder (in any case, with or without a
+> trailing slash or dot), any other `.invalid` host, a value without an `http(s)://` scheme, or a value whose host the
+> gate cannot classify as a real hostname (userinfo, percent-encoding, backslashes, whitespace, non-ASCII, a
+> non-numeric port) is refused with `PaymentVerifyError::NoHeaderService` before any other check: fail-closed, never
+> a silent skip. The host is normalised before the placeholder comparison, so no spelling of the placeholder reaches
+> DNS and fails open. Adopters with no header service opt out of SPV *by name* with
+> `verify_brc29_payment_structural_only(..)` (script + amount + BEEF structure, no root check).
+
+| `header_url` | result |
+|---|---|
+| `None`, `Some("")`, whitespace only | `Err(NoHeaderService)` |
+| the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host, no `http(s)://` scheme | `Err(NoHeaderService)` |
+| userinfo, `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
+| service unreachable, HTTP error, unparseable answer | `Ok(satoshis)`, warning logged (fail-open) |
+| the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
+| the header carries the proof's root | `Ok(satoshis)` |
+
+Every `PaymentVerifyError` means reject without internalizing, no refund owed. Most are client-fault; `NoHeaderService`
+(and a `KeyDerivation` error on the server key) is the deployment's own: answer 500-class and fix the configuration.
+
+With the `d1-claims` feature, `claim_payment_nonce(&db, nonce, agent)` is an atomic `INSERT OR IGNORE` on a D1
+`payment_claims` table (schema in `PAYMENT_CLAIMS_SCHEMA`): `Ok(true)` won, `Ok(false)` already used, `Err` storage
+fault. It is the single-use guard for callers that run their own payment flow and never reach the middleware's
+`try_consume_nonce`, and a second, globally consistent guard for the stock middleware on KV. Using both is safe. Claim
+after `verify_brc29_payment` succeeds and before internalizing; `release_payment_nonce` frees a claim after a
+pre-internalize failure.
+
+```toml
+bsv-middleware-cloudflare = { version = "0.3.6", features = ["d1-claims"] }
+```
 
 ## Session storage backends
 

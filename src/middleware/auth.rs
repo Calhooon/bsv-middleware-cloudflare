@@ -83,6 +83,12 @@ pub struct AuthMiddlewareOptions {
     #[allow(clippy::type_complexity)]
     pub on_certificates_received:
         Option<Box<dyn Fn(String, Vec<VerifiableCertificate>) + Send + Sync>>,
+    /// Session lane (0.3.4, `middleware::session_lane`): when set, the client's
+    /// FIRST BRC-104-signed general message carrying the explicit ask
+    /// (`x-low-lane-ask`) is answered with a lane offer (the unsigned handshake
+    /// never mints), and `process_auth_lane*` serves laned calls. `None`
+    /// (the default) = the reference behaviour byte-for-byte.
+    pub session_lane: Option<SessionLaneOptions>,
 }
 
 impl Default for AuthMiddlewareOptions {
@@ -93,8 +99,65 @@ impl Default for AuthMiddlewareOptions {
             certificates_to_request: None,
             session_ttl_seconds: 3600,
             on_certificates_received: None,
+            session_lane: None,
         }
     }
+}
+
+/// The session lane's knobs (`AuthMiddlewareOptions::session_lane`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLaneOptions {
+    /// The domain separator inside `K`'s derivation; every server on one label
+    /// shares the vectors. Default `session_lane::DEFAULT_LABEL`.
+    pub label: Vec<u8>,
+    /// The idle window a verified call refreshes. Default `session_lane::LANE_IDLE_MS`.
+    pub idle_ms: u64,
+}
+
+impl Default for SessionLaneOptions {
+    fn default() -> Self {
+        Self {
+            label: lane::DEFAULT_LABEL.to_vec(),
+            idle_ms: lane::LANE_IDLE_MS,
+        }
+    }
+}
+
+/// A verified laned call: what the door needs to bind the caller and to seal
+/// its answer (`seal_lane_response`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneAuth {
+    pub id: String,
+    /// The lane's identity (66 hex, lowercase) — the handshake's peer.
+    pub identity: String,
+    /// `K`, hex — the answer is sealed under it.
+    pub key: String,
+    /// The request's counter — the answer carries the same `h`.
+    pub h: u64,
+}
+
+/// `process_auth_lane*`'s answer. `Reference` wraps the unchanged reference
+/// outcome (a handshake reply, a BRC-104 verified request, a refusal) so an
+/// adopter's existing `match` on [`AuthResult`] keeps working.
+pub enum LaneAuthResult {
+    /// The request rode the lane: verified by the store, the body captured.
+    Laned {
+        context: AuthContext,
+        request: Request,
+        body: Vec<u8>,
+        lane: LaneAuth,
+    },
+    /// The reference outcome (`Authenticated`, always) PLUS a freshly minted
+    /// lane offer the adopter must attach to its SIGNED answer as the
+    /// `session_lane::LANE_OFFER_HEADER` extra header (a signable `x-bsv-`
+    /// header: the reference signs it, the client's verification covers it).
+    /// Minted only for a BRC-104-authenticated general message that carried
+    /// the ask, under the VERIFIED identity — never on the handshake.
+    Offered {
+        auth: AuthResult,
+        offer: lane::LaneOffer,
+    },
+    Reference(AuthResult),
 }
 
 /// Session info needed for signing responses.
@@ -136,6 +199,9 @@ pub enum AuthResult {
 
 const ORIGINATOR: &str = "bsv-auth-cloudflare";
 
+use crate::middleware::session_lane as lane;
+use crate::storage::session_storage::LaneVerifyAsk;
+
 /// Process authentication for a Cloudflare Worker request.
 ///
 /// This is a 1:1 port of auth-express-middleware's `createAuthMiddleware`.
@@ -160,7 +226,7 @@ pub async fn process_auth(
     process_auth_with_storage(req, &session_storage, options).await
 }
 
-/// `process_auth` over the Durable Object session backend (bsv-low W-D): the
+/// `process_auth` over the Durable Object session backend: the
 /// session record and the replay guard live in one object per session nonce
 /// (`AuthSessionStore`, bound as `do_binding`), KV the cold path. See
 /// `storage::do_session`.
@@ -249,7 +315,7 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
         .as_ref()
         .or(auth_message.nonce.as_ref());
 
-    // bsv-low W-D: a backend that answers "is this session live?" and "has
+    // The combined hot path: a backend that answers "is this session live?" and "has
     // this request nonce been seen?" from ONE place (the Durable Object
     // backend) answers both in one round trip here; every other backend says
     // "unsupported" and takes the two-step path below, unchanged. The nonce
@@ -293,6 +359,20 @@ pub async fn process_auth_with_storage<S: SessionStorage + ?Sized>(
     if !session.is_authenticated {
         return Err(AuthCloudflareError::InvalidAuthentication(
             "Session not authenticated".into(),
+        ));
+    }
+
+    // The signed identity IS the session's: a general message naming another
+    // identity over this session is refused by name before its signature is
+    // judged (the reference verifies with `peerSession.peerIdentityKey`; the
+    // header is a claim — the 2026-09-14 delta-verify NEW-1).
+    if !auth_message
+        .identity_key
+        .to_hex()
+        .eq_ignore_ascii_case(&session.peer_identity_key)
+    {
+        return Err(AuthCloudflareError::InvalidAuthentication(
+            "Message identity key is not the session's".into(),
         ));
     }
 
@@ -737,11 +817,325 @@ async fn handle_initial_request<S: SessionStorage + ?Sized>(
         let _ = headers.set(key, value);
     }
 
+    // Session lane (0.3.4): the InitialResponse NEVER offers a lane. The
+    // initialRequest is unsigned — its identity is a claim (the 2026-09-14
+    // gate HIGH-1: a stranger could mint a lane under any identity) — so the
+    // offer rides the answer to the client's FIRST BRC-104-SIGNED general
+    // message instead (`process_auth_lane_with_storage`, `LaneAuthResult::Offered`).
     let response = Response::from_json(&response_msg)
         .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
         .with_headers(headers);
-
     Ok(AuthResult::Response(add_cors_headers(response)))
+}
+
+/// Mint a lane for a proven handshake and store it; `None` when the store
+/// keeps no lanes or the mint could not be stored (the reference reply stands:
+/// a lane is never owed).
+async fn mint_lane_offer<S: SessionStorage + ?Sized>(
+    session_storage: &S,
+    lane_opts: &SessionLaneOptions,
+    peer_identity_key: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    ask: &str,
+) -> Option<lane::LaneOffer> {
+    let mut random = [0u8; 64];
+    if let Err(e) = getrandom::getrandom(&mut random) {
+        worker::console_warn!("session lane: no randomness ({e}); the reference reply stands");
+        return None;
+    }
+    let (record, offer) = lane::LaneRecord::mint(
+        &lane_opts.label,
+        &lane::Handshake {
+            identity: peer_identity_key,
+            client_nonce,
+            server_nonce,
+        },
+        &random,
+        current_time_ms(),
+        lane_opts.idle_ms,
+        ask,
+    );
+    match session_storage.lane_put(&record).await {
+        Ok(true) => Some(offer),
+        Ok(false) => None,
+        Err(e) => {
+            worker::console_warn!(
+                "session lane: the store refused the mint ({e:?}); the reference reply stands"
+            );
+            None
+        }
+    }
+}
+
+/// The attested mint (2026-09-14): mint a lane for an identity a first-party
+/// AUTHORITY has proven (the relay's hub mirror, asked by the door through its
+/// service binding) — the same `LaneRecord::mint` as the signed-read mint, the
+/// same label, idle window and lifetime; only the proof differs, and the door
+/// owns that proof. `client_nonce` is the client's fresh nonce from the attest
+/// body, `server_nonce` the door's fresh nonce it answers alongside the offer
+/// (the client derives K from both exactly as for a signed-read mint). `None`
+/// when the store keeps no lanes or the mint could not be stored.
+pub async fn mint_attested_lane<S: SessionStorage + ?Sized>(
+    session_storage: &S,
+    lane_opts: &SessionLaneOptions,
+    proven_identity_key: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    ask: &str,
+) -> Option<lane::LaneOffer> {
+    mint_lane_offer(
+        session_storage,
+        lane_opts,
+        proven_identity_key,
+        client_nonce,
+        server_nonce,
+        ask,
+    )
+    .await
+}
+
+/// `process_auth_lane` over the Durable Object session backend: a laned
+/// request (the `x-low-session*` headers) is verified by the lane's object and
+/// answered `Laned`; an AUTHENTICATED general message carrying `x-low-lane-ask`
+/// earns an offer (`Offered`, attached by the adopter to its signed answer);
+/// everything else takes [`process_auth_do`]'s path unchanged.
+pub async fn process_auth_lane(
+    req: Request,
+    env: &Env,
+    options: &AuthMiddlewareOptions,
+    do_binding: &str,
+) -> Result<LaneAuthResult> {
+    let storage =
+        crate::storage::DoSessionStorage::from_env(env, do_binding, options.session_ttl_seconds)?;
+    process_auth_lane_with_storage(req, &storage, options).await
+}
+
+/// [`process_auth_lane`] over a caller-supplied store. A store that keeps no
+/// lanes (the KV default) answers a laned call 503 `lane-unsupported` (the
+/// client falls back to the reference path) and never offers one.
+pub async fn process_auth_lane_with_storage<S: SessionStorage + ?Sized>(
+    mut req: Request,
+    session_storage: &S,
+    options: &AuthMiddlewareOptions,
+) -> Result<LaneAuthResult> {
+    let (parsed, ask_header, client_nonce_header) = {
+        let headers = req.headers();
+        let get = |name: &str| headers.get(name).ok().flatten();
+        (
+            lane::parse_lane_headers(
+                get(lane::SESSION_HEADER).as_deref(),
+                get(lane::SESSION_IDENTITY_HEADER).as_deref(),
+                get(lane::SESSION_COUNTER_HEADER).as_deref(),
+                get(lane::SESSION_MAC_HEADER).as_deref(),
+            ),
+            get(lane::LANE_ASK_HEADER),
+            // The asking general message's OWN nonce (the reference verifies
+            // it inside the signed payload): the client-side half of K.
+            get(auth_headers::NONCE).filter(|n| !n.trim().is_empty()),
+        )
+    };
+    let laned = match parsed {
+        Err(r) => {
+            return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                lane_refusal_response(r.as_str(), 401)?,
+            )))
+        }
+        Ok(None) => None,
+        Ok(Some(l)) => Some(l),
+    };
+    if let Some(lr) = laned {
+        let method = req.method().as_ref().to_ascii_uppercase();
+        let url = req
+            .url()
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?;
+        let path_and_query = lane::path_and_query(url.path(), url.query());
+        let body = req
+            .bytes()
+            .await
+            .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?;
+        let ask = LaneVerifyAsk {
+            id: lr.id.clone(),
+            identity: lr.identity.clone(),
+            h: lr.h,
+            method,
+            path_and_query,
+            body_sha256: hex::encode(lane::body_digest(&body)),
+            mac: lr.mac.clone(),
+        };
+        let verdict = match session_storage.lane_verify(&ask).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                    lane_refusal_response("lane-unsupported", 503)?,
+                )))
+            }
+            Err(e) => {
+                worker::console_warn!("session lane: the store could not be asked ({e:?})");
+                return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                    lane_refusal_response("lane-unavailable", 503)?,
+                )));
+            }
+        };
+        if !verdict.ok {
+            return Ok(LaneAuthResult::Reference(AuthResult::Response(
+                lane_refusal_response(verdict.reason.as_deref().unwrap_or("unknown-session"), 401)?,
+            )));
+        }
+        let identity = verdict.identity.unwrap_or(lr.identity).to_ascii_lowercase();
+        let key = verdict.key.unwrap_or_default();
+        return Ok(LaneAuthResult::Laned {
+            context: AuthContext::authenticated(identity.clone()),
+            request: req,
+            body,
+            lane: LaneAuth {
+                id: lr.id,
+                identity,
+                key,
+                h: lr.h,
+            },
+        });
+    }
+    if CloudflareTransport::is_handshake_request(&req) {
+        let private_key = PrivateKey::from_hex(&options.server_private_key).map_err(|e| {
+            AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e))
+        })?;
+        let wallet = ProtoWallet::new(Some(private_key));
+        return Ok(LaneAuthResult::Reference(
+            handle_handshake_request(req, &wallet, session_storage, options).await?,
+        ));
+    }
+    // The reference path judges the general message (the BRC-104 signature
+    // over the payload, the session, the per-request nonce). Only a request it
+    // AUTHENTICATED can earn a lane: the ask + the request's own nonce + the
+    // session's server nonce mint one under the VERIFIED identity, and the
+    // offer rides the adopter's signed answer (`x-bsv-lane-offer`).
+    let auth = process_auth_with_storage(req, session_storage, options).await?;
+    let ask = lane::parse_ask(ask_header.as_deref());
+    if let (Some(lane_opts), Some(ask), Some(client_nonce)) =
+        (options.session_lane.as_ref(), ask, client_nonce_header)
+    {
+        if let AuthResult::Authenticated {
+            context,
+            session: Some(session),
+            ..
+        } = &auth
+        {
+            if let Some(offer) = mint_lane_offer(
+                session_storage,
+                lane_opts,
+                &context.identity_key,
+                &client_nonce,
+                &session.session_nonce,
+                &ask,
+            )
+            .await
+            {
+                return Ok(LaneAuthResult::Offered { auth, offer });
+            }
+        }
+    }
+    Ok(LaneAuthResult::Reference(auth))
+}
+
+/// Whether a request presents the lane (the `x-low-session` header) — the
+/// adopter's front door counts it as an auth ATTEMPT (never silently anonymous)
+/// without reading a header itself.
+pub fn request_presents_lane(req: &Request) -> bool {
+    req.headers()
+        .get(lane::SESSION_HEADER)
+        .ok()
+        .flatten()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The lane's refusal: 401 `ERR_SESSION_REFUSED {reason}` (503 when the store
+/// could not be asked: the client falls back rather than reads "refused").
+fn lane_refusal_response(reason: &str, status: u16) -> Result<Response> {
+    let body = serde_json::json!({
+        "status": "error",
+        "code": lane::HTTP_REFUSED_CODE,
+        "reason": reason,
+        "description": format!("session lane refused: {reason}"),
+    });
+    let resp = Response::from_json(&body)
+        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+        .with_status(status);
+    let _ = resp.headers().set("Cache-Control", "no-store");
+    Ok(add_lane_cors_headers(add_cors_headers(resp)))
+}
+
+/// Seal a laned answer: the body as JSON text, `x-low-session-n` = the request's
+/// `h`, `x-low-session-mac` over it under `K`, `no-store`, the CORS lists.
+pub fn seal_lane_response<T: Serialize>(
+    data: &T,
+    status: u16,
+    auth: &LaneAuth,
+) -> Result<Response> {
+    let text = serde_json::to_string(data)
+        .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+    seal_lane_response_text(text, status, auth)
+}
+
+/// [`seal_lane_response`] for a body already serialized: the exact bytes sent
+/// are the bytes MAC'd.
+pub fn seal_lane_response_text(text: String, status: u16, auth: &LaneAuth) -> Result<Response> {
+    let mac = lane::response_mac(&auth.key, auth.h, &text).ok_or_else(|| {
+        AuthCloudflareError::ConfigError("session lane: the key is not hex".into())
+    })?;
+    let resp = Response::from_bytes(text.into_bytes())
+        .map_err(|e| AuthCloudflareError::TransportError(e.to_string()))?
+        .with_status(status);
+    let headers = resp.headers();
+    let _ = headers.set("Content-Type", "application/json");
+    let _ = headers.set("Cache-Control", "no-store");
+    let _ = headers.set(lane::SESSION_COUNTER_HEADER, &auth.h.to_string());
+    let _ = headers.set(lane::SESSION_MAC_HEADER, &mac);
+    Ok(add_lane_cors_headers(add_cors_headers(resp)))
+}
+
+/// Append the lane's headers to the reference CORS lists (allowed on the
+/// request, exposed on the answer). Idempotent.
+pub fn add_lane_cors_headers(response: Response) -> Response {
+    let headers = response.headers();
+    let allow = headers
+        .get("Access-Control-Allow-Headers")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !allow.contains(lane::SESSION_HEADER) {
+        let _ = headers.set(
+            "Access-Control-Allow-Headers",
+            &format!(
+                "{}, {}, {}, {}, {}, {}",
+                allow,
+                lane::SESSION_HEADER,
+                lane::SESSION_IDENTITY_HEADER,
+                lane::SESSION_COUNTER_HEADER,
+                lane::SESSION_MAC_HEADER,
+                lane::LANE_ASK_HEADER
+            ),
+        );
+    }
+    let expose = headers
+        .get("Access-Control-Expose-Headers")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !expose.contains(lane::SESSION_MAC_HEADER) {
+        let _ = headers.set(
+            "Access-Control-Expose-Headers",
+            &format!(
+                "{}, {}, {}, {}",
+                expose,
+                lane::SESSION_COUNTER_HEADER,
+                lane::SESSION_MAC_HEADER,
+                lane::LANE_OFFER_HEADER
+            ),
+        );
+    }
+    response
 }
 
 /// Handle a CertificateResponse message.
@@ -924,7 +1318,12 @@ fn sign_message(
 /// Matches Peer's `verify_message_signature`:
 /// - Uses the message's signing_data() as the data
 /// - Key ID: "{nonce} {server_session_nonce}"
-/// - Counterparty: message sender's identity key
+/// - Counterparty: the SESSION's peer identity (`peerSession.peerIdentityKey`
+///   in the reference), never the message header's. The header is a claim;
+///   with the header as the counterparty ANY wallet's honest signature
+///   verified under a session another identity's unsigned initialRequest
+///   opened, and the context reported that identity (the 2026-09-14
+///   delta-verify NEW-1).
 fn verify_message_signature(
     wallet: &ProtoWallet,
     message: &AuthMessage,
@@ -937,6 +1336,10 @@ fn verify_message_signature(
 
     let data = message.signing_data();
     let key_id = message.get_key_id(Some(session.session_nonce.as_str()));
+    let Ok(session_identity) = bsv_sdk::primitives::PublicKey::from_hex(&session.peer_identity_key)
+    else {
+        return Ok(false); // a session whose identity is not a key verifies nothing
+    };
 
     let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
 
@@ -946,7 +1349,7 @@ fn verify_message_signature(
         signature: signature.clone(),
         protocol_id: protocol,
         key_id,
-        counterparty: Some(Counterparty::Other(message.identity_key.clone())),
+        counterparty: Some(Counterparty::Other(session_identity)),
         for_self: None,
     });
 
@@ -994,14 +1397,20 @@ pub fn add_cors_headers(response: Response) -> Response {
     let _ = headers.set(
         "Access-Control-Expose-Headers",
         &format!(
-            "{}, {}, {}, {}, {}, {}, {}, x-bsv-payment-satoshis-paid, x-bsv-payment-version, x-bsv-payment-satoshis-required, x-bsv-payment-derivation-prefix, x-bsv-payment-txid",
+            "{}, {}, {}, {}, {}, {}, {}, x-bsv-payment-satoshis-paid, x-bsv-payment-version, x-bsv-payment-satoshis-required, x-bsv-payment-derivation-prefix, x-bsv-payment-txid, {}",
             auth_headers::VERSION,
             auth_headers::IDENTITY_KEY,
             auth_headers::NONCE,
             auth_headers::YOUR_NONCE,
             auth_headers::SIGNATURE,
             auth_headers::MESSAGE_TYPE,
-            auth_headers::REQUEST_ID
+            auth_headers::REQUEST_ID,
+            // The lane offer rides a SIGNED response header; a cross-origin
+            // fetch only sees EXPOSED headers, and the SDK rebuilds the signed
+            // payload from what it sees — unexposed, the offer is invisible AND
+            // the answer's signature never verifies (the 2026-09-14
+            // delta-verify NEW-2).
+            lane::LANE_OFFER_HEADER
         ),
     );
 
@@ -1036,6 +1445,58 @@ mod tests {
     // ===========================================
     // Message signing and verification tests
     // ===========================================
+
+    /// The 2026-09-14 gate HIGH-1, pinned at the source: the handshake path
+    /// (`handle_initial_request`, the unsigned initialRequest) contains NO mint,
+    /// and the only mint site sits inside the `AuthResult::Authenticated` arm
+    /// of `process_auth_lane_with_storage` — a lane binds a PROVEN identity.
+    #[test]
+    fn the_lane_mints_only_for_an_authenticated_general_message_never_on_the_handshake() {
+        // The crate's own source up to its tests (this pin's own literals excluded).
+        let whole = include_str!("auth.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        let initial = &src[src.find("async fn handle_initial_request").unwrap()
+            ..src.find("/// Mint a lane for a proven").unwrap()];
+        assert!(
+            !initial.contains("mint_lane_offer("),
+            "the handshake path must not mint"
+        );
+        assert!(
+            initial.contains("NEVER offers a lane"),
+            "the handshake path states why"
+        );
+        let lane_fn = &src[src
+            .find("pub async fn process_auth_lane_with_storage")
+            .unwrap()
+            ..src.find("pub fn request_presents_lane").unwrap()];
+        assert_eq!(
+            lane_fn.matches("mint_lane_offer(").count(),
+            1,
+            "exactly one mint site"
+        );
+        let mint_at = lane_fn.find("mint_lane_offer(").unwrap();
+        let auth_arm = lane_fn.find("if let AuthResult::Authenticated {").unwrap();
+        assert!(
+            auth_arm < mint_at,
+            "the mint sits inside the Authenticated arm"
+        );
+        assert!(
+            lane_fn[..mint_at]
+                .contains("process_auth_with_storage(req, session_storage, options).await?"),
+            "the reference path judges the message BEFORE any mint"
+        );
+        assert_eq!(
+            src.matches("mint_lane_offer(").count(),
+            2,
+            "exactly two CALL sites: the Authenticated arm and the #443 step-4 attested wrapper (the definition carries generics before its paren)"
+        );
+        let wrapper = &src[src.find("pub async fn mint_attested_lane").unwrap()..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap()];
+        assert!(
+            wrapper.contains("mint_lane_offer(") && !wrapper.contains("process_auth"),
+            "the attested wrapper mints only; the door owns the proof"
+        );
+    }
 
     #[test]
     fn test_sign_and_verify_initial_response() {
@@ -1535,5 +1996,103 @@ mod tests {
             &payload[body_offset + 1..body_offset + 1 + json_bytes.len()],
             json_bytes.as_slice()
         );
+    }
+
+    /// The 2026-09-14 delta-verify NEW-1: a general message is verified against
+    /// the SESSION's identity (the reference's `peerSession.peerIdentityKey`),
+    /// never the header's. Before this pin the header identity was the
+    /// counterparty, so ANY wallet's honest signature verified under a session
+    /// another identity's UNSIGNED initialRequest opened, and the context
+    /// reported the victim.
+    #[test]
+    fn a_general_message_is_verified_against_the_session_s_identity_not_the_header_s() {
+        let server_wallet = test_wallet(SERVER_KEY_HEX);
+        let server_pk = test_key(SERVER_KEY_HEX);
+        let victim_pk = test_key(CLIENT_KEY_HEX);
+        let attacker_hex = "0000000000000000000000000000000000000000000000000000000000000003";
+        let attacker_wallet = test_wallet(attacker_hex);
+        let attacker_pk = test_key(attacker_hex);
+
+        // The attacker names ITS OWN key in the header, rides the victim's
+        // session nonce and signs honestly for its own key.
+        let mut msg = AuthMessage::new(MessageType::General, attacker_pk.clone());
+        msg.nonce = Some("attacker-nonce".to_string());
+        msg.your_nonce = Some("victim-session-nonce".to_string());
+        msg.payload = Some(vec![9, 9, 9]);
+        let attacker_view = StoredSession {
+            session_nonce: "attacker-nonce".to_string(),
+            peer_identity_key: server_pk.to_hex(),
+            peer_nonce: Some("victim-session-nonce".to_string()),
+            is_authenticated: true,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 0,
+            last_update: 0,
+        };
+        sign_message(&attacker_wallet, &mut msg, &attacker_view).unwrap();
+
+        // The server's session: opened by an unsigned initialRequest CLAIMING the victim.
+        let victim_session = StoredSession {
+            session_nonce: "victim-session-nonce".to_string(),
+            peer_identity_key: victim_pk.to_hex(),
+            peer_nonce: Some("attacker-nonce".to_string()),
+            is_authenticated: true,
+            certificates_required: false,
+            certificates_validated: false,
+            created_at: 0,
+            last_update: 0,
+        };
+        assert!(
+            !verify_message_signature(&server_wallet, &msg, &victim_session).unwrap(),
+            "another key's signature over a session claiming the victim must NOT verify"
+        );
+        // The honest control: the same message over the session ITS identity opened.
+        let own_session = StoredSession {
+            peer_identity_key: attacker_pk.to_hex(),
+            ..victim_session.clone()
+        };
+        assert!(verify_message_signature(&server_wallet, &msg, &own_session).unwrap());
+        // A session whose identity is not a key verifies nothing (never a panic).
+        let junk = StoredSession {
+            peer_identity_key: "not-a-key".to_string(),
+            ..victim_session
+        };
+        assert!(!verify_message_signature(&server_wallet, &msg, &junk).unwrap());
+    }
+
+    /// Structural: the general path refuses a header identity that is not the
+    /// session's BEFORE the signature is judged, and the verify's counterparty
+    /// is the session's identity (NEW-1); the lane offer header is EXPOSED by
+    /// both CORS emitters (NEW-2: a cross-origin fetch sees exposed headers
+    /// only, and the SDK rebuilds the signed payload from what it sees).
+    #[test]
+    fn the_general_path_binds_the_identity_and_the_offer_header_is_exposed() {
+        let whole = include_str!("auth.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").unwrap()];
+        let general = &src[src.find("pub async fn process_auth_with_storage").unwrap()..];
+        let bind = general
+            .find(".eq_ignore_ascii_case(&session.peer_identity_key)")
+            .expect("the identity binding");
+        let verify = general
+            .find("verify_message_signature(&wallet, &auth_message, &session)")
+            .expect("the verify call");
+        assert!(bind < verify, "the binding precedes the signature check");
+        let verify_fn = &src[src.find("fn verify_message_signature(").unwrap()..];
+        let verify_fn = &verify_fn[..verify_fn.find("\n}\n").unwrap()];
+        assert!(
+            verify_fn.contains("PublicKey::from_hex(&session.peer_identity_key)")
+                && verify_fn.contains("Counterparty::Other(session_identity)")
+                && !verify_fn.contains("message.identity_key"),
+            "the counterparty is the session's identity, never the header's"
+        );
+        for emitter in ["pub fn add_cors_headers(", "pub fn add_lane_cors_headers("] {
+            let body = &src[src.find(emitter).unwrap()..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            let expose = body.find("Access-Control-Expose-Headers").expect(emitter);
+            assert!(
+                body[expose..].contains("lane::LANE_OFFER_HEADER"),
+                "{emitter} exposes the lane offer header"
+            );
+        }
     }
 }

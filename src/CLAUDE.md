@@ -45,6 +45,8 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `middleware/mod.rs` | Re-exports for auth and payment middleware |
 | `middleware/auth.rs` | BRC-103/104 authentication (`process_auth` / `process_auth_with_storage`), per-request nonce replay protection (401 `ERR_REPLAYED_REQUEST` on reuse), `sign_response()`, `sign_json_response()`, inline CORS (`add_cors_headers`, `handle_cors_preflight`), handshake handling (InitialRequest, CertificateRequest, CertificateResponse). `process_auth` returns raw body bytes via `AuthResult::Authenticated { body }` for General messages. |
 | `middleware/payment.rs` | BRC-29 payment verification (`process_payment_with_storage` with `accepted` gate + single-use derivation prefixes; deprecated stateless `process_payment`), 402 response generation, `payment_headers` module (incl. `TXID`), `PAYMENT_NONCE_SCOPE`, `payment_failed_response()`. Internally split into a request/`Response`-free decision core (`decide_payment` → `PaymentDecision`, with an internalize seam) so the money path executes under native `cargo test` (the-composer #62), plus thin wrappers that render decisions into the exact historical HTTP responses. |
+| `payment_verify.rs` | Pre-internalize BRC-29 verification: `expected_brc29_locking_script`, `verify_brc29_payment_output` (script + amount, sync), `verify_brc29_payment` (adds BEEF completeness + SPV against a caller-supplied header service, which is REQUIRED: `None` / empty / the `.invalid` placeholder in any spelling (the host is normalised — lowercased, trailing dot stripped — before the comparison) / no `http(s)://` scheme / a host the gate cannot classify (userinfo, `%`, `\`, whitespace, non-ASCII, bad port) is `NoHeaderService`, fail-closed; once named, fail-open on service errors, fail-closed on a root mismatch; the gate `resolve_header_service` and the per-root `decide_root` are pure and table-tested), `verify_brc29_payment_structural_only` (the named opt-out: no SPV), `verify_brc29_payment_with_header_lookup` (caller-supplied header lookup, no URL gate; drives `conformance/brc29-payment-vectors.json` via `tests/conformance_brc29.rs`), `PaymentVerifyError` |
+| `payment_claims.rs` | Feature `d1-claims`: `claim_payment_nonce` / `release_payment_nonce`, an atomic `INSERT OR IGNORE` single-use claim on a D1 `payment_claims` table (`PAYMENT_CLAIMS_SCHEMA`); module docs state when it is needed next to `try_consume_nonce(PAYMENT_NONCE_SCOPE, ..)` |
 | `storage/mod.rs` | Re-exports for storage trait + KV implementations |
 | `storage/session_storage.rs` | `SessionStorage` trait: pluggable session persistence + single-use nonce consumption (`try_consume_nonce` / `release_nonce`); `MemorySessionStorage` (`cfg(test)`, `pub(crate)`) — atomic in-memory test double with consume/release fault injection, shared by the payment money-path tests |
 | `storage/kv_session.rs` | `KvSessionStorage` for BRC-103/104 session persistence with identity index and nonce-consumption records (read-then-write; see residual window note) |
@@ -68,6 +70,8 @@ lib.rs                    # Crate entry point, re-exports, init_panic_hook()
 | `sign_json_response` | Sign a JSON response with body bytes included in signed payload (recommended over `sign_response`) |
 | `WorkerStorageClient` | Storage server RPC client with BRC-103/104 authentication (re-exported from `client`) |
 | `init_panic_hook` | Initialize WASM panic hook for better error messages |
+| `verify_brc29_payment` / `verify_brc29_payment_output` / `expected_brc29_locking_script` | Pre-internalize payment verification for callers with their own payment flow (`payment_verify`) |
+| `claim_payment_nonce` / `release_payment_nonce` | Feature `d1-claims`: atomic single-use payment-nonce claim on D1 (`payment_claims`) |
 
 ### Middleware Types
 
@@ -451,7 +455,7 @@ wrangler secret put SERVER_PRIVATE_KEY
 ## Dependencies
 
 - `bsv_sdk` - BSV primitives, wallet (`ProtoWallet`, `WalletInterface`), auth protocol, nonce utils
-- `worker` - Cloudflare Workers runtime (Request, Response, KV, Headers)
+- `worker` - Cloudflare Workers runtime (Request, Response, KV, Headers; `d1` only under the `d1-claims` feature)
 - `serde` / `serde_json` - Serialization
 - `thiserror` - Error derive macros
 - `hex` - Hex encoding/decoding

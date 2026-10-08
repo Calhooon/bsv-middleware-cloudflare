@@ -109,8 +109,8 @@ pub trait SessionStorage {
 
     /// The hot path's two questions — "is this session live?" and "has this
     /// request nonce been seen?" — in ONE storage round trip, for a backend
-    /// that can answer both from one place (the Durable Object backend,
-    /// bsv-low W-D). The default says "not supported" (`None`) and the
+    /// that can answer both from one place (the Durable Object backend).
+    /// The default says "not supported" (`None`) and the
     /// middleware falls back to `get_session` then `try_consume_nonce`, in
     /// that order, so a backend that does not override this is byte-for-byte
     /// unchanged. An override consumes the request nonce BEFORE the signature
@@ -125,6 +125,50 @@ pub trait SessionStorage {
     ) -> Result<Option<(Option<StoredSession>, bool)>> {
         Ok(None)
     }
+
+    /// Session lane (0.3.4, `middleware::session_lane`): store a freshly
+    /// minted lane under its id. `Ok(false)` = this backend keeps no lanes
+    /// (the KV default): the handshake then offers none.
+    async fn lane_put(&self, _lane: &LaneRecord) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Session lane: verify one laned call against the stored lane (the
+    /// counter window, the MAC, the idle refresh), answering the verdict and,
+    /// on success, the lane's key so the caller can seal its answer.
+    /// `Ok(None)` = this backend keeps no lanes.
+    async fn lane_verify(&self, _ask: &LaneVerifyAsk) -> Result<Option<LaneVerdict>> {
+        Ok(None)
+    }
+}
+
+pub use crate::middleware::session_lane::LaneRecord;
+
+/// One laned call, as the door read it (the body already digested).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneVerifyAsk {
+    pub id: String,
+    pub identity: String,
+    // bounded: the counter is refused above MAX_SAFE_COUNTER at the header (parse_lane_headers)
+    pub h: u64,
+    pub method: String,
+    pub path_and_query: String,
+    pub body_sha256: String,
+    pub mac: String,
+}
+
+/// The store's answer to a `lane_verify`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneVerdict {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// In-memory [`SessionStorage`] test double, shared by the trait-contract
@@ -240,7 +284,7 @@ impl SessionStorage for MemorySessionStorage {
 mod tests {
     use super::*;
 
-    /// bsv-low W-D: a backend that does not override the combined hot-path
+    /// A backend that does not override the combined hot-path
     /// call answers "not supported", and the middleware keeps its two-step
     /// order (`get_session`, then `try_consume_nonce`) for it.
     #[test]

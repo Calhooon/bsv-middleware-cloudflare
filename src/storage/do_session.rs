@@ -1,4 +1,4 @@
-//! The Durable Object session backend (bsv-low W-D, 2026-09-10).
+//! The Durable Object session backend (2026-09-10).
 //!
 //! # Why
 //!
@@ -48,8 +48,9 @@
 //! the object and the client are thin shells over them.
 
 use crate::error::{AuthCloudflareError, Result};
+use crate::middleware::session_lane::{hex32, HttpCall, LaneRecord, Refusal, LANE_IDLE_MS};
 use crate::storage::kv_session::KvSessionStorage;
-use crate::storage::session_storage::SessionStorage;
+use crate::storage::session_storage::{LaneVerdict, LaneVerifyAsk, SessionStorage};
 use crate::types::{current_time_ms, StoredSession};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,9 @@ use worker::*;
 /// A consumed nonce outlives its request by at least this long when the
 /// caller passes no TTL (the KV backend's floor is the same 60 s).
 pub const NONCE_MIN_TTL_SECONDS: u64 = 60;
+/// The most nonces one session cell remembers (≈ 64 KiB of a 128 KiB value at
+/// 44-char nonces); beyond it the earliest-expiring generation is evicted.
+pub const CONSUMED_CAP: usize = 1_024;
 
 /// The pure state one `AuthSessionStore` holds for ONE session nonce.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -66,15 +70,72 @@ pub struct SessionCell {
     /// The session record, once a handshake saved it.
     pub session: Option<StoredSession>,
     /// The session's expiry (ms since the epoch); nothing is answered past it.
+    // bounded: a millisecond stamp
     pub expires_at_ms: u64,
     /// Consumed per-request nonces → their expiry (ms since the epoch).
+    // bounded: the values are millisecond expiries
     pub consumed: HashMap<String, u64>,
+    /// Session lane (0.3.4): an object keyed by a LANE id holds the lane here
+    /// and never a session; a session object never holds a lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneRecord>,
 }
 
 impl SessionCell {
     /// Whether the cell holds nothing live at `now_ms` (absent or expired).
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        self.session.is_none() || now_ms >= self.expires_at_ms
+        (self.session.is_none() && self.lane.is_none()) || now_ms >= self.expires_at_ms
+    }
+
+    /// Session lane: store a minted lane; the cell's window becomes the lane's.
+    pub fn lane_put(&mut self, lane: LaneRecord) {
+        self.expires_at_ms = lane.expires_at_ms;
+        self.lane = Some(lane);
+    }
+
+    /// Session lane: verify one laned call against the held lane
+    /// (`session_lane::LaneRecord::verify_http`; `idle_ms` refreshes the window
+    /// on success). An object without a lane, or whose lane's id or identity
+    /// differs from the caller's claim, answers `unknown-session` — the id is
+    /// the caller's word, the identity the store's.
+    pub fn lane_verify(&mut self, ask: &LaneVerifyAsk, now_ms: u64, idle_ms: u64) -> LaneVerdict {
+        let refused = |r: Refusal| LaneVerdict {
+            ok: false,
+            reason: Some(r.as_str().to_string()),
+            identity: None,
+            key: None,
+        };
+        let Some(lane) = self.lane.as_mut() else {
+            return refused(Refusal::UnknownSession);
+        };
+        if !lane.id.eq_ignore_ascii_case(&ask.id)
+            || !lane.identity.eq_ignore_ascii_case(&ask.identity)
+        {
+            return refused(Refusal::UnknownSession);
+        }
+        let Some(digest) = hex32(&ask.body_sha256) else {
+            return refused(Refusal::Malformed);
+        };
+        let call = HttpCall {
+            h: ask.h,
+            method: &ask.method,
+            path_and_query: &ask.path_and_query,
+            body_digest: &digest,
+            mac_hex: &ask.mac,
+        };
+        match lane.verify_http(&call, now_ms, idle_ms) {
+            Ok(()) => {
+                let (identity, key) = (lane.identity.clone(), lane.key.clone());
+                self.expires_at_ms = lane.expires_at_ms; // the object lives exactly as long as its lane
+                LaneVerdict {
+                    ok: true,
+                    reason: None,
+                    identity: Some(identity),
+                    key: Some(key),
+                }
+            }
+            Err(r) => refused(r),
+        }
     }
 
     /// The live session, or `None` when absent or expired.
@@ -87,18 +148,34 @@ impl SessionCell {
     }
 
     /// Save (or update) the session and extend its life by `ttl_seconds` from
-    /// `now_ms`. The consumed set is KEPT: an update is the same session.
+    /// `now_ms`. The consumed set is KEPT: an update is the same session, and
+    /// every remembered nonce lives at least as long as the session now does
+    /// (NEW-3, see `consume`).
     pub fn save(&mut self, session: StoredSession, ttl_seconds: u64, now_ms: u64) {
         self.session = Some(session);
         self.expires_at_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+        let life = self.expires_at_ms;
+        for exp in self.consumed.values_mut() {
+            if *exp < life {
+                *exp = life;
+            }
+        }
         self.prune(now_ms);
     }
 
     /// Atomic put-if-absent of a per-request nonce: `true` the first time,
     /// `false` on a replay. A consumed nonce is remembered for `ttl_seconds`
-    /// (floored at `NONCE_MIN_TTL_SECONDS`); expired ones are pruned first, so
-    /// a nonce whose memory lapsed is fresh again — exactly the KV backend's
-    /// TTL semantics, without the write.
+    /// (floored at `NONCE_MIN_TTL_SECONDS`) AND for the session's remaining
+    /// life — `save` (the sliding touch) extends every remembered nonce with
+    /// the session, so a captured signed request never outlives the memory of
+    /// its nonce while its session still answers (the 2026-09-14 delta-verify
+    /// NEW-3; the KV backend keeps a plain TTL per nonce — a stated divergence
+    /// between the two backends, the KV one's residual is the reference's).
+    /// Bounded: past `CONSUMED_CAP` nonces the earliest-expiring generation is
+    /// evicted (a replay of a request older than that many requests within one
+    /// live session is the residual, and the cell stays under the Durable
+    /// Object's 128 KiB value cap). Expired ones are pruned first, so a nonce
+    /// whose memory lapsed is fresh again.
     pub fn consume(&mut self, nonce: &str, ttl_seconds: Option<u64>, now_ms: u64) -> bool {
         self.prune(now_ms);
         if self.consumed.contains_key(nonce) {
@@ -107,11 +184,28 @@ impl SessionCell {
         let ttl = ttl_seconds
             .unwrap_or(NONCE_MIN_TTL_SECONDS)
             .max(NONCE_MIN_TTL_SECONDS);
-        self.consumed.insert(
-            nonce.to_string(),
-            now_ms.saturating_add(ttl.saturating_mul(1000)),
-        );
+        let until = now_ms
+            .saturating_add(ttl.saturating_mul(1000))
+            .max(self.expires_at_ms);
+        self.consumed.insert(nonce.to_string(), until);
+        self.evict_past_cap();
         true
+    }
+
+    /// Keep the consumed set under `CONSUMED_CAP`: the earliest-expiring
+    /// entries go first (the oldest generation under the session-life rule).
+    fn evict_past_cap(&mut self) {
+        while self.consumed.len() > CONSUMED_CAP {
+            let Some(oldest) = self
+                .consumed
+                .iter()
+                .min_by_key(|(n, exp)| (**exp, (*n).clone()))
+                .map(|(n, _)| n.clone())
+            else {
+                break;
+            };
+            self.consumed.remove(&oldest);
+        }
     }
 
     /// Forget a consumed nonce (the payment path's release on a failed
@@ -135,7 +229,12 @@ impl SessionCell {
         ttl_seconds: Option<u64>,
         now_ms: u64,
     ) -> (Option<StoredSession>, bool) {
-        if self.is_expired(now_ms) {
+        // A LANE object (keyed by a lane id) holds no session: a general
+        // message whose `your-nonce` names a lane id must consume NOTHING here
+        // (the 2026-09-14 gate LOW-4: every such request grew the lane object's
+        // consumed map toward the value cap, turning the victim's laned calls
+        // 503). Only a live SESSION burns a nonce.
+        if self.session.is_none() || self.is_expired(now_ms) {
             return (None, false);
         }
         let fresh = self.consume(nonce, ttl_seconds, now_ms);
@@ -167,6 +266,7 @@ pub fn route_scope(scope: &str) -> ScopeRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SaveBody {
     pub session: StoredSession,
+    // bounded: a TTL in seconds (the configured session TTL)
     pub ttl_seconds: u64,
 }
 
@@ -175,10 +275,26 @@ pub struct SaveBody {
 pub struct NonceBody {
     pub nonce: String,
     #[serde(default)]
+    // bounded: a TTL in seconds (the configured session TTL)
     pub ttl_seconds: Option<u64>,
 }
 
 /// `POST /consume` answer.
+/// `PUT /lane` — the minted lane, stored under its id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LanePutBody {
+    pub lane: LaneRecord,
+}
+
+/// `POST /lane-verify` — one laned call to judge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaneVerifyBody {
+    pub ask: LaneVerifyAsk,
+    #[serde(default)]
+    // bounded: the configured idle window in ms (an hour)
+    pub idle_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConsumeAnswer {
     pub fresh: bool,
@@ -290,6 +406,31 @@ impl DurableObject for AuthSessionStore {
                 Ok(Response::empty()?.with_status(204))
             }
             (Method::Delete, "/session") => {
+                let _ = self.state.storage().delete_all().await;
+                Ok(Response::empty()?.with_status(204))
+            }
+            // Session lane (0.3.4): the object keyed by the LANE id.
+            (Method::Put, "/lane") => {
+                let body: LanePutBody = req.json().await?;
+                cell.lane_put(body.lane);
+                self.store(&cell)
+                    .await
+                    .map_err(|e| worker::Error::from(e.to_string()))?;
+                self.arm_gc(cell.expires_at_ms).await;
+                Ok(Response::empty()?.with_status(204))
+            }
+            (Method::Post, "/lane-verify") => {
+                let body: LaneVerifyBody = req.json().await?;
+                let verdict =
+                    cell.lane_verify(&body.ask, now, body.idle_ms.unwrap_or(LANE_IDLE_MS));
+                if verdict.ok {
+                    self.store(&cell)
+                        .await
+                        .map_err(|e| worker::Error::from(e.to_string()))?;
+                }
+                json_status(&verdict, 200)
+            }
+            (Method::Delete, "/lane") => {
                 let _ = self.state.storage().delete_all().await;
                 Ok(Response::empty()?.with_status(204))
             }
@@ -546,6 +687,42 @@ impl SessionStorage for DoSessionStorage {
             }
         }
     }
+
+    async fn lane_put(&self, lane: &LaneRecord) -> Result<bool> {
+        let body = serde_json::to_string(&LanePutBody { lane: lane.clone() })
+            .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+        let res = self
+            .call(&lane.id, Method::Put, "/lane", Some(body))
+            .await?;
+        if res.status_code() != 204 {
+            return Err(AuthCloudflareError::KvError(format!(
+                "auth-session-store lane put: status {}",
+                res.status_code()
+            )));
+        }
+        Ok(true)
+    }
+
+    async fn lane_verify(&self, ask: &LaneVerifyAsk) -> Result<Option<LaneVerdict>> {
+        let body = serde_json::to_string(&LaneVerifyBody {
+            ask: ask.clone(),
+            idle_ms: Some(LANE_IDLE_MS),
+        })
+        .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
+        let mut res = self
+            .call(&ask.id, Method::Post, "/lane-verify", Some(body))
+            .await?;
+        if res.status_code() != 200 {
+            return Err(AuthCloudflareError::KvError(format!(
+                "auth-session-store lane verify: status {}",
+                res.status_code()
+            )));
+        }
+        let verdict: LaneVerdict = res.json().await.map_err(|e| {
+            AuthCloudflareError::KvError(format!("auth-session-store lane verify body: {e}"))
+        })?;
+        Ok(Some(verdict))
+    }
 }
 
 /// `now` for callers outside a Worker request (tests); the object itself reads
@@ -574,6 +751,139 @@ mod tests {
         }
     }
 
+    fn lane(id: &str, identity: &str, key: &str, expires_at_ms: u64) -> LaneRecord {
+        LaneRecord {
+            id: id.to_string(),
+            key: key.to_string(),
+            identity: identity.to_string(),
+            expires_at_ms,
+            last_h: 0,
+            seen_mask: 0,
+            minted_at_ms: 1_000,
+        }
+    }
+
+    /// The 2026-09-14 gate LOW-4: an object holding a LANE (no session) must
+    /// consume no per-request nonce — a general message naming a lane id as
+    /// its `your-nonce` used to grow the lane object toward the value cap.
+    #[test]
+    fn a_lane_object_consumes_no_session_nonce() {
+        let mut c = SessionCell::default();
+        c.lane_put(lane(
+            &"ab".repeat(32),
+            &"02".repeat(33),
+            &"cd".repeat(32),
+            5_000_000,
+        ));
+        assert!(!c.is_expired(1_000));
+        let (session, fresh) = c.get_and_consume("some-nonce", None, 1_000);
+        assert!(session.is_none());
+        assert!(!fresh, "nothing is burnt against a lane");
+        assert!(
+            c.consumed.is_empty(),
+            "the lane object stays empty of nonces"
+        );
+        let (_, again) = c.get_and_consume("some-nonce", None, 1_000);
+        assert!(!again);
+    }
+
+    fn lane_ask(l: &LaneRecord, h: u64, method: &str, path: &str, body: &str) -> LaneVerifyAsk {
+        use crate::middleware::session_lane::{frame_mac, http_event};
+        let key = hex32(&l.key).unwrap();
+        LaneVerifyAsk {
+            id: l.id.clone(),
+            identity: l.identity.clone(),
+            h,
+            method: method.to_string(),
+            path_and_query: path.to_string(),
+            body_sha256: hex::encode(crate::middleware::session_lane::body_digest(
+                body.as_bytes(),
+            )),
+            mac: hex::encode(frame_mac(&key, h, &http_event(method, path), body)),
+        }
+    }
+
+    #[test]
+    fn a_lane_object_holds_no_session_serves_its_lane_and_lives_by_the_lanes_window() {
+        let key = "3189aaa50e7da56072898a9fb1c62af598b6d69f12c300f907b8c85b74d7dca4";
+        let id = "ab".repeat(32);
+        let identity = "02".repeat(33);
+        let mut c = SessionCell::default();
+        assert!(c.is_expired(1_000), "an empty cell is expired");
+        c.lane_put(lane(&id, &identity, key, 5_000_000));
+        assert!(!c.is_expired(1_000), "a lane keeps the object alive");
+        assert!(c.get(1_000).is_none(), "a lane object answers no session");
+        assert!(c.is_expired(5_000_000), "…until the lane's window ends");
+        let l = c.lane.clone().unwrap();
+        let ok = c.lane_verify(
+            &lane_ask(&l, 1, "GET", "/results?identity=02", ""),
+            1_000,
+            LANE_IDLE_MS,
+        );
+        assert!(ok.ok, "{ok:?}");
+        assert_eq!(ok.identity.as_deref(), Some(identity.as_str()));
+        assert_eq!(ok.key.as_deref(), Some(key));
+        assert_eq!(
+            c.expires_at_ms,
+            1_000 + LANE_IDLE_MS,
+            "a good call refreshes the object's window"
+        );
+        let replay = c.lane_verify(
+            &lane_ask(&l, 1, "GET", "/results?identity=02", ""),
+            1_000,
+            LANE_IDLE_MS,
+        );
+        assert_eq!(replay.reason.as_deref(), Some("replay"));
+        assert!(replay.key.is_none(), "a refusal never leaks the key");
+    }
+
+    #[test]
+    fn a_lane_verify_refuses_a_foreign_identity_a_foreign_id_a_missing_lane_and_a_malformed_digest()
+    {
+        let key = "3189aaa50e7da56072898a9fb1c62af598b6d69f12c300f907b8c85b74d7dca4";
+        let id = "ab".repeat(32);
+        let identity = "02".repeat(33);
+        let mut c = SessionCell::default();
+        let l = lane(&id, &identity, key, 5_000_000);
+        let none = c.lane_verify(&lane_ask(&l, 1, "GET", "/x", ""), 1_000, LANE_IDLE_MS);
+        assert_eq!(
+            none.reason.as_deref(),
+            Some("unknown-session"),
+            "no lane in the object"
+        );
+        c.lane_put(l.clone());
+        let mut foreign = lane_ask(&l, 2, "GET", "/x", "");
+        foreign.identity = "03".repeat(33);
+        assert_eq!(
+            c.lane_verify(&foreign, 1_000, LANE_IDLE_MS)
+                .reason
+                .as_deref(),
+            Some("unknown-session")
+        );
+        let mut other = lane_ask(&l, 2, "GET", "/x", "");
+        other.id = "cd".repeat(32);
+        assert_eq!(
+            c.lane_verify(&other, 1_000, LANE_IDLE_MS).reason.as_deref(),
+            Some("unknown-session")
+        );
+        let mut bad = lane_ask(&l, 2, "GET", "/x", "");
+        bad.body_sha256 = "zz".into();
+        assert_eq!(
+            c.lane_verify(&bad, 1_000, LANE_IDLE_MS).reason.as_deref(),
+            Some("malformed")
+        );
+        assert_eq!(c.lane.as_ref().unwrap().last_h, 0, "nothing accepted");
+        let good = lane_ask(&l, 2, "GET", "/x", "");
+        assert!(c.lane_verify(&good, 1_000, LANE_IDLE_MS).ok);
+        let session_json = serde_json::to_string(&c).unwrap();
+        assert!(
+            session_json.contains("\"lane\""),
+            "the lane persists in the cell"
+        );
+        let empty = serde_json::to_string(&SessionCell::default()).unwrap();
+        assert!(!empty.contains("lane"), "an old cell serializes as before");
+    }
+
     #[test]
     fn a_cell_answers_nothing_when_absent_or_expired_and_the_session_inside_its_life() {
         let mut c = SessionCell::default();
@@ -594,21 +904,87 @@ mod tests {
     }
 
     #[test]
-    fn consume_is_a_put_if_absent_with_the_kv_backend_s_ttl_semantics() {
+    fn consume_is_a_put_if_absent_remembered_for_the_session_s_life() {
+        // No session (the two-step `/consume` path): the KV backend's TTL
+        // semantics, floored at 60 s.
         let mut c = SessionCell::default();
-        c.save(session("n1"), 3_600, 0);
-        assert!(c.consume("r1", Some(3_600), 10));
-        assert!(!c.consume("r1", Some(3_600), 11), "a replay is refused");
         assert!(c.consume("r2", None, 12));
-        // The floor: a consumed nonce is remembered for at least 60 s.
         assert!(!c.consume("r2", None, 12 + 59_999));
         assert!(
             c.consume("r2", None, 12 + 60_000),
             "its memory lapsed: fresh again"
         );
-        // The caller's TTL, when longer, is honoured.
-        assert!(!c.consume("r1", Some(3_600), 10 + 3_599_999));
-        assert!(c.consume("r1", Some(3_600), 10 + 3_600_000));
+        // A live session: the nonce is remembered for the LONGER of the TTL
+        // and the session's remaining life (NEW-3).
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 3_600, 0);
+        assert!(c.consume("r1", Some(60), 10));
+        assert!(!c.consume("r1", Some(60), 11), "a replay is refused");
+        assert!(
+            !c.consume("r1", Some(60), 10 + 60_000),
+            "the TTL lapsed but the session lives: still refused"
+        );
+        assert!(
+            !c.consume("r1", Some(60), 3_599_999),
+            "remembered to the session's last millisecond"
+        );
+        assert!(
+            c.consume("r1", Some(60), 3_600_000),
+            "the session died with it"
+        );
+        // The caller's TTL, when LONGER than the session's life, is honoured.
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 60, 0);
+        assert!(c.consume("r3", Some(3_600), 10));
+        assert!(!c.consume("r3", Some(3_600), 10 + 3_599_999));
+        assert!(c.consume("r3", Some(3_600), 10 + 3_600_000));
+    }
+
+    /// NEW-3: the session slides on its lazy touch; a nonce consumed before
+    /// the touch used to lapse while the session still answered (a captured
+    /// signed request replayed, and with a lane ask minted a lane under the
+    /// victim). The touch now extends every remembered nonce with the session.
+    #[test]
+    fn a_touch_extends_every_remembered_nonce_with_the_session() {
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 3_600, 0);
+        assert!(c.consume("r1", Some(3_600), 1_000));
+        let mut touched = session("n1");
+        touched.last_update = 3_000_000;
+        c.save(touched, 3_600, 3_000_000); // the session now lives to 6_600_000
+        assert!(
+            !c.consume("r1", Some(3_600), 3_601_000),
+            "past the nonce's own TTL, the session live: refused"
+        );
+        assert!(
+            !c.consume("r1", Some(3_600), 6_599_999),
+            "refused to the session's last millisecond"
+        );
+        assert_eq!(c.consumed.get("r1"), Some(&6_600_000));
+        assert!(c.consume("r1", Some(3_600), 6_600_000));
+    }
+
+    /// The bound: past `CONSUMED_CAP` nonces the earliest-expiring go first;
+    /// a busy session never grows its cell past the value cap into a 503.
+    #[test]
+    fn the_consumed_set_is_bounded_and_evicts_the_earliest_expiring() {
+        let mut c = SessionCell::default();
+        c.save(session("n1"), 3_600, 0);
+        for i in 0..CONSUMED_CAP {
+            assert!(c.consume(&format!("r{i}"), Some(7_200), i as u64));
+        }
+        assert_eq!(c.consumed.len(), CONSUMED_CAP);
+        assert!(c.consume("late", Some(7_200), 10_000));
+        assert_eq!(c.consumed.len(), CONSUMED_CAP, "one in, one out");
+        assert!(
+            !c.consumed.contains_key("r0"),
+            "the earliest-expiring nonce was evicted"
+        );
+        assert!(c.consumed.contains_key("r1") && c.consumed.contains_key("late"));
+        assert!(
+            c.consume("r0", Some(7_200), 10_001),
+            "evicted = fresh again (the stated residual)"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ adapted for the Workers runtime (KV for state, async everywhere, explicit respon
 ```bash
 cargo check --target wasm32-unknown-unknown
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
-cargo test --lib
+cargo test --lib --all-features
 worker-build --release           # WASM binary (only for the example server)
 ```
 
@@ -40,6 +40,10 @@ src/
 │   └── storage.rs      — WorkerStorageClient: auth'd RPC to a wallet storage server
 ├── transport/
 │   └── cloudflare.rs   — CloudflareTransport: BRC-104 header extraction, payload build
+├── payment_verify.rs   — verify_brc29_payment[_output](): pre-internalize script + amount,
+│                         BEEF completeness, SPV via a caller-supplied header service (required;
+│                         verify_brc29_payment_structural_only() is the named opt-out)
+├── payment_claims.rs   — feature `d1-claims`: atomic single-use payment-nonce claim on D1
 ├── refund/             — feature-gated BRC-41 refund builder
 └── utils/
     └── cors.rs         — CorsConfig and preflight helpers

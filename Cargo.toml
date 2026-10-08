@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-cloudflare"
-version = "0.3.3"
+version = "0.3.7"
 edition = "2021"
 description = "BSV BRC-103/104 authentication and BRC-29 payment middleware for Cloudflare Workers"
 license = "MIT OR Apache-2.0"
@@ -17,9 +17,6 @@ worker = "0.8"
 
 # BSV SDK
 bsv-sdk = { package = "bsv-rs", version = "0.3", features = ["auth", "wallet", "transaction", "wasm"] }
-# The shared payment check (P0-3): the paying output compared with the price.
-# Pinned to the main commit that carries the check; replace with version = "0.2.1" once published.
-bsv-middleware-rs = { git = "https://github.com/Calhooon/bsv-middleware-rs.git", rev = "20c1a650dd7ad4e77d06c2127c62bc580015f82d" }
 
 # Async
 futures = "0.3"
@@ -47,12 +44,19 @@ getrandom = { version = "0.2", features = ["js"] }
 rand = "0.8"
 
 # Crypto (optional, for refund feature)
-sha2 = { version = "0.10", optional = true }
+# sha2 is a plain dependency since 0.3.4 (the session lane MACs); ripemd stays behind `refund`.
+sha2 = "0.10"
+hmac = "0.12"
 ripemd = { version = "0.1", optional = true }
 
 [features]
 default = []
-refund = ["sha2", "ripemd"]
+refund = ["ripemd"]
+# `payment_claims`: atomic single-use payment-nonce claims on a D1 table.
+d1-claims = ["worker/d1"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

@@ -175,7 +175,7 @@ pub async fn issue_refund(
         PrivateKey::from_hex(server_key).map_err(|e| RefundError::Signing(e.to_string()))?,
     ));
     let signed_tx = signer::sign_create_action_template(&signing_wallet, &create_result)
-        .map_err(|e| RefundError::Signing(e))?;
+        .map_err(RefundError::Signing)?;
     let txid = signer::compute_txid(&signed_tx);
 
     // 4. Broadcast via processAction
