@@ -393,7 +393,7 @@ mod tests {
     }
 
     /// Round-trip test: build multipart bytes in the same format as the Rust client
-    /// (rust-bsv-worm build_multipart_body) and verify the parser extracts correctly.
+    /// (the client's multipart body builder) and verify the parser extracts correctly.
     #[test]
     fn test_roundtrip_client_format() {
         let boundary = "----BsvPayment00a1b2c3d4e5f678";
@@ -403,7 +403,7 @@ mod tests {
             br#"{"model":"gpt-5-nano","messages":[{"role":"user","content":"hello"}]}"#;
         let original_ct = "application/json";
 
-        // Build multipart body in client format (mirrors rust-bsv-worm build_multipart_body)
+        // Build multipart body in client format (mirrors the client's build_multipart_body)
         let mut buf = Vec::new();
         buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         buf.extend_from_slice(b"Content-Disposition: form-data; name=\"x-bsv-payment\"\r\n");
