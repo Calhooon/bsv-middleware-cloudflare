@@ -1,16 +1,5 @@
 # Changelog
 
-## 0.3.8 — 2026-10-08
-
-### Fixed
-
-- **The middleware's own payment flow reads the paying output** (P0-3b): `verify_brc29_payment_output` runs on output 0 before the derivation prefix is consumed and before `internalizeAction`; `Underpaid` and `WrongScript` answer 402 with a fresh challenge; the amount read is recorded as `satoshis_paid`. 0.3.7 shipped the conformance vectors without this wiring.
-
-## 0.3.7 — 2026-10-08
-
-- `conformance/brc29-payment-vectors.json`: the BRC-29 payment-verification conformance set (20 cases: output checks incl. the reference's first-output rule, no-header-service forms, merkle-root outcomes) with `tests/conformance_brc29.rs` pinning and running it. A second implementation runs the same file; see `conformance/README.md`.
-- One additive public decision function so the verdict is callable without a fetch. No behaviour or signature changes.
-
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
@@ -19,7 +8,7 @@ patch versions are additive unless a line below says otherwise.
 The core extract. The rules moved to a new runtime-free crate, `bsv-middleware-core` 0.1.0 (this repository,
 `core/`); this crate is now the Cloudflare Workers adapter over it. **Not a breaking change for adopters:** every
 0.3 public item keeps its name, path and signature (re-exported from the core where the type moved), and the
-fleet's call sites compile unchanged.
+fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
 
 ### What moved to the core (re-exported here at the 0.3 paths)
 
@@ -48,12 +37,8 @@ fleet's call sites compile unchanged.
   (feature `d1-claims`): the D1 table as the core's `ClaimStore`.
 - `bsv_middleware_cloudflare::core` (the core crate as a module) and the top-level `HeaderService`,
   `PaymentVerdict`, `PaymentFault` re-exports.
-- `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
-  (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
-  fail-open service error. For a service binding, a cached header store, or a conformance runner.
-- `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
-  verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
-  by `tests/conformance_brc29.rs`; the core runs the same file through its trait with a stub.
+- `core/tests/conformance_brc29.rs`: the core runs the 20 vectors of `conformance/brc29-payment-vectors.json` (0.3.7)
+  through its `HeaderService` trait with a stub; the adapter's runner re-pins the file with the 0.4.0 producer line.
 
 ### Behaviour
 
@@ -62,18 +47,31 @@ fleet's call sites compile unchanged.
   the reason logged; a later release changes the hosts), every other word is the same-named `Err`.
 - `verify_brc29_payment_structural_only` now answers through the core's `Unverifiable` word when a proof carries
   roots; the adapter accepts it and logs the warning, as 0.3.6 did.
+- **The middleware's own payment path decides from the core's words.** `process_payment_with_storage`,
+  `process_payment_with_storage_signed` and the deprecated `process_payment` run the core's output check
+  (`bsv_middleware_core::verify_payment_output`) on output 0 and match its `PaymentVerdict` once
+  (`judge_paying_output`): `Verified` serves and records the amount read; `Underpaid` / `WrongScript` keep the
+  0.3.8 answer (`402 ERR_INVALID_PAYMENT` with a fresh challenge, the prefix not consumed, the wallet not called);
+  a `PaymentFault` or `RootMismatch` is `400 ERR_INVALID_PAYMENT`, the prefix kept; `NoHeaderService` is
+  `500 ERR_SERVER_MISCONFIGURED` (the server's own fault, never a client error); `Unverifiable` takes the adapter's
+  `accept_verdict` policy (accepted, logged). The output check answers three of the six words today (no SPV on
+  this path); the other arms are the path's standing answer should the check grow a proof step. Every payment
+  0.3.8 could see gets the same wire answer.
 
 ### Removed from the dependency list
 
 - `hmac` and `ripemd` (they moved with the lane and the signer; `sha2` stays for the Durable Object cell).
 
+## 0.3.8 — 2026-10-08
+
 ### Fixed
 
-- **The middleware's own payment flow reads the paying output.** `process_payment_with_storage`,
+- **The middleware's own payment flow reads the paying output** (P0-3b). `process_payment_with_storage`,
   `process_payment_with_storage_signed` and the deprecated `process_payment` now run `verify_brc29_payment_output` on
   output 0 before the derivation prefix is consumed and before `internalizeAction`. Until now nothing on this path
   compared the output with the price or checked that it pays this server's BRC-29 derived key; the storage server
-  checks neither, so an underpaid payment, or one paying another key, was served.
+  checks neither, so an underpaid payment, or one paying another key, was served. 0.3.7 shipped the conformance
+  vectors without this wiring.
 
 ### Behaviour
 
@@ -87,6 +85,17 @@ fleet's call sites compile unchanged.
 - The middleware does not run BEEF structure or SPV (`verify_brc29_payment` stays the caller's choice).
 - Exact-price payers to the key derived from the same `server_private_key` see no change. A deployment whose payment
   key differs from the key its clients derive for will now be refused instead of recording outputs it cannot spend.
+
+## 0.3.7 — 2026-10-08
+
+### Added
+
+- `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
+  (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
+  fail-open service error. For a service binding, a cached header store, or a conformance runner.
+- `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
+  verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
+  by `tests/conformance_brc29.rs`. A second implementation runs the same file. No behaviour or signature changes.
 
 ## 0.3.6 — 2026-10-08
 

@@ -5,7 +5,7 @@ patch versions are additive unless a line below says otherwise.
 
 ## 0.1.0 — 2026-10-08
 
-The first release: the runtime-free rules extracted from `bsv-middleware-cloudflare` 0.3.6, which becomes a
+The first release: the runtime-free rules extracted from `bsv-middleware-cloudflare` 0.3.8, which becomes a
 Workers adapter over this crate in its 0.4.0.
 
 ### The six words
