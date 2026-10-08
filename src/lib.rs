@@ -32,7 +32,7 @@
 //!   [`verify_brc29_payment_structural_only`] is the named opt-out without
 //!   SPV), for callers running their own payment flow
 //! - **Atomic payment-nonce claims on D1** (feature `d1-claims`):
-//!   [`claim_payment_nonce`] / [`release_payment_nonce`], a globally
+//!   `claim_payment_nonce` / `release_payment_nonce`, a globally
 //!   consistent put-if-absent for callers outside the stock middleware
 //! - **Cloudflare KV Storage**: Session and payment storage in Cloudflare KV
 //! - **CORS Handling**: Built-in CORS support for browser clients

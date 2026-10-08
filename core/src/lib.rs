@@ -28,7 +28,7 @@
 //!   `InitialResponse`, the signed general message that carries a response.
 //! - [`session_lane`]: the MAC'd session lane (one handshake, then no wallet
 //!   calls per request), pure.
-//! - [`refund`] (feature `refund`): the refund key derivation and the
+//! - `refund` (feature `refund`): the refund key derivation and the
 //!   `createAction` template signer.
 //! - [`types`]: the context a host attaches to a request.
 //!
