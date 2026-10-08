@@ -3,16 +3,58 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
-## Unreleased
+## 0.4.0 — 2026-10-08
+
+The core extract. The rules moved to a new runtime-free crate, `bsv-middleware-core` 0.1.0 (this repository,
+`core/`); this crate is now the Cloudflare Workers adapter over it. **Not a breaking change for adopters:** every
+0.3 public item keeps its name, path and signature (re-exported from the core where the type moved), and the
+fleet's call sites compile unchanged.
+
+### What moved to the core (re-exported here at the 0.3 paths)
+
+- `types::{AuthContext, PaymentContext, BsvPayment}`.
+- `transport::{auth_headers, HttpRequestData, HttpResponseData}`; the request payload builder, the varint
+  writer, the signable-header filters and `message_to_headers` are `bsv_middleware_core::brc104`
+  (`CloudflareTransport` delegates to them).
+- `middleware::session_lane` (whole; the adapter keeps the suite and `tests/fixtures/session_lane.vectors.json`).
+- `refund::signer` (whole); `issue_refund` derives the client's key through `bsv_middleware_core::refund`.
+- The BRC-103 sign/verify, the identity binding, the `InitialResponse` and `CertificateResponse` builders and
+  response signing (`bsv_middleware_core::auth`, over a `SessionBinding`); `process_auth*`, `sign_response` and
+  `sign_json_response` call them and are byte-for-byte on the wire.
+- BRC-29 derivation, the output check, BEEF completeness and the SPV decision
+  (`bsv_middleware_core::{brc29, spv, payment_verify}`), answered in the six words (`PaymentVerdict`).
+- `PAYMENT_NONCE_SCOPE` (`bsv_middleware_core::store`).
 
 ### Added
 
+- `UrlHeaderService`: the core's `HeaderService` over a ChainTracks-compatible base URL (Workers `fetch`), built
+  only through the 0.3.6 configuration gate (`UrlHeaderService::resolve`).
+- `verify_brc29_payment_verdict`: the core's `PaymentVerdict` through any `HeaderService`, for callers that
+  decide the words themselves.
+- `accept_verdict`: the one visible match from the core's words to `PaymentVerifyError` / `Ok(satoshis)`.
+- `PaymentVerifyError: From<PaymentFault>`; `AuthCloudflareError: From<bsv_middleware_core::AuthError>`.
+- `SessionNonceStore(&storage)`: any `SessionStorage` as the core's `PaymentNonceStore`; `D1ClaimStore(&db)`
+  (feature `d1-claims`): the D1 table as the core's `ClaimStore`.
+- `bsv_middleware_cloudflare::core` (the core crate as a module) and the top-level `HeaderService`,
+  `PaymentVerdict`, `PaymentFault` re-exports.
 - `verify_brc29_payment_with_header_lookup`: `verify_brc29_payment` with the header lookup supplied by the caller
   (`Fn(height) -> Future<Result<merkle_root, reason>>`) instead of a `header_url`; same fail-closed mismatch,
   fail-open service error. For a service binding, a cached header store, or a conformance runner.
 - `conformance/brc29-payment-vectors.json` + `conformance/README.md`: 20 implementation-neutral BRC-29 payment
   verification vectors (amount, script, first-output rule, pay-yourself, header-service gate, SPV), produced and run
-  by `tests/conformance_brc29.rs`.
+  by `tests/conformance_brc29.rs`; the core runs the same file through its trait with a stub.
+
+### Behaviour
+
+- Unchanged on the wire. The verdict mapping is documented in `payment_verify`: `Verified` and `Unverifiable`
+  are `Ok(satoshis)` (**fail-open on a header-service error stays this adapter's documented policy in 0.4**, with
+  the reason logged; a later release changes the hosts), every other word is the same-named `Err`.
+- `verify_brc29_payment_structural_only` now answers through the core's `Unverifiable` word when a proof carries
+  roots; the adapter accepts it and logs the warning, as 0.3.6 did.
+
+### Removed from the dependency list
+
+- `hmac` and `ripemd` (they moved with the lane and the signer; `sha2` stays for the Durable Object cell).
 
 ## 0.3.6 — 2026-10-08
 

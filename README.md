@@ -14,6 +14,23 @@ Port of [`auth-express-middleware`](https://github.com/bitcoin-sv/auth-express-m
 - **`verify_brc29_payment`** / **`verify_brc29_payment_output`** (0.3.6) — checks, before anything is internalized, that a BRC-29 payment output pays *this* server's derived key at least the quoted amount inside a structurally complete BEEF, with merkle roots checked against a header service you run (required: no service, no verdict; `verify_brc29_payment_structural_only` is the named opt-out without SPV). For callers with their own payment flow.
 - **Optional `d1-claims` feature** (0.3.6) — `claim_payment_nonce` / `release_payment_nonce`: an atomic, globally consistent single-use claim on a payment nonce in a D1 table, for callers outside the stock middleware or on the eventually-consistent KV backend.
 
+## Shape (0.4.0): the core and the adapter
+
+Since 0.4.0 the rules live in a runtime-free crate, [`bsv-middleware-core`](core/README.md) (this repository,
+`core/`), and this crate is the Cloudflare Workers adapter over it:
+
+| the core (`bsv-middleware-core`, no runtime) | this crate (`bsv-middleware-cloudflare`, Workers) |
+|---|---|
+| BRC-103 message build and verify over a `SessionBinding` (sign, verify against the SESSION's identity, the handshake replies, response signing) | reading a `worker::Request` into those messages, the session records, the replay guard, the HTTP answers, CORS |
+| BRC-29 derivation, the output check, BEEF completeness and the SPV decision, answered in six words (`PaymentVerdict`: `Verified`, `Underpaid`, `WrongScript`, `NoHeaderService`, `RootMismatch`, `Unverifiable`) | `verify_brc29_payment` and friends with their 0.3 signatures, `PaymentVerifyError`, and `accept_verdict`, the one visible match from the words to it |
+| the `HeaderService` trait (no URL type in the core; `None` fails closed) | `UrlHeaderService`: Workers `fetch` to a ChainTracks-compatible base URL behind the 0.3.6 configuration gate |
+| the `PaymentNonceStore` and `ClaimStore` traits | KV, Durable Object and D1 implementations (`SessionNonceStore`, `D1ClaimStore`) |
+| the session lane's rules, the refund key derivation and the template signer, the context types | the lane's door and store, `issue_refund` over the storage client |
+
+**Every 0.3 public item keeps its name, path and signature** (re-exported from the core where the type moved);
+adopters upgrade by bumping the version. The core is reachable as `bsv_middleware_cloudflare::core` for code that
+wants the words or the traits directly.
+
 ## Why Cloudflare Workers
 
 Workers are request-scoped and have no in-process memory, so a direct port of the Express middleware isn't possible. Adaptations:
@@ -85,7 +102,7 @@ Secret: `wrangler secret put SERVER_PRIVATE_KEY` (64-char hex secp256k1 private 
 
 | Feature | Default | Pulls in |
 |---|---|---|
-| `refund` | off | `sha2`, `ripemd` — enables `refund::issue_refund` for BRC-41 partial refunds |
+| `refund` | off | `bsv-middleware-core/refund` (`ripemd`) — enables `refund::issue_refund` for BRC-41 partial refunds |
 | `d1-claims` | off | `worker/d1` — enables `payment_claims::{claim_payment_nonce, release_payment_nonce}` (atomic single-use payment-nonce claims on a D1 table) |
 
 ## Parity with Express middleware
@@ -177,6 +194,12 @@ proves, offline and before any wallet call, that the payment *pays this server c
 Every `PaymentVerifyError` means reject without internalizing, no refund owed. Most are client-fault; `NoHeaderService`
 (and a `KeyDerivation` error on the server key) is the deployment's own: answer 500-class and fix the configuration.
 
+Since 0.4.0 the check itself is the core's and answers in six words; `accept_verdict` is this crate's one visible
+match from them to the table above (`Verified` and `Unverifiable` are `Ok(satoshis)`, the latter with the reason
+logged: fail-open on a service error stays this crate's documented policy in 0.4; every other word is the
+same-named `Err`). Callers that want to decide `Unverifiable` themselves use `verify_brc29_payment_verdict` with any
+`HeaderService` (`UrlHeaderService::resolve(header_url)` is the gated URL one).
+
 With the `d1-claims` feature, `claim_payment_nonce(&db, nonce, agent)` is an atomic `INSERT OR IGNORE` on a D1
 `payment_claims` table (schema in `PAYMENT_CLAIMS_SCHEMA`): `Ok(true)` won, `Ok(false)` already used, `Err` storage
 fault. It is the single-use guard for callers that run their own payment flow and never reach the middleware's
@@ -185,7 +208,7 @@ after `verify_brc29_payment` succeeds and before internalizing; `release_payment
 pre-internalize failure.
 
 ```toml
-bsv-middleware-cloudflare = { version = "0.3.6", features = ["d1-claims"] }
+bsv-middleware-cloudflare = { version = "0.4.0", features = ["d1-claims"] }
 ```
 
 ## Session storage backends
