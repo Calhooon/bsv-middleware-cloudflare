@@ -88,7 +88,9 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
   `ERR_INVALID_PAYMENT` with the quote kept: no fresh challenge, the prefix not consumed, the wallet not called
   (0.4.0; 0.3.8 answered 402 with a fresh challenge); a `PaymentFault` or `RootMismatch` 400
   `ERR_INVALID_PAYMENT`; `NoHeaderService` 500 `ERR_SERVER_MISCONFIGURED`;
-  `Unverifiable` through `accept_verdict`. The output check answers three of the six today (no SPV on this path).
+  `Unverifiable` through `accept_verdict`. The output check answers three of the six today: this path runs no SPV
+  (no merkle proof is checked against a header here, and what the wallet storage server does on internalize is not
+  verified by this crate); `verify_brc29_payment` is the caller's proof step, run before the middleware.
 
 - **Raw body passthrough.** `process_auth` returns the original request bytes via
   `AuthResult::Authenticated { body }`. Workers consume the body stream during auth

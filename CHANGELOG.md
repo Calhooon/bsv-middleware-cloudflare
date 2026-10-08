@@ -70,10 +70,28 @@ fleet's call sites compile unchanged. Carries everything in 0.3.7 and 0.3.8.
   `400 ERR_INVALID_PAYMENT` with the quote kept (the prefix not consumed, no fresh challenge, the wallet not called;
   see Changed); a `PaymentFault` or `RootMismatch` is `400 ERR_INVALID_PAYMENT`, the prefix kept; `NoHeaderService` is
   `500 ERR_SERVER_MISCONFIGURED` (the server's own fault, never a client error); `Unverifiable` takes the adapter's
-  `accept_verdict` policy (accepted, logged). The output check answers three of the six words today (no SPV on
-  this path); the other arms are the path's standing answer should the check grow a proof step. Every payment
+  `accept_verdict` policy (accepted, logged). The output check answers three of the six words today: this path
+  runs no SPV (no merkle proof is checked against a header; what the wallet storage server does on
+  `internalizeAction` is not verified by this crate, and `verify_brc29_payment` is the caller's proof step before
+  the middleware); the other arms are the path's standing answer should the check grow a proof step. Every payment
   0.3.8 served is served, with the same `satoshis_paid`; the one wire answer that changed is the refusal under
   Changed.
+
+### Tests
+
+- 0.3.8 baseline: 212 unit + 2 conformance-file tests. 0.4.0: adapter 219 unit + 3 conformance-file tests (the
+  runner, the pinned bytes, the core's copy; the emitter is ignored); core 89 unit (82 without `refund`) + 2
+  conformance. 23 test paths moved from the adapter to the core, none lost.
+
+### Known
+
+- Error-code spelling: hosts that run their own payment flow through `verify_brc29_payment` have answered
+  `ERR_PAYMENT_INVALID` for a refused payment; this crate and the Express reference spell it `ERR_INVALID_PAYMENT`.
+  The Express spelling is the one to keep; aligning the hosts (or documenting the alias) is a later release.
+- `HeaderService::merkle_root` and the core's store traits return `impl Future` without a `Send` bound, by design
+  for wasm32. A host on a multi-threaded runtime needs its own implementations' futures to be `Send`; the verifier
+  is generic over the service, so that works, but it is the host's obligation and the core README will say so
+  before a native host adopts the trait.
 
 ### Removed from the dependency list
 

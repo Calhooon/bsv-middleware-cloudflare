@@ -121,6 +121,7 @@ Known divergences (architectural, not bugs):
 - **Pluggable storage via `SessionStorage`.** Express lets you swap `SessionManager`; here the equivalent seam is the `SessionStorage` trait (`process_auth_with_storage` / `process_payment_with_storage`), with `KvSessionStorage` as the default backend.
 - **No injectable logger.** Use `console_log!` / `console_error!` from the `worker` crate at call sites if needed.
 - **Payment internalizes via HTTP to a wallet storage server**, not a local `WalletInterface`. Required for Workers (no local wallet possible).
+- **No SPV on the middleware's own path.** `process_payment_with_storage` checks output 0's script and amount and nothing else about the transaction: no merkle proof is checked against a block header there. Whether the payment is real and confirmable is left to the wallet storage server's `internalizeAction`, which this crate does not verify. Run `verify_brc29_payment` (through a header service) before it when a proof must be checked.
 
 Deliberate hardening divergences (the reference is weaker here; security audit findings #30/#44):
 - **Auth replay protection.** The TS stack (`@bsv/sdk` `Peer.processGeneralMessage`) never records consumed per-request nonces, so a byte-identical signed request replays successfully there for the whole session TTL. This crate consumes each `(session nonce, x-bsv-auth-nonce)` pair and rejects duplicates with `401 ERR_REPLAYED_REQUEST`. See `middleware::auth` docs for the exact residual window under eventually-consistent KV.

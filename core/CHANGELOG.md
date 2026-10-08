@@ -46,3 +46,10 @@ Workers adapter over this crate in its 0.4.0.
   `verify_brc29_payment` with a stub service. The file ships inside this package (a copy of the repository root's
   canonical file, which the Workers adapter produces and pins byte-identical to this one), so the published crate
   runs the vectors on its own.
+- 89 unit tests with `refund` (82 without) + 2 conformance tests; the packaged crate runs all of them on its own.
+
+### Known
+
+- `HeaderService::merkle_root`, `PaymentNonceStore` and `ClaimStore` return `impl Future` without a `Send` bound,
+  by design for wasm32. A host on a multi-threaded runtime must make its own implementations' futures `Send`; the
+  verifier is generic over the service, so that works.
