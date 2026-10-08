@@ -70,9 +70,12 @@
 //! ## Relation to the payment middleware
 //!
 //! [`process_payment_with_storage`](crate::process_payment_with_storage)
-//! verifies the derivation-prefix HMAC, runs [`verify_brc29_payment_output`]
-//! on output 0 (script and amount; 0.3.7), consumes the prefix once, and
-//! hands the transaction to the wallet storage server. The storage server's
+//! verifies the derivation-prefix HMAC, runs the core's output check
+//! (`bsv_middleware_core::verify_payment_output`: script and amount, 0.3.8)
+//! on output 0 and decides its words in one match of its own
+//! (`middleware::payment`; `Unverifiable` comes back to [`accept_verdict`]),
+//! consumes the prefix once, and hands the transaction to the wallet storage
+//! server. The storage server's
 //! `internalizeAction` checks neither the script nor the amount (the
 //! reference keeps the script check in its signer, which is not on this
 //! path), so the middleware's check is the only one on it. The middleware

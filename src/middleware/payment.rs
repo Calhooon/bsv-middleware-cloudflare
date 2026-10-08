@@ -16,9 +16,10 @@
 use crate::client::WorkerStorageClient;
 use crate::error::{AuthCloudflareError, Result};
 use crate::middleware::auth::{add_cors_headers, sign_json_response, AuthSession};
-use crate::payment_verify::{verify_brc29_payment_output, PaymentVerifyError};
+use crate::payment_verify::accept_verdict;
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::types::{AuthContext, BsvPayment, ErrorResponse, PaymentContext};
+use bsv_middleware_core::{verify_payment_output, PaymentFault, PaymentVerdict};
 use bsv_sdk::auth::utils::{create_nonce, verify_nonce};
 use bsv_sdk::primitives::{from_base64, PrivateKey};
 use bsv_sdk::wallet::ProtoWallet;
@@ -190,10 +191,15 @@ where
 ///    internalizing; unlike it, the output must also be locked to the
 ///    server's BRC-29 key, because the storage server checks neither (the
 ///    reference leaves the script to its wallet's signer, which is not on
-///    this path). The check is [`verify_brc29_payment_output`]. A short or
-///    misdirected payment gets a 402 `ERR_INVALID_PAYMENT` with a fresh
-///    challenge (the reference answers 400); `satoshis_paid` is the amount
-///    read, not the price.
+///    this path). The check is the core's
+///    (`bsv_middleware_core::verify_payment_output`), answered in its words
+///    and decided here in one match (`judge_paying_output`): a short or
+///    misdirected payment (`Underpaid`, `WrongScript`) gets a 402
+///    `ERR_INVALID_PAYMENT` with a fresh challenge (the reference answers
+///    400); an unreadable one, or a proof contradicting a block header, 400;
+///    a server that cannot judge (`NoHeaderService`) 500; `Unverifiable`
+///    takes the adapter's [`accept_verdict`] policy. `satoshis_paid` is the
+///    amount read, not the price.
 ///
 /// Consumption ordering (money path):
 /// - The prefix is consumed **before** `internalizeAction`, so concurrent
@@ -348,13 +354,81 @@ enum PaymentDecision {
         fresh_prefix: String,
         description: String,
     },
-    /// The payment transaction cannot be read, or has no output 0 → 400
-    /// `ERR_INVALID_PAYMENT`; the prefix is not consumed
-    /// ([`PaymentResult::Failed`]).
+    /// The payment transaction cannot be read, has no output 0, or carries a
+    /// proof that contradicts a block header → 400 `ERR_INVALID_PAYMENT`;
+    /// the prefix is not consumed ([`PaymentResult::Failed`]).
     InvalidPayment { description: String },
+    /// The server cannot judge the payment (the core answered
+    /// `NoHeaderService`) → 500 `ERR_SERVER_MISCONFIGURED`: the server's own
+    /// fault, never a client error; the prefix is not consumed
+    /// ([`PaymentResult::Failed`]).
+    ServerFault { description: String },
     /// Wallet accepted → [`PaymentResult::Verified`]; `satoshis_paid` is
     /// read from the paying output.
     Verified { satoshis_paid: u64, tx: String },
+}
+
+/// What this path does with the core's answer on the paying output.
+#[derive(Debug, PartialEq, Eq)]
+enum OutputJudgement {
+    /// Serve; `satoshis_paid` is the amount the output carries.
+    Covered { satoshis_paid: u64 },
+    /// 402 `ERR_INVALID_PAYMENT` with a fresh challenge; the prefix is kept
+    /// and the wallet never called.
+    NotCovered { description: String },
+    /// 400 `ERR_INVALID_PAYMENT`; the prefix is kept.
+    Invalid { description: String },
+    /// 500 `ERR_SERVER_MISCONFIGURED`; the prefix is kept.
+    ServerFault { description: String },
+}
+
+/// The one match on this path from the core's words (and faults) to what
+/// the middleware answers:
+///
+/// | the core says | this path answers |
+/// |---|---|
+/// | `Verified { satoshis }` | serve; `satoshis_paid = satoshis` |
+/// | `Underpaid` / `WrongScript` | 402 with a fresh challenge; prefix kept, wallet not called |
+/// | `NoHeaderService` | 500: the server's own fault |
+/// | `RootMismatch` | 400: a proof that contradicts a block header is a fraud signal, refused |
+/// | `Unverifiable` | the adapter's documented policy, [`accept_verdict`] (0.4: accepted, logged) |
+/// | a `PaymentFault` | 400: unreadable, no such output, keys that do not derive, incomplete proof |
+///
+/// The output check ([`verify_payment_output`]) answers `Verified`,
+/// `Underpaid`, `WrongScript` or a fault; the SPV words are the path's
+/// standing answer should the check grow a proof step.
+fn judge_paying_output(
+    answer: std::result::Result<PaymentVerdict, PaymentFault>,
+) -> OutputJudgement {
+    match answer {
+        Ok(PaymentVerdict::Verified { satoshis }) => OutputJudgement::Covered {
+            satoshis_paid: satoshis,
+        },
+        Ok(verdict @ (PaymentVerdict::Underpaid { .. } | PaymentVerdict::WrongScript { .. })) => {
+            OutputJudgement::NotCovered {
+                description: verdict.to_string(),
+            }
+        }
+        Ok(verdict @ PaymentVerdict::NoHeaderService) => OutputJudgement::ServerFault {
+            description: verdict.to_string(),
+        },
+        Ok(verdict @ PaymentVerdict::RootMismatch { .. }) => OutputJudgement::Invalid {
+            description: verdict.to_string(),
+        },
+        // The adapter's policy decides this word; were the policy to become
+        // a refusal, it is rendered here as an invalid payment.
+        Ok(verdict @ PaymentVerdict::Unverifiable { .. }) => match accept_verdict(verdict) {
+            Ok(satoshis) => OutputJudgement::Covered {
+                satoshis_paid: satoshis,
+            },
+            Err(refusal) => OutputJudgement::Invalid {
+                description: refusal.to_string(),
+            },
+        },
+        Err(fault) => OutputJudgement::Invalid {
+            description: fault.to_string(),
+        },
+    }
 }
 
 /// Request/`Response`-free core of BRC-29 payment processing.
@@ -448,9 +522,10 @@ where
     // Step 6a: read the output that will be internalized and compare it
     // with the price before anyone is asked to record it. The storage
     // server checks neither the amount nor the script, so this is the only
-    // check on the path. Before consumption: the refusal is deterministic,
-    // so it must not burn the prefix.
-    let satoshis_paid = match verify_brc29_payment_output(
+    // check on the path. The core answers in its words; `judge_paying_output`
+    // is this path's one match over them. Before consumption: a refusal
+    // here is deterministic, so it must not burn the prefix.
+    let satoshis_paid = match judge_paying_output(verify_payment_output(
         server_private_key,
         &auth_context.identity_key,
         &payment.derivation_prefix,
@@ -458,22 +533,21 @@ where
         &tx_bytes,
         PAYMENT_OUTPUT_INDEX,
         price,
-    ) {
-        Ok(paid) => paid,
-        Err(
-            e @ (PaymentVerifyError::Underpaid { .. } | PaymentVerifyError::WrongScript { .. }),
-        ) => {
+    )) {
+        OutputJudgement::Covered { satoshis_paid } => satoshis_paid,
+        OutputJudgement::NotCovered { description } => {
             let fresh_prefix = create_nonce(&wallet, None, ORIGINATOR).await?;
             return Ok(PaymentDecision::NotCovered {
                 price,
                 fresh_prefix,
-                description: e.to_string(),
+                description,
             });
         }
-        Err(e) => {
-            return Ok(PaymentDecision::InvalidPayment {
-                description: e.to_string(),
-            })
+        OutputJudgement::Invalid { description } => {
+            return Ok(PaymentDecision::InvalidPayment { description })
+        }
+        OutputJudgement::ServerFault { description } => {
+            return Ok(PaymentDecision::ServerFault { description })
         }
     };
 
@@ -635,6 +709,9 @@ fn decision_into_result(decision: PaymentDecision) -> Result<PaymentResult> {
         PaymentDecision::InvalidPayment { description } => {
             failed_json_response(400, "ERR_INVALID_PAYMENT", &description)
         }
+        PaymentDecision::ServerFault { description } => {
+            failed_json_response(500, "ERR_SERVER_MISCONFIGURED", &description)
+        }
         PaymentDecision::Verified { satoshis_paid, tx } => {
             Ok(PaymentResult::Verified(PaymentContext {
                 satoshis_paid,
@@ -730,6 +807,9 @@ fn decision_into_result_signed(
         }
         PaymentDecision::InvalidPayment { description } => {
             signed_failed(400, "ERR_INVALID_PAYMENT", &description)
+        }
+        PaymentDecision::ServerFault { description } => {
+            signed_failed(500, "ERR_SERVER_MISCONFIGURED", &description)
         }
         PaymentDecision::Verified { satoshis_paid, tx } => {
             Ok(PaymentResult::Verified(PaymentContext {
@@ -1251,6 +1331,106 @@ mod tests {
     // money path — consume-before-internalize, replay rejection, release
     // on wallet error, keep-consumed on wallet rejection, fail-closed on
     // storage faults — instead of only covering pure helpers (#29 lesson).
+
+    // ===========================================
+    // The six words on the paying output
+    // ===========================================
+    //
+    // `judge_paying_output` is this path's one match over the core's
+    // answer. The output check gives three of the six words today; the
+    // table pins all six (and the faults), so the path's answer to a proof
+    // step is settled before one exists.
+    mod judge {
+        use super::*;
+
+        fn covered(judgement: OutputJudgement) -> u64 {
+            match judgement {
+                OutputJudgement::Covered { satoshis_paid } => satoshis_paid,
+                other => panic!("expected Covered, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn verified_serves_the_amount_read() {
+            let j = judge_paying_output(Ok(PaymentVerdict::Verified { satoshis: 501 }));
+            assert_eq!(covered(j), 501);
+        }
+
+        #[test]
+        fn underpaid_and_wrong_script_get_a_fresh_challenge() {
+            let j = judge_paying_output(Ok(PaymentVerdict::Underpaid {
+                paid: 499,
+                required: 500,
+            }));
+            assert!(
+                matches!(&j, OutputJudgement::NotCovered { description }
+                    if description.contains("carries 499 satoshis but 500 are required")),
+                "{j:?}"
+            );
+            let j = judge_paying_output(Ok(PaymentVerdict::WrongScript {
+                expected: "aa".into(),
+                actual: "bb".into(),
+            }));
+            assert!(
+                matches!(&j, OutputJudgement::NotCovered { description }
+                    if description.contains("does not pay this server's BRC-29 derived key")),
+                "{j:?}"
+            );
+        }
+
+        #[test]
+        fn no_header_service_is_the_servers_own_fault() {
+            let j = judge_paying_output(Ok(PaymentVerdict::NoHeaderService));
+            assert!(
+                matches!(&j, OutputJudgement::ServerFault { description }
+                    if description.contains("header service")),
+                "{j:?}"
+            );
+        }
+
+        #[test]
+        fn root_mismatch_is_refused_without_a_fresh_challenge() {
+            let j = judge_paying_output(Ok(PaymentVerdict::RootMismatch {
+                height: 42,
+                root: "ab".into(),
+            }));
+            assert!(
+                matches!(&j, OutputJudgement::Invalid { description }
+                    if description.contains("height 42")),
+                "{j:?}"
+            );
+        }
+
+        #[test]
+        fn unverifiable_takes_the_adapters_accept_verdict_policy() {
+            // 0.4: accepted with the reason logged (`payment_verify::accept_verdict`).
+            let j = judge_paying_output(Ok(PaymentVerdict::Unverifiable {
+                satoshis: 7,
+                reason: "HTTP 503".into(),
+            }));
+            assert_eq!(covered(j), 7);
+        }
+
+        #[test]
+        fn every_fault_is_an_invalid_payment() {
+            for fault in [
+                PaymentFault::BadTransaction("x".into()),
+                PaymentFault::MissingOutput {
+                    index: 0,
+                    output_count: 0,
+                },
+                PaymentFault::KeyDerivation("x".into()),
+                PaymentFault::BadBeef("x".into()),
+            ] {
+                let text = fault.to_string();
+                let j = judge_paying_output(Err(fault));
+                assert!(
+                    matches!(&j, OutputJudgement::Invalid { description } if *description == text),
+                    "{j:?}"
+                );
+            }
+        }
+    }
 
     mod decide {
         use super::*;
