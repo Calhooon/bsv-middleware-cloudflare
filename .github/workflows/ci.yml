@@ -1,0 +1,209 @@
+name: ci
+
+# The machine gate for the two crates of this repository: `core/` is
+# bsv-middleware-core (runtime-free) and the root is bsv-middleware-cloudflare
+# (the Workers adapter). The job ids below are the status-check contexts
+# branch protection on main requires (test, fmt, clippy, wasm32, vectors,
+# package); renaming a job removes its context and blocks every PR until the
+# protection is updated. Modelled on Calhooon/bsv-middleware-rs's ci.yml.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # release.yml runs the same jobs on a tag before it publishes.
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      # Cargo.lock is not tracked (two libraries), so the key follows the manifests.
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-test-${{ hashFiles('Cargo.toml', 'core/Cargo.toml') }}
+          restore-keys: |
+            ubuntu-test-
+
+      - name: Run the tests of both crates
+        run: cargo test --workspace --all-features
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-clippy-${{ hashFiles('Cargo.toml', 'core/Cargo.toml') }}
+          restore-keys: |
+            ubuntu-clippy-
+
+      - name: Run Clippy on both crates
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build the docs of both crates, warnings denied
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # The adapter runs on Cloudflare Workers: it must build and lint on its target.
+  wasm32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-wasm32-${{ hashFiles('Cargo.toml', 'core/Cargo.toml') }}
+          restore-keys: |
+            ubuntu-wasm32-
+
+      - name: Check the adapter for wasm32-unknown-unknown
+        run: cargo check -p bsv-middleware-cloudflare --target wasm32-unknown-unknown --all-features
+
+      - name: Run Clippy on the adapter for wasm32-unknown-unknown
+        run: cargo clippy -p bsv-middleware-cloudflare --target wasm32-unknown-unknown --all-features -- -D warnings
+
+  vectors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-vectors-${{ hashFiles('Cargo.toml', 'core/Cargo.toml') }}
+          restore-keys: |
+            ubuntu-vectors-
+
+      # The BRC-29 conformance vectors (22 cases, the stack review repository's
+      # file, pinned by digest under conformance/ and copied byte-identical
+      # under core/conformance/), run by both crates' runners by name; the
+      # context name `vectors` is stable.
+      - name: Run the adapter's BRC-29 conformance runner
+        run: cargo test -p bsv-middleware-cloudflare --test conformance_brc29 -- --nocapture
+
+      - name: Run the core's BRC-29 conformance runner
+        run: cargo test -p bsv-middleware-core --test conformance_brc29 -- --nocapture
+
+      - name: Run the core's payment tests
+        run: cargo test -p bsv-middleware-core --lib 'payment_verify::'
+
+      - name: Run the adapter's payment tests
+        run: cargo test -p bsv-middleware-cloudflare --lib 'payment'
+
+  # Both crates package. The core publishes dry-run against crates.io. The
+  # adapter depends on the core by path AND version, and `cargo package`
+  # resolves the packaged manifest against crates.io alone (a `[patch]` does
+  # not reach it), so the adapter packages only once that core version is
+  # published: before then the step reports and passes, and release.yml
+  # dry-runs the adapter for real after the core's tag has published it.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-package-${{ hashFiles('Cargo.toml', 'core/Cargo.toml') }}
+          restore-keys: |
+            ubuntu-package-
+
+      - name: No [patch] section in either manifest
+        run: |
+          if grep -q '^\[patch' Cargo.toml core/Cargo.toml; then
+            echo "::error::a [patch] section would publish a crate that does not build from crates.io"
+            exit 1
+          fi
+
+      - name: Dry-run publish of bsv-middleware-core
+        run: cargo publish --dry-run -p bsv-middleware-core
+
+      - name: Package bsv-middleware-cloudflare (once its core version is on crates.io)
+        run: |
+          core=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "bsv-middleware-core") | .version')
+          if cargo info "bsv-middleware-core@$core" >/dev/null 2>&1; then
+            cargo package -p bsv-middleware-cloudflare --no-verify
+          else
+            echo "::notice::bsv-middleware-core $core is not on crates.io yet; the adapter packages after tag core-v$core publishes it (release.yml dry-runs it then)"
+          fi
