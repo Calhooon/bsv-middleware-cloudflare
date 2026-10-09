@@ -3,6 +3,95 @@
 All notable changes to `bsv-middleware-core`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## 0.2.0 — 2026-10-09
+
+The payment door reads a BEEF of any size, and the scripts run. The posture, as a rule (the owner's ruling of
+2026-10-09; the stack review repository's charter "a BEEF of any size"): a valid BEEF is never refused for its size
+or its counts; a refusal is for invalid bytes only, and names them. This crate carries no bound and exports none.
+Breaking: the verdict's shape and the SDK major.
+
+### Changed (breaking)
+
+- `verify_brc29_payment` reads the payment ONCE through the streaming reader of bsv-rs 0.4.0
+  (`transaction::verify_stream`; every root is granted to a `Headers` that accepts them, so the roots can be asked of
+  the async `HeaderService` afterwards): the frame, every BUMP's own root, every unproven transaction's inputs naming
+  earlier transactions and SPENDING them (the interpreter executes each unlocking script against the parent output
+  the BEEF carries; no transaction creates value), an Atomic subject the tip of its ancestry. 0.1.0 checked the
+  structure alone (`Beef::verify_valid`) and answered `Verified` for an unsigned spend beside a proven stranger and
+  for an ancestry with no input. Order of checks: no header service (before the bytes are read); the server's key
+  derives (else `Err`); the sender's derives (else `Unverifiable`); the reader, at the soonest fault in stream order;
+  the subject's output (`WrongScript`, then `Underpaid`); a proof exists; each distinct root, lowest height first;
+  `Verified`. The output is judged before any header is asked, as before; the bytes are judged before the output
+  (0.1.0 judged the output first: a payment with both a wrong output and an invalid BEEF was `WrongScript` or
+  `Underpaid`, and is `Unverifiable` now).
+- `PaymentVerdict::Unverifiable { reason: UnverifiableReason }` (was `{ satoshis: u64, reason: String }`). The
+  reason splits the class (the no-root ruling of 2026-10-09): `is_server_side()` is true for
+  `HeaderLookupFailed { height, reason }` alone (the lowest height the service could not answer for; the host's 5xx
+  with the quote kept, the same payment retried); every other reason is the payer's (the host's 4xx, no fields, send
+  another payment): `InvalidBeef { offset, kind, reason }` (the reader's refusal: the offset of the byte and one of
+  its eighteen kinds, none a size or a count; txids in display hex), `SpendRefused { offset, txid, input, why }`,
+  `MalformedTransaction`, `NoTransaction`, `OutputMissing { output_index, output_count }`, `KeyDerivation` (the
+  SENDER's key), `NoProof { txid }` (the transaction whose proof is absent; the server never fetches a missing proof),
+  and `RootsUnchecked { satoshis, roots }` (the named opt-out's own word, carrying the amount). `#[non_exhaustive]`:
+  match it with a catch-all arm. `PaymentVerdict::is_server_side_unverifiable()` is the predicate on the verdict.
+- `PaymentFault` is the host's own fault alone: `KeyDerivation` (the SERVER's key) and `Source` (a byte source that
+  failed; never for a slice in hand). `BadTransaction`, `MissingOutput` and `BadBeef` are gone: a payer's bytes never
+  produce an `Err`; they are an `UnverifiableReason`. `#[non_exhaustive]`.
+- `verify_payment_output` (the offline output check): unreadable bytes, a missing output and a sender key that does
+  not derive are `Ok(Unverifiable { .. })` now, never `Err`; the server's key alone is the `Err`.
+- `verify_brc29_payment_structural_only`: the reader's structure (`verify_stream_structure`, no script run), the
+  output, the proof's presence; a payment that passes is `Unverifiable { reason: RootsUnchecked { satoshis, roots } }`
+  so the skip stays visible in the word. A BEEF with no root is `NoProof` here too (0.1.0 answered `Verified` for a
+  proof with no root to check).
+- `spv::beef_roots` is removed (the reader replaces it; nothing in the core parses a BEEF whole). `spv::check_roots`
+  takes `&[(u32, String)]` (each distinct root once, lowest height first: two BUMPs at one height with two roots are
+  two questions, and one is a mismatch) and answers `RootsOutcome::Unanswered { height, reason }` (the lowest
+  unanswered height and the service's words; was `{ reasons: Vec<String> }`); `decide_root`'s `Unanswered` carries the
+  service's words alone, the height beside it.
+- `expected_locking_script` is unchanged in shape; either key's failure is still its `KeyDerivation` fault (a bare
+  helper with no verdict to answer in); the verifiers split the sides.
+
+### Added
+
+- `verify_brc29_payment_verified(..) -> Result<Result<VerifiedPayment, PaymentVerdict>, PaymentFault>`: the same
+  check, with the subject's txid as the reader hashed it (`VerifiedPayment { satoshis, txid }`), so a host records and
+  internalizes without parsing the BEEF a second time. `Ok(Ok(..))` serves; `Ok(Err(word))` is a refusal, never
+  `Verified`; `Err` is the host's own fault.
+- `UnverifiableReason` (above), with `is_server_side()` and a `Display` that names the fact (offset, txid, height);
+  `VerifiedPayment`; `spv::{check_roots, RootsOutcome}` re-exported at the root.
+
+### Tests
+
+- The witnesses, one fact each: an unsigned spend of a proven parent is `SpendRefused` naming the subject and its
+  input, and no header is asked (the stack review repository's question of 2026-10-09, answered yes: the scripts
+  run); the same chain spendable is `Verified`; a transaction that creates value is `SpendRefused`; what bsv-rs
+  0.4.0's reader says of an unproven transaction with no input (`Valid`, no root) and the core's `NoProof` over it,
+  alone, under a subject, or beside a proven stranger whose root is the header's; the owned no-root shapes
+  (`spv-no-root`, `spv-incomplete-beef`) refused by the reader as `InputNamesNoElement` naming the absent
+  transaction; the lookup error at the lowest height, the server's side; `None` service before the bytes are read;
+  an honest proven payment; a BUMP at a height above `u32::MAX` (`RootNotCarried`, never asked at the low bits);
+  two roots at one height; a deep honest chain of 3,000 links `Verified` whole, the scripts run at every link.
+- `tests/conformance_brc29.rs`: the owner's 22 cases, 22 exact; `Unverifiable` emits `fields.height` on the
+  server's side and no fields on the payer's; the two no-root cases held to the payer's side, to a refusal that names
+  a transaction of the case, and to a service never asked.
+
+### Dependencies
+
+- `bsv-rs` 0.4 (was 0.3): the streaming BEEF reader (`transaction::beef_stream`). No `BeefLimits`, no size bound.
+  (`{:?}` of a linked `Transaction` prints a source as its txid in 0.4.0; no log line or test of this crate prints
+  one.)
+
+### Upgrade
+
+- A match on `PaymentVerdict::Unverifiable { satoshis, reason }` becomes `Unverifiable { reason }`; render it by
+  `reason.is_server_side()`: true is the server's 5xx with the quote kept (retry the same payment), false the payer's
+  4xx (send another payment). The amount is on `Verified` alone (or on `VerifiedPayment`).
+- A match on `PaymentFault::{BadTransaction, MissingOutput, BadBeef}` has nothing left to match: those are
+  `Unverifiable` reasons now. An `Err` is the host's own fault: render it 500.
+- Nothing to delete for limits: this crate never had one.
+- Next: 0.3.0 reads the payment from a byte source (`verify_stream_async` over an `AsyncByteSource`), so a host
+  streams a request body through the same checks without holding it whole.
+
 ## 0.1.0 — 2026-10-08
 
 The first release: the runtime-free rules extracted from `bsv-middleware-cloudflare` 0.3.8, which becomes a

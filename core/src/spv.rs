@@ -1,12 +1,12 @@
 //! The SPV decision, pure: what one merkle root's header lookup means, and
 //! the loop over a proof's roots through a [`HeaderService`].
-
-use std::collections::BTreeMap;
-
-use bsv_sdk::transaction::Beef;
+//!
+//! The roots come from the streaming reader
+//! ([`verify_brc29_payment`](crate::verify_brc29_payment) reads them with
+//! every root granted and asks them here afterwards, lowest height first);
+//! nothing in this module parses a BEEF.
 
 use crate::header_service::{HeaderService, MerkleRoot, ServiceError};
-use crate::verdict::PaymentFault;
 
 /// What one merkle root's header lookup means for the payment: the pure half
 /// of SPV, pinned by table tests.
@@ -18,7 +18,7 @@ pub enum RootDecision {
     Mismatch,
     /// The service could not answer (outage, timeout, HTTP error, height not
     /// yet indexed, unparseable body): the root goes unchecked; the carried
-    /// reason names the height and the cause.
+    /// reason is the cause as the service said it.
     Unanswered(String),
 }
 
@@ -34,24 +34,8 @@ pub fn decide_root(
         Ok(Some(header_root)) if header_root.matches(root) => RootDecision::Match,
         Ok(Some(_)) => RootDecision::Mismatch,
         Ok(None) => RootDecision::Unanswered(format!("no header at height {}", height)),
-        Err(reason) => RootDecision::Unanswered(format!("height {}: {}", height, reason)),
+        Err(reason) => RootDecision::Unanswered(reason.reason().to_string()),
     }
-}
-
-/// Parse the BEEF and check it is structurally complete: offline and
-/// deterministic. Rejects missing inputs, txid-only gaps, and a proof chain
-/// that does not verify. Returns the merkle roots the proofs compute, by
-/// block height (lowest first), for SPV.
-pub fn beef_roots(tx_bytes: &[u8]) -> Result<BTreeMap<u32, String>, PaymentFault> {
-    let mut beef = Beef::from_binary(tx_bytes)
-        .map_err(|e| PaymentFault::BadBeef(format!("BEEF parse: {}", e)))?;
-    let validation = beef.verify_valid(false);
-    if !validation.valid {
-        return Err(PaymentFault::BadBeef(
-            "missing inputs, txid-only gaps, or broken proof chain".to_string(),
-        ));
-    }
-    Ok(validation.roots.into_iter().collect())
 }
 
 /// The outcome of checking every root of a proof.
@@ -61,20 +45,22 @@ pub enum RootsOutcome {
     AllMatched,
     /// A root differs from its header: the first mismatch, lowest height first.
     Mismatch { height: u32, root: String },
-    /// No root mismatched, but at least one went unanswered; `reasons` lists
-    /// every unanswered height.
-    Unanswered { reasons: Vec<String> },
+    /// No root mismatched, but at least one went unanswered: the lowest such
+    /// height and what the service said for it.
+    Unanswered { height: u32, reason: String },
 }
 
-/// SPV over every root, lowest height first, through `service`. The first
-/// mismatch decides (a mismatch at a later height is never masked by an
-/// unanswered lookup at an earlier one); otherwise any unanswered root makes
-/// the outcome [`RootsOutcome::Unanswered`].
+/// SPV over every root, lowest height first, through `service`. `roots` is
+/// `(height, root hex)` pairs sorted by height (two BUMPs that claim one
+/// height with two roots are two questions, and one of them is a mismatch).
+/// The first mismatch decides (a mismatch at a later height is never masked
+/// by an unanswered lookup at an earlier one); otherwise the lowest
+/// unanswered root makes the outcome [`RootsOutcome::Unanswered`].
 pub async fn check_roots<H: HeaderService + ?Sized>(
-    roots: &BTreeMap<u32, String>,
+    roots: &[(u32, String)],
     service: &H,
 ) -> RootsOutcome {
-    let mut reasons = Vec::new();
+    let mut first_unanswered: Option<(u32, String)> = None;
     for (height, root) in roots {
         match decide_root(*height, root, service.merkle_root(*height).await) {
             RootDecision::Match => {}
@@ -84,26 +70,25 @@ pub async fn check_roots<H: HeaderService + ?Sized>(
                     root: root.clone(),
                 }
             }
-            RootDecision::Unanswered(reason) => reasons.push(reason),
+            RootDecision::Unanswered(reason) => {
+                first_unanswered.get_or_insert((*height, reason));
+            }
         }
     }
-    if reasons.is_empty() {
-        RootsOutcome::AllMatched
-    } else {
-        RootsOutcome::Unanswered { reasons }
+    match first_unanswered {
+        None => RootsOutcome::AllMatched,
+        Some((height, reason)) => RootsOutcome::Unanswered { height, reason },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brc29::test_support::*;
     use crate::header_service::LookupFn;
 
     /// The per-root decision, as a table: match (case-insensitive) accepts,
     /// a different root rejects, an unparseable or empty root rejects, no
-    /// header and a service error go unanswered with a reason naming the
-    /// height and the cause.
+    /// header and a service error go unanswered with the cause.
     #[test]
     fn test_decide_root_table() {
         let root = |s: &str| Ok(Some(MerkleRoot::new(s)));
@@ -119,23 +104,21 @@ mod tests {
             RootDecision::Unanswered(reason) => assert!(reason.contains("height 7"), "{reason}"),
             other => panic!("expected Unanswered, got {other:?}"),
         }
-        match decide_root(7, "abcd", Err(ServiceError::new("header service HTTP 503"))) {
-            RootDecision::Unanswered(reason) => {
-                assert!(reason.contains("height 7"), "{reason}");
-                assert!(reason.contains("HTTP 503"), "{reason}");
-            }
-            other => panic!("expected Unanswered, got {other:?}"),
-        }
+        assert_eq!(
+            decide_root(7, "abcd", Err(ServiceError::new("header service HTTP 503"))),
+            RootDecision::Unanswered("header service HTTP 503".into()),
+            "the service's own words, the height carried beside them"
+        );
     }
 
     /// The SPV loop over several roots: all matching accepts; one mismatch
-    /// rejects naming its height and root; unanswered lookups collect their
-    /// reasons; and an unanswered lookup at one height never masks a
-    /// mismatch at another.
+    /// rejects naming its height and root; unanswered lookups report the
+    /// lowest height and its cause; an unanswered lookup at one height never
+    /// masks a mismatch at another; two roots at one height are two
+    /// questions.
     #[tokio::test]
     async fn test_check_roots_table() {
-        let roots: BTreeMap<u32, String> =
-            BTreeMap::from([(100, "aa".to_string()), (200, "bb".to_string())]);
+        let roots: Vec<(u32, String)> = vec![(100, "aa".to_string()), (200, "bb".to_string())];
         let answer = |table: &'static [(u32, Result<&'static str, &'static str>)]| {
             LookupFn(move |height: u32| {
                 let found = table
@@ -163,19 +146,18 @@ mod tests {
             }
         );
 
-        match check_roots(
-            &roots,
-            &answer(&[(100, Err("timeout")), (200, Err("HTTP 503"))]),
-        )
-        .await
-        {
-            RootsOutcome::Unanswered { reasons } => {
-                assert_eq!(reasons.len(), 2);
-                assert!(reasons[0].contains("height 100") && reasons[0].contains("timeout"));
-                assert!(reasons[1].contains("height 200") && reasons[1].contains("HTTP 503"));
-            }
-            other => panic!("expected Unanswered, got {other:?}"),
-        }
+        assert_eq!(
+            check_roots(
+                &roots,
+                &answer(&[(100, Err("timeout")), (200, Err("HTTP 503"))]),
+            )
+            .await,
+            RootsOutcome::Unanswered {
+                height: 100,
+                reason: "timeout".into()
+            },
+            "the lowest unanswered height, with what the service said"
+        );
 
         assert_eq!(
             check_roots(&roots, &answer(&[(100, Err("timeout")), (200, Ok("zz"))])).await,
@@ -187,37 +169,27 @@ mod tests {
         );
 
         match check_roots(&roots, &answer(&[(100, Ok("aa"))])).await {
-            RootsOutcome::Unanswered { reasons } => {
-                assert_eq!(reasons.len(), 1);
-                assert!(
-                    reasons[0].contains("no header at height 200"),
-                    "{reasons:?}"
-                );
+            RootsOutcome::Unanswered { height, reason } => {
+                assert_eq!(height, 200);
+                assert!(reason.contains("no header at height 200"), "{reason}");
             }
             other => panic!("expected Unanswered, got {other:?}"),
         }
 
         assert_eq!(
-            check_roots(&BTreeMap::new(), &answer(&[])).await,
+            check_roots(&[], &answer(&[])).await,
             RootsOutcome::AllMatched,
             "no roots: nothing to check"
         );
-    }
 
-    #[test]
-    fn test_beef_roots_reports_the_proof_and_refuses_the_unproven() {
-        let (proven, txid) = beef_with_proven_payment(&our_script(), 1000);
-        let roots = beef_roots(&proven).unwrap();
-        assert_eq!(roots, BTreeMap::from([(PROOF_HEIGHT, txid)]));
-
-        let unproven = beef_with_unproven_payment(&our_script(), 1000);
-        assert!(matches!(
-            beef_roots(&unproven),
-            Err(PaymentFault::BadBeef(_))
-        ));
-        assert!(matches!(
-            beef_roots(&[0u8; 16]),
-            Err(PaymentFault::BadBeef(_))
-        ));
+        let two_at_one_height = vec![(100, "aa".to_string()), (100, "cc".to_string())];
+        assert_eq!(
+            check_roots(&two_at_one_height, &answer(&[(100, Ok("aa"))])).await,
+            RootsOutcome::Mismatch {
+                height: 100,
+                root: "cc".into()
+            },
+            "two roots at one height are two questions; the one the header does not carry is a mismatch"
+        );
     }
 }
