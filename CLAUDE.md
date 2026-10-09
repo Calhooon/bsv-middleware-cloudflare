@@ -197,7 +197,7 @@ Payment: `x-bsv-payment`, `x-bsv-payment-version`, `x-bsv-payment-satoshis-requi
 |---|---|
 | Express auth middleware (reference) | `~/bsv/auth-express-middleware/` |
 | Express payment middleware (reference) | `~/bsv/payment-express-middleware/` |
-| BSV SDK (used for auth, wallet, transaction) | `~/bsv/bsv-rs/` (crates.io: `bsv-rs = "0.3"`) |
+| BSV SDK (used for auth, wallet, transaction) | `~/bsv/bsv-rs/` (crates.io: `bsv-rs = "0.4"`) |
 | Consumer example | `~/bsv/rust-message-box/` |
 | Agent consumers | `~/bsv/agents/{banana-agent,claude-agent,...}` |
 

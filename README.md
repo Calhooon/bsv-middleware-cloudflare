@@ -268,3 +268,7 @@ new_classes = ["AuthSessionStore"]
 ```
 
 and export the class from the worker crate: `pub use bsv_middleware_cloudflare::AuthSessionStore;`. Any other store implements `SessionStorage` and goes through `process_auth_with_storage`.
+
+## Releases
+
+Tags `core-v*` and `v*` publish `bsv-middleware-core` and `bsv-middleware-cloudflare` through crates.io trusted publishing (`.github/workflows/release.yml`). The trusted-publishing entries on crates.io are the owner's to add; until they exist, releases go out by the captain's token under the release hold, and the tags are pushed after.

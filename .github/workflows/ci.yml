@@ -202,7 +202,7 @@ jobs:
         run: |
           core=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "bsv-middleware-core") | .version')
-          if cargo info "bsv-middleware-core@$core" >/dev/null 2>&1; then
+          if curl -sf -A "bsv-middleware-cloudflare ci" "https://crates.io/api/v1/crates/bsv-middleware-core/$core" >/dev/null; then
             cargo package -p bsv-middleware-cloudflare --no-verify
           else
             echo "::notice::bsv-middleware-core $core is not on crates.io yet; the adapter packages after tag core-v$core publishes it (release.yml dry-runs it then)"

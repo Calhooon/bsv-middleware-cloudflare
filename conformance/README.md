@@ -20,7 +20,7 @@ file without the repository. All keys are synthetic (private keys `0x01`, `0x02`
 Top level: `schema`, `producer`, `description`, `words` (the six outcome words, defined below), `derivation` (how the
 expected script is derived), `cases`, and `rulings` (the file owner's rulings on a case's word: `date`, `case`, `word`,
 `by`, `why`; a ruled case's `expected.word` is the ruled word). The canonical copy of this file is the stack review
-repository's; this repository's copy differs from it in the `producer` line alone.
+repository's; this repository's copy is byte-identical to it (sha256 `836579ad…`), the `producer` line included.
 
 Each case:
 
@@ -130,8 +130,7 @@ cases need a configuration gate but no lookup. The other ten need neither.
 
 ## Taking a new owned file
 
-Copy the owner's bytes over `conformance/brc29-payment-vectors.json` and `core/conformance/brc29-payment-vectors.json`,
-set the `producer` line to this crate's (`bsv-middleware-cloudflare <version> tests/conformance_brc29.rs build_vectors
-(fixed synthetic inputs; regenerate, never retype)`), update `VECTORS_SHA256` in `tests/conformance_brc29.rs`, and run
+Copy the owner's bytes unchanged over `conformance/brc29-payment-vectors.json` and
+`core/conformance/brc29-payment-vectors.json` (the `producer` line is the owner's and stays), update `VECTORS_SHA256` in `tests/conformance_brc29.rs`, and run
 both runners: `cargo test --test conformance_brc29` at the root and `cargo test -p bsv-middleware-core --test
 conformance_brc29`. Never retype a case.

@@ -68,7 +68,8 @@ every 0.3 function keeps its name, path and signature, and the fleet's call site
 
 - `conformance/brc29-payment-vectors.json` (and the core's copy `core/conformance/`) is the stack review repository's
   owned file (22 cases; the two no-root cases of 2026-10-09, `spv-no-root` and `spv-incomplete-beef`, `Unverifiable`
-  with no fields, the payer's side), its bytes with the `producer` line alone changed, pinned by digest.
+  with no fields, the payer's side), its bytes unchanged (the `producer` line included), pinned by digest
+  (sha256 `836579ad…`, the sha every implementation pins; bsv-middleware-rs 0.4.0 pins the same).
   `spv-lookup-error` emits `fields.height` (the declared `fields.satoshis` divergence of 0.4.x is withdrawn). Both
   runners pass 22 of 22; `crate_result` is informational, `expected` is the judge. The emit mode is a check now
   (`the_twenty_synthetic_cases_regenerate_from_the_producer`): the 20 synthetic cases regenerate from the producer's
