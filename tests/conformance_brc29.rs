@@ -3,8 +3,8 @@
 //!
 //! The vector file is OWNED by the stack review repository (bsv-stack-lean,
 //! `conformance/brc29-payment-vectors.json`, 22 cases since 2026-10-09); the
-//! copy here is its bytes with one line changed, the `producer`, and is
-//! pinned by digest below. Twenty of its cases are synthetic payments this
+//! copy here is its bytes unchanged (the `producer` line included) and is
+//! pinned by digest below, the same sha every implementation pins. Twenty of its cases are synthetic payments this
 //! crate's producer (`build_cases`, fixed inputs) regenerates, and
 //! `the_twenty_synthetic_cases_regenerate_from_the_producer` holds the
 //! file's cases to the regenerated ones field for field (the owner's own
@@ -26,8 +26,8 @@
 //! holds those two to the payer's side and to a refusal that names the
 //! absent transaction.
 //!
-//! To take a new owned file: copy its bytes over both copies, set the
-//! `producer` line, update `VECTORS_SHA256`, and run this file.
+//! To take a new owned file: copy its bytes over both copies unchanged,
+//! update `VECTORS_SHA256`, and run this file.
 
 use std::cell::RefCell;
 
@@ -46,8 +46,8 @@ use sha2::{Digest, Sha256};
 
 const PINNED: &str = include_str!("../conformance/brc29-payment-vectors.json");
 /// SHA-256 of the pinned copy: the owner's file (blob `8eede32d` of the
-/// stack review repository) with the `producer` line set to this crate's.
-const VECTORS_SHA256: &str = "50cb4f2d8eacb98236e2698a7542469ba6a1c67ba0ed11b810944eebde8e5023";
+/// stack review repository), byte for byte.
+const VECTORS_SHA256: &str = "836579ad73e20ca0e259a6c7cce5b55d85095cf290f74458937aeb39c9b5253c";
 /// The core's copy of the file (`core/conformance/`), shipped inside the
 /// `bsv-middleware-core` package. It sits next to this manifest only in the
 /// repository: the sub-package is not part of this crate's own tarball.
@@ -403,25 +403,23 @@ fn the_ruled_cases_are_unverifiable() {
     );
 }
 
-/// The pinned copy is the owner's file (one line changed, the `producer`),
-/// by digest. A new owned file is a reviewed diff here.
+/// The pinned copy is the owner's file byte for byte (the `producer` line
+/// included: sha256 836579ad…, the sha bsv-middleware-rs 0.4.0 pins too), by
+/// digest. A new owned file is a reviewed diff here.
 #[test]
 fn brc29_vectors_are_the_owned_bytes() {
     let digest = hex::encode(Sha256::digest(PINNED.as_bytes()));
     assert_eq!(
         digest, VECTORS_SHA256,
         "conformance/brc29-payment-vectors.json is not the pinned owned file. It is a CROSS-REPO \
-         agreement: take the owner's bytes, set the producer line, update VECTORS_SHA256, and copy \
+         agreement: take the owner's bytes unchanged, update VECTORS_SHA256, and copy \
          the file to every implementation that runs it."
     );
     let doc: Value = serde_json::from_str(PINNED).unwrap();
     assert_eq!(
         s(&doc, "producer"),
-        format!(
-            "bsv-middleware-cloudflare {} tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
-            env!("CARGO_PKG_VERSION")
-        ),
-        "the producer line names this crate's version"
+        "bsv-middleware-cloudflare 0.3.6 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+        "the producer line is the owner's (the 0.3.6 producer first generated the twenty synthetic cases); it is not rewritten per release, so every implementation pins one sha"
     );
 }
 
