@@ -154,7 +154,9 @@ mod api_surface_tests;
 /// module, so an adopter can reach the words and the traits without a second
 /// dependency line (`bsv_middleware_cloudflare::core::PaymentVerdict`).
 pub use bsv_middleware_core as core;
-pub use bsv_middleware_core::{HeaderService, PaymentFault, PaymentVerdict};
+pub use bsv_middleware_core::{
+    HeaderService, PaymentFault, PaymentVerdict, UnverifiableReason, VerifiedPayment,
+};
 pub use client::{ClientSessionSnapshot, WorkerStorageClient};
 pub use error::{AuthCloudflareError, Result};
 pub use middleware::auth::{
@@ -178,8 +180,9 @@ pub use payment_claims::{claim_payment_nonce, release_payment_nonce, PAYMENT_CLA
 pub use payment_verify::{
     accept_verdict, expected_brc29_locking_script, verify_brc29_payment,
     verify_brc29_payment_output, verify_brc29_payment_structural_only,
-    verify_brc29_payment_verdict, verify_brc29_payment_with_header_lookup, PaymentVerifyError,
-    UrlHeaderService, DEFAULT_CHAINTRACKS_URL,
+    verify_brc29_payment_verdict, verify_brc29_payment_verified,
+    verify_brc29_payment_with_header_lookup, PaymentVerifyError, UrlHeaderService,
+    DEFAULT_CHAINTRACKS_URL,
 };
 pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
 pub use storage::{

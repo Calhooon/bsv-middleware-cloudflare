@@ -833,10 +833,10 @@
       "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
       "description": "The header service cannot answer (HTTP 503).",
       "expected": {
+        "word": "Unverifiable",
         "fields": {
-          "satoshis": 1000
-        },
-        "word": "Unverifiable"
+          "height": 850000
+        }
       },
       "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
       "header_service": {
@@ -847,7 +847,7 @@
         "url": "https://headers.example"
       },
       "name": "spv-lookup-error",
-      "note": "Fail-closed (ruled 2026-10-08): the root was NOT checked, so the crate refuses with Err(Unverifiable) carrying the output's satoshis and the reason; the host answers a 5xx and keeps the quote for a retry. 0.3.x accepted this case with a logged warning.",
+      "note": "Fail closed (ruled 2026-10-08): the header service errored at height 850000, so the root was not checked and the payment is refused as Unverifiable; fields.height names the height to re-ask (the first erroring root in height order). crate_result is the 0.3.6 producer's answer: it returned Ok(satoshis) and logged a warning (fail open); 0.3.9 and 0.4.x refuse.",
       "output_index": 0,
       "required_satoshis": 1000,
       "requires_merkle_lookup": true,
@@ -870,6 +870,78 @@
         },
         "txid": "c8c9577c7db74180efc0c2b65fe48d1a25bc7629582697b1c41b52b65e8067eb"
       }
+    },
+    {
+      "crate_result": null,
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The BEEF carries the subject and the parent it spends, no BUMP for either: no merkle path, no proven ancestry, so the proofs give no root.",
+      "expected": {
+        "fields": {},
+        "word": "Unverifiable"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": "https://headers.example"
+      },
+      "name": "spv-no-root",
+      "note": "The payer's side (the captain's recommendation of 2026-10-09, docs/lanes/brc29-noroot-class.md, ruled by the owner rules): nothing the server could retry, so the 4xx class and no fields; the payer must send a proven BEEF. Nothing is asked of the header service. The parent pays the sender's own key the price and spends the synthetic prevout of the producer's cases; neither transaction carries a BUMP. Produced here by tools/brc29_noroot_cases.py from the exact-amount keys, not by the Cloudflare crate's build_vectors (crate_result null); parent txid 6b68ea8de3b8c80cc9bb3f2b867d3e46c51830b8f65259419f777fce62a45e1a.",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "spv",
+      "transaction": {
+        "beef_hex": "0200beef000200010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01e8030000000000001976a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac000000000001000000011a5ea462ce7f779f415952f6b83018c5463e7d862b3fbbc90cc8b8e38dea686b0000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": null,
+        "txid": "5fb0dd51da95fc078480899edacbeee850625710a9c3461c67a0550c54761b09"
+      }
+    },
+    {
+      "crate_result": null,
+      "derivation_prefix": "YnJjMjktY29uZm9ybWFuY2UtcHJlZml4",
+      "derivation_suffix": "YnJjMjktY29uZm9ybWFuY2Utc3VmZml4",
+      "description": "The BEEF carries the subject alone, no BUMP; its one input spends a transaction the BEEF does not carry.",
+      "expected": {
+        "fields": {},
+        "word": "Unverifiable"
+      },
+      "expected_locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+      "header_service": {
+        "lookup": null,
+        "url": "https://headers.example"
+      },
+      "name": "spv-incomplete-beef",
+      "note": "The payer's side, as spv-no-root: the 4xx class and no fields; nothing is asked of the header service. The subject is spv-no-root's (same bytes, same txid); its parent is not carried, so the BEEF cannot be walked to a proof. Produced here by tools/brc29_noroot_cases.py (crate_result null).",
+      "output_index": 0,
+      "required_satoshis": 1000,
+      "requires_merkle_lookup": false,
+      "sender_identity_key": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "sender_private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "server_identity_key": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "server_private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "stage": "spv",
+      "transaction": {
+        "beef_hex": "0200beef00010001000000011a5ea462ce7f779f415952f6b83018c5463e7d862b3fbbc90cc8b8e38dea686b0000000000ffffffff01e8030000000000001976a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac00000000",
+        "outputs": [
+          {
+            "locking_script": "76a914f1df1c2b8ba8151484996c7086905eceb8bb8caa88ac",
+            "satoshis": 1000
+          }
+        ],
+        "proof": null,
+        "txid": "5fb0dd51da95fc078480899edacbeee850625710a9c3461c67a0550c54761b09"
+      }
     }
   ],
   "derivation": {
@@ -884,13 +956,13 @@
     "server_side": "child public key for (server_private_key, counterparty = sender_identity_key, for_self = true)"
   },
   "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
-  "producer": "bsv-middleware-cloudflare 0.4.1 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+  "producer": "bsv-middleware-cloudflare 0.5.0 tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
   "schema": "brc29-payment-vectors/1",
   "words": {
-    "AcceptedUnverified": "Accept, but the header service could not answer so the merkle root was NOT checked (fail-open). fields.satoshis.",
     "NoHeaderService": "Refuse before any other check: no usable header service is configured (fail-closed misconfiguration).",
     "RootMismatch": "Refuse: the header at the proof's height carries a different merkle root (fail-closed fraud signal). fields.height, fields.merkle_root (the proof's root).",
     "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
+    "Unverifiable": "Refuse: a merkle root could not be checked (fail-closed): the header service errored at fields.height (the first such height in height order), or the BEEF carries no proof at all (no fields).",
     "Verified": "Accept. fields.satoshis = the output's satoshis.",
     "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script."
   },
@@ -900,7 +972,21 @@
       "case": "spv-lookup-error",
       "word": "Unverifiable",
       "by": "the owner",
-      "why": "fail closed on a header lookup error: a merkle root that was not checked against a block header is not evidence, so the verifier refuses instead of accepting with a warning; the Cloudflare crate fails closed from 0.3.9 and 0.4.0"
+      "why": "fail closed on a header lookup error (the agents side's epoch Rule 27; the north star's second and fifth tests); the Cloudflare crate fails closed in 0.3.9"
+    },
+    {
+      "date": "2026-10-09",
+      "case": "spv-no-root",
+      "word": "Unverifiable",
+      "by": "the owner (the captain's recommendation of 2026-10-09, ruled the same day: \"no-root yes\")",
+      "why": "the class of a payment whose proofs give no root: Unverifiable keeps its word and its reason splits the class; a lookup error is the server's side (5xx, retry; the ruling of 2026-10-08), no root is the payer's (4xx, no fields, send a proven BEEF); the captain's call of 2026-10-09, docs/lanes/brc29-noroot-class.md, ruled by the owner on 2026-10-09)"
+    },
+    {
+      "date": "2026-10-09",
+      "case": "spv-incomplete-beef",
+      "word": "Unverifiable",
+      "by": "the owner (the captain's recommendation of 2026-10-09, ruled the same day: \"no-root yes\")",
+      "why": "the class of a payment whose proofs give no root: Unverifiable keeps its word and its reason splits the class; a lookup error is the server's side (5xx, retry; the ruling of 2026-10-08), no root is the payer's (4xx, no fields, send a proven BEEF); the captain's call of 2026-10-09, docs/lanes/brc29-noroot-class.md, ruled by the owner on 2026-10-09)"
     }
   ]
 }

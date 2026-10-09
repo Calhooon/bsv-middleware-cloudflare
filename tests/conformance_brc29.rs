@@ -1,34 +1,39 @@
 //! BRC-29 payment-verification conformance: runs every case of
 //! `conformance/brc29-payment-vectors.json` through the crate's public API.
 //!
-//! The vector file is PRODUCED here (`emit_brc29_payment_vectors`, fixed
-//! synthetic inputs, the crate's own answer recorded as `crate_result`) and
-//! pinned byte-for-byte, so it cannot drift from the verifier. It is meant to
-//! be copied verbatim into other implementations; `conformance/README.md`
-//! describes the schema. The runner below reads the file the way a second
-//! implementation would: from JSON only, never from the emitter's tables.
+//! The vector file is OWNED by the stack review repository (bsv-stack-lean,
+//! `conformance/brc29-payment-vectors.json`, 22 cases since 2026-10-09); the
+//! copy here is its bytes with one line changed, the `producer`, and is
+//! pinned by digest below. Twenty of its cases are synthetic payments this
+//! crate's producer (`build_cases`, fixed inputs) regenerates, and
+//! `the_twenty_synthetic_cases_regenerate_from_the_producer` holds the
+//! file's cases to the regenerated ones field for field (the owner's own
+//! `note` and `crate_result` texts aside). The two no-root cases of
+//! 2026-10-09 and the `rulings` list are the owner's bytes alone, never
+//! retyped here. The runner below reads the file the way a second
+//! implementation would: from JSON only, never from the producer's tables;
+//! `expected` is the judge, `crate_result` is informational.
 //!
 //! The core (`core/`, the `bsv-middleware-core` package) ships its own copy
 //! under `core/conformance/` so its published tarball runs the vectors
-//! without this repository; the emitter writes both copies and
-//! `the_cores_copy_of_the_vectors_is_byte_identical` pins them equal, so
-//! the root copy stays canonical.
+//! without this repository; `the_cores_copy_of_the_vectors_is_byte_identical`
+//! pins the two copies equal, so the root copy stays canonical.
 //!
-//! The file is a cross-repository agreement whose canonical copy is owned by
-//! the stack review repository; this emitter reproduces that copy byte for
-//! byte except the `producer` line and, on the one ruled case, the fields
-//! that record this crate's own answer (`crate_result`, `note`). The
-//! `rulings` list (`RULINGS`) carries the owner's ruling: date, case, word
-//! and `by` verbatim, `why` in this crate's public wording.
+//! The six words are the core's. `Unverifiable` emits `fields.height` (the
+//! lowest height the header service could not answer for) when its reason
+//! is the server's, and no fields when it is the payer's (the no-root class,
+//! ruled 2026-10-09: `spv-no-root`, `spv-incomplete-beef`); the runner also
+//! holds those two to the payer's side and to a refusal that names the
+//! absent transaction.
 //!
-//! Regenerate (only when a case is added or the verifier's answer changes on
-//! purpose): `cargo test --test conformance_brc29 -- --ignored emit`.
+//! To take a new owned file: copy its bytes over both copies, set the
+//! `producer` line, update `VECTORS_SHA256`, and run this file.
 
 use std::cell::RefCell;
 
 use bsv_middleware_cloudflare::{
     expected_brc29_locking_script, verify_brc29_payment, verify_brc29_payment_output,
-    verify_brc29_payment_with_header_lookup, PaymentVerifyError,
+    verify_brc29_payment_with_header_lookup, PaymentVerifyError, UnverifiableReason,
 };
 use bsv_sdk::primitives::hash::hash160;
 use bsv_sdk::primitives::PrivateKey;
@@ -37,12 +42,12 @@ use bsv_sdk::transaction::{
     Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-const VECTORS_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/conformance/brc29-payment-vectors.json"
-);
 const PINNED: &str = include_str!("../conformance/brc29-payment-vectors.json");
+/// SHA-256 of the pinned copy: the owner's file (blob `8eede32d` of the
+/// stack review repository) with the `producer` line set to this crate's.
+const VECTORS_SHA256: &str = "50cb4f2d8eacb98236e2698a7542469ba6a1c67ba0ed11b810944eebde8e5023";
 /// The core's copy of the file (`core/conformance/`), shipped inside the
 /// `bsv-middleware-core` package. It sits next to this manifest only in the
 /// repository: the sub-package is not part of this crate's own tarball.
@@ -50,6 +55,9 @@ const CORE_COPY_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/core/conformance/brc29-payment-vectors.json"
 );
+const CASES: usize = 22;
+const SYNTHETIC_CASES: usize = 20;
+const NO_ROOT_CASES: [&str; 2] = ["spv-no-root", "spv-incomplete-beef"];
 
 // ─── The runner (reads JSON only) ───────────────────────────────────
 
@@ -73,7 +81,12 @@ fn u(v: &Value, key: &str) -> u64 {
 
 /// The header lookup a case describes: `answer: "root"` answers
 /// `merkle_root` at `height` (and nothing else), `answer: "error"` fails.
+/// A `null` lookup (the no-root cases) is a service that is never asked:
+/// it errors should it be.
 fn lookup_answer(lookup: &Value, height: u32) -> Result<String, String> {
+    if lookup.is_null() {
+        return Err(format!("the header service was asked at height {height}"));
+    }
     match s(lookup, "answer") {
         "root" if u(lookup, "height") == u64::from(height) => {
             Ok(s(lookup, "merkle_root").to_string())
@@ -140,15 +153,19 @@ async fn run_case(case: &Value) -> Outcome {
 }
 
 /// The conformance word for an outcome. `Ok` is `Verified` and nothing
-/// else: since 0.4.0 the crate serves on no other word. A root the lookup
-/// could not answer is `Unverifiable`, an `Err` (fail-closed, the ruling of
-/// 2026-10-08), carrying the output's satoshis as the file's `fields`.
+/// else: since 0.4.0 the crate serves on no other word. `Unverifiable` is an
+/// `Err` (fail-closed, the ruling of 2026-10-08) whose fields are the
+/// lowest height the service could not answer for when the reason is the
+/// server's, and nothing when it is the payer's (ruled 2026-10-09).
 fn word_of(outcome: &Outcome) -> (String, Value) {
     match &outcome.result {
         Ok(sats) => ("Verified".into(), json!({ "satoshis": sats })),
-        Err(PaymentVerifyError::Unverifiable { satoshis, .. }) => {
-            ("Unverifiable".into(), json!({ "satoshis": satoshis }))
-        }
+        Err(PaymentVerifyError::Unverifiable { reason }) => match reason {
+            UnverifiableReason::HeaderLookupFailed { height, .. } => {
+                ("Unverifiable".into(), json!({ "height": height }))
+            }
+            _ => ("Unverifiable".into(), json!({})),
+        },
         Err(PaymentVerifyError::Underpaid { satoshis, required }) => (
             "Underpaid".into(),
             json!({ "paid": satoshis, "required": required }),
@@ -173,10 +190,25 @@ fn crate_result_of(result: &Result<u64, PaymentVerifyError>) -> String {
     }
 }
 
+/// Every txid a case's BEEF names: the subject's, and each input's source
+/// up the linked ancestry (so the one the BEEF does not carry is among
+/// them).
+fn txids_named(tx: &Transaction, out: &mut Vec<String>) {
+    out.push(tx.id());
+    for input in &tx.inputs {
+        if let Some(source) = &input.source_txid {
+            out.push(source.clone());
+        }
+        if let Some(parent) = &input.source_transaction {
+            txids_named(parent, out);
+        }
+    }
+}
+
 /// The checks every case gets that do not depend on the verdict: the
 /// identity and script derivations, and that the listed outputs are the
 /// outputs of the BEEF's subject transaction.
-fn check_case_is_self_consistent(case: &Value, name: &str) {
+fn check_case_is_self_consistent(case: &Value, name: &str) -> Transaction {
     let server = PrivateKey::from_hex(s(case, "server_private_key")).unwrap();
     assert_eq!(
         server.public_key().to_hex(),
@@ -207,6 +239,7 @@ fn check_case_is_self_consistent(case: &Value, name: &str) {
             "{name}"
         );
     }
+    tx
 }
 
 #[tokio::test]
@@ -214,15 +247,17 @@ async fn every_brc29_vector_gives_its_word() {
     let doc: Value = serde_json::from_str(PINNED).unwrap();
     assert_eq!(doc["schema"], "brc29-payment-vectors/1");
     let cases = doc["cases"].as_array().unwrap();
-    assert!(!cases.is_empty());
+    assert_eq!(cases.len(), CASES, "the 22 vectors");
 
     let mut mismatches = Vec::new();
+    let mut table = Vec::new();
     for case in cases {
         let name = s(case, "name");
-        check_case_is_self_consistent(case, name);
+        let subject = check_case_is_self_consistent(case, name);
 
         let outcome = run_case(case).await;
         let (word, fields) = word_of(&outcome);
+        table.push(format!("{name}: {word} {fields}"));
         let expected = &case["expected"];
         if word != s(expected, "word") || fields != expected["fields"] {
             mismatches.push(format!(
@@ -242,17 +277,45 @@ async fn every_brc29_vector_gives_its_word() {
                 crate_result_of(&outcome.result)
             ));
         }
-        let got = crate_result_of(&outcome.result);
-        if got != s(case, "crate_result") {
-            mismatches.push(format!(
-                "{name}: crate_result recorded {}, now {got}",
-                case["crate_result"]
-            ));
+        // `crate_result` is what some producer once answered: informational,
+        // never the judge (the owner's file carries older shapes).
+        if let Some(recorded) = case["crate_result"].as_str() {
+            let got = crate_result_of(&outcome.result);
+            if got != recorded {
+                eprintln!(
+                    "{name}: crate_result recorded {recorded:?}, now {got:?} (informational)"
+                );
+            }
         }
         if !case["requires_merkle_lookup"].as_bool().unwrap() {
             assert!(
                 outcome.asked.is_empty() || word == "Verified",
                 "{name}: a refusal that does not need a lookup must not ask for one"
+            );
+        }
+        // The no-root class (ruled 2026-10-09): the payer's side, no fields,
+        // the refusal names the transaction whose proof is absent, and the
+        // header service is never asked.
+        if NO_ROOT_CASES.contains(&name) {
+            let err = outcome
+                .result
+                .as_ref()
+                .err()
+                .unwrap_or_else(|| panic!("{name}: refused"));
+            assert!(
+                !err.is_server_side(),
+                "{name}: the payer's side, never the server's: {err}"
+            );
+            let shown = err.to_string();
+            let mut named = Vec::new();
+            txids_named(&subject, &mut named);
+            assert!(
+                named.iter().any(|txid| shown.contains(txid)),
+                "{name}: the refusal must name a transaction of the case: {shown}"
+            );
+            assert!(
+                outcome.asked.is_empty(),
+                "{name}: nothing asked of the service"
             );
         }
 
@@ -281,6 +344,11 @@ async fn every_brc29_vector_gives_its_word() {
             }
         }
     }
+    eprintln!(
+        "conformance table ({} cases):\n{}",
+        table.len(),
+        table.join("\n")
+    );
     assert!(
         mismatches.is_empty(),
         "conformance mismatches:\n{}",
@@ -288,44 +356,72 @@ async fn every_brc29_vector_gives_its_word() {
     );
 }
 
-/// The ruling the file records, as the owner's `rulings` list: the
-/// lookup-error case expects `Unverifiable`, the case agrees with its
-/// ruling, and the list is the verbatim text this emitter carries.
+/// The rulings the file records, as the owner's `rulings` list: the
+/// lookup-error case (2026-10-08) and the two no-root cases (2026-10-09)
+/// expect `Unverifiable`, each case agrees with its ruling, and the glossary
+/// has the six words under the core's spellings.
 #[test]
-fn the_lookup_error_case_is_ruled_unverifiable() {
+fn the_ruled_cases_are_unverifiable() {
     let doc: Value = serde_json::from_str(PINNED).unwrap();
     let rulings = doc["rulings"].as_array().expect("a rulings list");
-    assert_eq!(rulings.len(), 1);
-    let ruling = &rulings[0];
-    assert_eq!(s(ruling, "case"), "spv-lookup-error");
-    assert_eq!(s(ruling, "word"), "Unverifiable");
-    assert_eq!(s(ruling, "date"), "2026-10-08");
-    for key in ["date", "case", "word", "by", "why"] {
-        assert!(ruling[key].is_string(), "a ruling carries {key}");
+    assert_eq!(rulings.len(), 3);
+    let cases = doc["cases"].as_array().unwrap();
+    let mut ruled = Vec::new();
+    for ruling in rulings {
+        for key in ["date", "case", "word", "by", "why"] {
+            assert!(ruling[key].is_string(), "a ruling carries {key}");
+        }
+        assert_eq!(s(ruling, "word"), "Unverifiable");
+        let case = cases
+            .iter()
+            .find(|c| s(c, "name") == s(ruling, "case"))
+            .unwrap_or_else(|| panic!("the ruled case {}", ruling["case"]));
+        assert_eq!(s(&case["expected"], "word"), "Unverifiable");
+        ruled.push((s(ruling, "date"), s(ruling, "case")));
     }
-    let case = doc["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| s(c, "name") == "spv-lookup-error")
-        .expect("the ruled case");
-    assert_eq!(s(&case["expected"], "word"), "Unverifiable");
-    assert!(
-        s(case, "crate_result").starts_with("Err(Unverifiable"),
-        "{}",
-        case["crate_result"]
+    assert_eq!(
+        ruled,
+        [
+            ("2026-10-08", "spv-lookup-error"),
+            ("2026-10-09", "spv-no-root"),
+            ("2026-10-09", "spv-incomplete-beef"),
+        ]
     );
     let words = doc["words"].as_object().unwrap();
-    assert_eq!(words.len(), 6, "six words in the glossary");
+    let mut spelled: Vec<&str> = words.keys().map(String::as_str).collect();
+    spelled.sort_unstable();
+    assert_eq!(
+        spelled,
+        [
+            "NoHeaderService",
+            "RootMismatch",
+            "Underpaid",
+            "Unverifiable",
+            "Verified",
+            "WrongScript"
+        ]
+    );
 }
 
-#[tokio::test]
-async fn brc29_vectors_are_the_pinned_bytes() {
-    assert!(
-        build_vectors().await == PINNED,
-        "conformance/brc29-payment-vectors.json is stale or hand-edited. It is a CROSS-REPO \
-         agreement: regenerate with `cargo test --test conformance_brc29 -- --ignored emit`, \
-         review the diff, and copy the file to every implementation that runs it."
+/// The pinned copy is the owner's file (one line changed, the `producer`),
+/// by digest. A new owned file is a reviewed diff here.
+#[test]
+fn brc29_vectors_are_the_owned_bytes() {
+    let digest = hex::encode(Sha256::digest(PINNED.as_bytes()));
+    assert_eq!(
+        digest, VECTORS_SHA256,
+        "conformance/brc29-payment-vectors.json is not the pinned owned file. It is a CROSS-REPO \
+         agreement: take the owner's bytes, set the producer line, update VECTORS_SHA256, and copy \
+         the file to every implementation that runs it."
+    );
+    let doc: Value = serde_json::from_str(PINNED).unwrap();
+    assert_eq!(
+        s(&doc, "producer"),
+        format!(
+            "bsv-middleware-cloudflare {} tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "the producer line names this crate's version"
     );
 }
 
@@ -339,8 +435,7 @@ fn the_cores_copy_of_the_vectors_is_byte_identical() {
         Ok(core_copy) => assert!(
             core_copy == PINNED,
             "core/conformance/brc29-payment-vectors.json differs from the root copy. The root copy \
-             is canonical: regenerate with `cargo test --test conformance_brc29 -- --ignored emit` \
-             (it writes both copies)."
+             is canonical: copy it over the core's."
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let core_manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/core/Cargo.toml");
@@ -354,16 +449,66 @@ fn the_cores_copy_of_the_vectors_is_byte_identical() {
     }
 }
 
-/// Writes `conformance/brc29-payment-vectors.json` and the core's copy
-/// (`core/conformance/`) on purpose.
+/// The producer's check (the former emit mode): the twenty synthetic cases
+/// regenerate from the fixed inputs and equal the file's, field for field,
+/// the owner's own `note` and `crate_result` texts aside; the top-level
+/// `words`, `derivation`, `schema` and `description` equal the producer's
+/// too. The two owned cases and the `rulings` are not produced here and are
+/// not compared: they are the owner's bytes. (The file cannot be emitted
+/// byte-identically from here: the owner's copy carries its own key order
+/// and texts on the ruled case, so the emit became this check.)
 #[tokio::test]
-#[ignore = "writes conformance/brc29-payment-vectors.json (both copies) on purpose"]
-async fn emit_brc29_payment_vectors() {
-    let bytes = build_vectors().await;
-    for path in [VECTORS_PATH, CORE_COPY_PATH] {
-        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
-        std::fs::write(path, &bytes).unwrap();
+async fn the_twenty_synthetic_cases_regenerate_from_the_producer() {
+    let doc: Value = serde_json::from_str(PINNED).unwrap();
+    let file_cases = doc["cases"].as_array().unwrap();
+    let produced = build_cases().await;
+    assert_eq!(produced.len(), SYNTHETIC_CASES);
+    assert_eq!(file_cases.len(), SYNTHETIC_CASES + NO_ROOT_CASES.len());
+
+    let mut drift = Vec::new();
+    for ours in &produced {
+        let name = s(ours, "name");
+        let Some(theirs) = file_cases.iter().find(|c| s(c, "name") == name) else {
+            drift.push(format!("{name}: produced here, not in the file"));
+            continue;
+        };
+        for (key, value) in ours.as_object().unwrap() {
+            if key == "crate_result" || key == "note" {
+                continue;
+            }
+            if theirs[key] != *value {
+                drift.push(format!(
+                    "{name}.{key}: file {}, produced {value}",
+                    theirs[key]
+                ));
+            }
+        }
+        if theirs["crate_result"] != ours["crate_result"] {
+            eprintln!(
+                "{name}: crate_result in the file {}, this crate's {} (informational)",
+                theirs["crate_result"], ours["crate_result"]
+            );
+        }
     }
+    for owned in NO_ROOT_CASES {
+        assert!(
+            file_cases.iter().any(|c| s(c, "name") == owned),
+            "the owned case {owned} is in the file"
+        );
+        assert!(
+            produced.iter().all(|c| s(c, "name") != owned),
+            "{owned} is the owner's, never produced here"
+        );
+    }
+    assert_eq!(doc["schema"], producer_header()["schema"]);
+    assert_eq!(doc["description"], producer_header()["description"]);
+    assert_eq!(doc["words"], producer_header()["words"]);
+    assert_eq!(doc["derivation"], producer_header()["derivation"]);
+    assert!(
+        drift.is_empty(),
+        "the file's synthetic cases drifted from the producer:\n{}",
+        drift.join("\n")
+    );
 }
 
 // ─── The producer (fixed synthetic inputs) ──────────────────────────
@@ -620,7 +765,7 @@ fn case_defs() -> Vec<CaseDef> {
             Lookup::Error,
             "Unverifiable",
             "The header service cannot answer (HTTP 503).",
-            "Fail-closed (ruled 2026-10-08): the root was NOT checked, so the crate refuses with Err(Unverifiable) carrying the output's satoshis and the reason; the host answers a 5xx and keeps the quote for a retry. 0.3.x accepted this case with a logged warning.",
+            "Fail closed (ruled 2026-10-08): the header service errored at height 850000, so the root was not checked and the payment is refused as Unverifiable; fields.height names the height to re-ask (the first erroring root in height order).",
         ),
     ] {
         defs.push(CaseDef {
@@ -635,7 +780,8 @@ fn case_defs() -> Vec<CaseDef> {
 fn expected_fields(word: &str, def: &CaseDef, expected_script: &str, root: &str) -> Value {
     let out = &def.outputs[def.output_index as usize];
     match word {
-        "Verified" | "Unverifiable" => json!({ "satoshis": out.1 }),
+        "Verified" => json!({ "satoshis": out.1 }),
+        "Unverifiable" => json!({ "height": PROOF_HEIGHT }),
         "Underpaid" => json!({ "paid": out.1, "required": PRICE }),
         "WrongScript" => json!({ "expected_script": expected_script, "actual_script": out.0 }),
         "NoHeaderService" => json!({}),
@@ -644,7 +790,9 @@ fn expected_fields(word: &str, def: &CaseDef, expected_script: &str, root: &str)
     }
 }
 
-async fn build_vectors() -> String {
+/// The twenty synthetic cases, each with this crate's answer as
+/// `crate_result`.
+async fn build_cases() -> Vec<Value> {
     let mut cases = Vec::new();
     for def in case_defs() {
         let sender_identity = identity(def.sender_identity_override.unwrap_or(SENDER_KEY));
@@ -704,14 +852,18 @@ async fn build_vectors() -> String {
         case["crate_result"] = json!(crate_result_of(&outcome.result));
         cases.push(case);
     }
+    cases
+}
 
-    let doc = json!({
+/// The document's head as this producer states it; the owner's file must
+/// agree (the `producer` line aside, which names the version).
+fn producer_header() -> Value {
+    json!({
         "schema": "brc29-payment-vectors/1",
-        "producer": format!("bsv-middleware-cloudflare {} tests/conformance_brc29.rs build_vectors (fixed synthetic inputs; regenerate, never retype)", env!("CARGO_PKG_VERSION")),
         "description": "BRC-29 payment verification before internalize: does output `output_index` of the payment transaction pay the server's BRC-29 derived key at least `required_satoshis`, and does its merkle proof tie to a block header? See conformance/README.md.",
         "words": {
             "Verified": "Accept. fields.satoshis = the output's satoshis.",
-            "AcceptedUnverified": "Accept, but the header service could not answer so the merkle root was NOT checked (fail-open). fields.satoshis.",
+            "Unverifiable": "Refuse: a merkle root could not be checked (fail-closed): the header service errored at fields.height (the first such height in height order), or the BEEF carries no proof at all (no fields).",
             "Underpaid": "Refuse: the output pays the derived key less than required. fields.paid, fields.required.",
             "WrongScript": "Refuse: the output's locking script is not the expected one. fields.expected_script, fields.actual_script.",
             "NoHeaderService": "Refuse before any other check: no usable header service is configured (fail-closed misconfiguration).",
@@ -725,25 +877,5 @@ async fn build_vectors() -> String {
             "sender_side": "child public key for (sender_private_key, counterparty = server_identity_key, for_self = false); equal by BRC-42",
             "locking_script": "P2PKH: 76a914 <hash160(compressed child pubkey)> 88ac"
         },
-        "cases": cases,
-    });
-    let mut text = serde_json::to_string_pretty(&doc).unwrap();
-    // The owner's rulings, appended after the sorted keys exactly as the
-    // canonical copy carries them (its own key order, not serde's).
-    let body = text
-        .strip_suffix("\n}")
-        .expect("a pretty-printed object ends with a newline and a brace");
-    text = format!("{body},\n{RULINGS}\n}}\n");
-    text
+    })
 }
-
-/// The owner's `rulings` list, verbatim: date, case, word, by, why.
-const RULINGS: &str = r#"  "rulings": [
-    {
-      "date": "2026-10-08",
-      "case": "spv-lookup-error",
-      "word": "Unverifiable",
-      "by": "the owner",
-      "why": "fail closed on a header lookup error: a merkle root that was not checked against a block header is not evidence, so the verifier refuses instead of accepting with a warning; the Cloudflare crate fails closed from 0.3.9 and 0.4.0"
-    }
-  ]"#;

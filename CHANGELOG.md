@@ -3,6 +3,96 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## 0.5.0 — 2026-10-09
+
+The payment door reads a BEEF of any size, and the scripts run. The core is `bsv-middleware-core` 0.2.0; the SDK is
+bsv-rs 0.4. The posture, as a rule (the owner's ruling of 2026-10-09; the stack review repository's charter "a BEEF
+of any size"): a valid BEEF is never refused for its size or its counts; a refusal is for invalid bytes only, and
+names them. This crate carries no limit, no count bound and no 413. Breaking: the verdict's shape and the SDK major;
+every 0.3 function keeps its name, path and signature, and the fleet's call sites compile unchanged
+(`src/api_surface_tests.rs`).
+
+### Changed (breaking)
+
+- `verify_brc29_payment`, `verify_brc29_payment_with_header_lookup`, `verify_brc29_payment_verdict`: the core's
+  check reads the payment ONCE through the streaming reader of bsv-rs 0.4.0 with the scripts run (every unproven
+  transaction's inputs executed against the parent outputs the BEEF carries; no transaction creates value; an Atomic
+  subject the tip of its ancestry), then the subject's output, then a proof's presence, then each distinct root
+  against the header service, lowest height first. 0.4.x checked the BEEF's structure alone and served an unsigned
+  spend beside a proven stranger. Order: no header service (before the bytes are read); the bytes, at the soonest
+  fault; the output (`WrongScript`, then `Underpaid`); a proof; the roots; `Ok(satoshis)`.
+- `PaymentVerifyError::Unverifiable { reason: UnverifiableReason }` (was `{ satoshis, reason: String }`), the core's
+  reason re-exported. `PaymentVerifyError::is_server_side()` is true for it when the reason is the server's
+  (`HeaderLookupFailed { height, .. }`: the lowest height the service could not answer for) and false for every
+  other variant, `NoHeaderService` included (a misconfiguration, 500, not a transient 503). The 0.3 variants
+  `BadTransaction`, `MissingOutput` and `BadBeef` are gone: a payer's bytes are an `Unverifiable` reason now
+  (`MalformedTransaction`, `OutputMissing`, `InvalidBeef { offset, kind, reason }`, `SpendRefused { offset, txid,
+  input, why }`, `NoProof { txid }`, `NoTransaction`, the sender's `KeyDerivation`), every one of them payer-side.
+  `Source(String)` is added for a byte source that fails (never for bytes in hand).
+- The host's table (in the rustdoc of `PaymentVerifyError` and the README):
+
+  | `PaymentVerifyError` | status | code |
+  |---|---|---|
+  | `NoHeaderService` | 500 | `ERR_SERVER_MISCONFIGURED` (fix the deployment) |
+  | `KeyDerivation` (the server's key) | 500 | the host's own |
+  | `Unverifiable`, `is_server_side()` | 503 | `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: retry the same payment later |
+  | every other refusal (`Unverifiable` payer-side, `Underpaid`, `WrongScript`, `RootMismatch`) | 400 | `ERR_PAYMENT_INVALID`, the quote kept: send another payment |
+
+- The middleware's own path (`process_payment_with_storage*`, `judge_paying_output`): `Unverifiable` with a
+  server-side reason stays 503 `ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept; `Unverifiable` with a
+  payer-side reason is 400 `ERR_INVALID_PAYMENT` with the quote kept (as `RootMismatch`; the no-root ruling of
+  2026-10-09); a `PaymentFault` is 500 `ERR_SERVER_MISCONFIGURED` (0.4.x answered a fault 400, when faults were the
+  payer's bytes; they are the server's own key now). What the path reads is unchanged: output 0, script and amount,
+  through the core's output check; no reader, no SPV.
+- `verify_brc29_payment_structural_only`: through the reader's structure (no script run), the output and the proof's
+  presence; serves (`Ok(satoshis)`) by name on the core's `RootsUnchecked`; a BEEF with no root is refused (`NoProof`)
+  here too (0.4.x served it).
+- `verify_brc29_payment_output` (the output check alone): unreadable bytes and a missing output are payer-side
+  `Unverifiable` errors (were `BadTransaction`, `MissingOutput`).
+
+### Added
+
+- `verify_brc29_payment_verified(.., header_url) -> Result<VerifiedPayment, PaymentVerifyError>`: the same gate and
+  refusals as `verify_brc29_payment`, with the subject's txid beside the amount (`VerifiedPayment { satoshis, txid }`,
+  the core's, hashed by the reader while the bytes passed), so a host records the payment without parsing the BEEF a
+  second time. Re-exports `UnverifiableReason` and `VerifiedPayment` at the root.
+- The machine gate: `.github/workflows/ci.yml` (on PR and push to `main`: `cargo fmt --check`, clippy on both crates
+  and the adapter on `wasm32-unknown-unknown`, the tests of both, both conformance runners by name, rustdoc with
+  warnings denied, `cargo publish --dry-run` of the core, the adapter packaged once its core version is on crates.io,
+  the manifests held free of `[patch]`) and `release.yml` (tag `core-v*` publishes the core, `v*` the adapter, through crates.io trusted
+  publishing after the gate passes; action SHAs pinned). The crates.io trusted-publishing entries are the owner's to
+  add (crates.io → crate → Settings → Trusted Publishing: repository `Calhooon/bsv-middleware-cloudflare`, workflow
+  `release.yml`); until they exist the captain publishes with a token under the release hold.
+
+### Conformance
+
+- `conformance/brc29-payment-vectors.json` (and the core's copy `core/conformance/`) is the stack review repository's
+  owned file (22 cases; the two no-root cases of 2026-10-09, `spv-no-root` and `spv-incomplete-beef`, `Unverifiable`
+  with no fields, the payer's side), its bytes with the `producer` line alone changed, pinned by digest.
+  `spv-lookup-error` emits `fields.height` (the declared `fields.satoshis` divergence of 0.4.x is withdrawn). Both
+  runners pass 22 of 22; `crate_result` is informational, `expected` is the judge. The emit mode is a check now
+  (`the_twenty_synthetic_cases_regenerate_from_the_producer`): the 20 synthetic cases regenerate from the producer's
+  fixed inputs and are held to the file's field for field (the owner's `note` and `crate_result` texts aside); the
+  owner's two cases and the `rulings` list are never produced here.
+
+### Dependencies
+
+- `bsv-middleware-core` 0.2.0; `bsv-rs` 0.4 (was 0.3; the streaming BEEF reader, no `BeefLimits`); `worker` 0.8
+  (unchanged). (`{:?}` of a linked `Transaction` prints a source as its txid in bsv-rs 0.4.0; no log line or test of
+  this crate prints one.)
+
+### Upgrade
+
+- Match `PaymentVerifyError::Unverifiable { reason }` and render by `is_server_side()`: a two-arm match with a `_`
+  arm compiles unchanged and answers 400 for a header outage; the three-arm form (500 `NoHeaderService` / 503
+  server-side `Unverifiable` with the quote kept / 400 everything else) is the hosts' change
+  (`src/api_surface_tests.rs` shows it). The amount is on `Ok` alone (or on `VerifiedPayment`).
+- Delete arms for `BadTransaction`, `MissingOutput`, `BadBeef`: a `_` arm takes their cases.
+- No limit to delete: this crate never had one. `src/transport/cloudflare.rs` still reads the whole request body into
+  memory before the middleware runs; nothing refuses it for its size.
+- Next: 0.6.0 streams the request body through `verify_stream_async` (`AsyncByteSource`), so the body is never held
+  whole.
+
 ## 0.4.1 — 2026-10-08
 
 ### Changed

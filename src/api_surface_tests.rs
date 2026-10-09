@@ -8,8 +8,9 @@ use crate::middleware::AuthSession;
 use crate::types::{AuthContext, BsvPayment, PaymentContext};
 use crate::{
     expected_brc29_locking_script, verify_brc29_payment, verify_brc29_payment_output,
-    verify_brc29_payment_structural_only, verify_brc29_payment_with_header_lookup,
-    PaymentVerifyError,
+    verify_brc29_payment_structural_only, verify_brc29_payment_verified,
+    verify_brc29_payment_with_header_lookup, PaymentVerifyError, UnverifiableReason,
+    VerifiedPayment,
 };
 
 const KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
@@ -46,17 +47,42 @@ async fn the_fleet_payment_verify_call_sites_compile_unchanged() {
         render(answer.unwrap_err()),
         (500, "ERR_SERVER_MISCONFIGURED")
     );
-    // 0.4.0 adds `Unverifiable` (a header lookup the service could not
-    // answer, refused: fail-closed). The fleet's match above compiles
-    // unchanged because of its `_` arm, and that arm answers the client's
-    // 400 today; the hosts' follow-up is a 503 arm for it, the quote kept.
-    assert_eq!(
-        render(PaymentVerifyError::Unverifiable {
-            satoshis: 1000,
+    // 0.4.0 added `Unverifiable` (refused: fail-closed); 0.5.0 gives it the
+    // core's reason and `is_server_side()`. The fleet's two-arm match above
+    // compiles unchanged because of its `_` arm, and that arm answers the
+    // client's 400 for a header outage; the hosts' change is the three-arm
+    // form below: 500 misconfigured, 503 the server's transient condition
+    // (the quote kept, the same payment retried), 400 everything else.
+    let outage = || PaymentVerifyError::Unverifiable {
+        reason: UnverifiableReason::HeaderLookupFailed {
+            height: 850_000,
             reason: "header service HTTP 503".into(),
+        },
+    };
+    assert_eq!(
+        render(outage()),
+        (400, "ERR_PAYMENT_INVALID"),
+        "what a two-arm host answers; the 503 arm is the hosts' change"
+    );
+    let render_three = |err: PaymentVerifyError| match err {
+        PaymentVerifyError::NoHeaderService => (500u16, "ERR_SERVER_MISCONFIGURED"),
+        e if e.is_server_side() => (503u16, "ERR_HEADER_SERVICE_UNAVAILABLE"),
+        _ => (400u16, "ERR_PAYMENT_INVALID"),
+    };
+    assert_eq!(
+        render_three(outage()),
+        (503, "ERR_HEADER_SERVICE_UNAVAILABLE")
+    );
+    assert_eq!(
+        render_three(PaymentVerifyError::Unverifiable {
+            reason: UnverifiableReason::NoProof { txid: "ab".into() },
         }),
         (400, "ERR_PAYMENT_INVALID"),
-        "what a two-arm host answers today; a 503 arm is the hosts' change"
+        "a missing proof is the payer's (ruled 2026-10-09)"
+    );
+    assert_eq!(
+        render_three(PaymentVerifyError::NoHeaderService),
+        (500, "ERR_SERVER_MISCONFIGURED")
     );
 
     let output: Result<u64, PaymentVerifyError> =
@@ -68,6 +94,13 @@ async fn the_fleet_payment_verify_call_sites_compile_unchanged() {
     let script: Result<String, PaymentVerifyError> =
         expected_brc29_locking_script(KEY, "02", "prefix", "suffix");
     assert!(matches!(script, Err(PaymentVerifyError::KeyDerivation(_))));
+    // 0.5.0: the same gate, the amount and the subject's txid together.
+    let with_txid: Result<VerifiedPayment, PaymentVerifyError> =
+        verify_brc29_payment_verified(KEY, "02", "prefix", "suffix", &tx, 0, 1000, None).await;
+    assert!(matches!(
+        with_txid,
+        Err(PaymentVerifyError::NoHeaderService)
+    ));
     let looked_up: Result<u64, PaymentVerifyError> = verify_brc29_payment_with_header_lookup(
         KEY,
         "02",
