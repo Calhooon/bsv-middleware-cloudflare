@@ -2,45 +2,70 @@
 //! `bsv_middleware_core`.
 //!
 //! The rules live in the core: the pays-us-correctly check
-//! ([`bsv_middleware_core::brc29`]), BEEF completeness and the SPV decision
-//! ([`bsv_middleware_core::spv`]), and the six-word verdict
-//! ([`PaymentVerdict`]). This module keeps what is bound to this runtime and
-//! to the 0.3 API:
+//! ([`bsv_middleware_core::brc29`]), the streaming reader's validity and
+//! spends, the proof's presence and the SPV decision
+//! ([`bsv_middleware_core::payment_verify`], [`bsv_middleware_core::spv`]),
+//! and the six-word verdict ([`PaymentVerdict`]). This module keeps what is
+//! bound to this runtime and to the 0.3 API:
 //!
 //! - [`UrlHeaderService`]: the core's [`HeaderService`] over a
 //!   ChainTracks-compatible base URL fetched with Workers `fetch`, behind the
 //!   0.3.6 configuration gate (below);
 //! - [`PaymentVerifyError`], the 0.3 error type, and [`accept_verdict`], the
 //!   one visible match that maps the core's words onto it;
-//! - the 0.3 functions, name for name and signature for signature.
+//! - the 0.3 functions, name for name and signature for signature, and
+//!   [`verify_brc29_payment_verified`] (0.5.0), which hands back the
+//!   subject's txid beside the amount.
 //!
-//! ## What the words map to (0.4.0)
+//! ## A payment of any size (0.5.0)
 //!
-//! | core | adapter |
-//! |---|---|
-//! | `Verified { satoshis }` | `Ok(satoshis)` |
-//! | `Unverifiable { satoshis, reason }` | `Err(Unverifiable { satoshis, reason })`, warning logged (**fail-closed**, see below) |
-//! | `Underpaid { paid, required }` | `Err(Underpaid { satoshis: paid, required })` |
-//! | `WrongScript { expected, actual }` | `Err(WrongScript { expected, actual })` |
-//! | `NoHeaderService` | `Err(NoHeaderService)` |
-//! | `RootMismatch { height, root }` | `Err(RootMismatch { height, root })` |
-//! | `PaymentFault::BadTransaction` / `MissingOutput` / `KeyDerivation` / `BadBeef` | the same-named `Err` |
+//! The payment is read ONCE through the streaming reader of bsv-rs 0.4.0
+//! (`transaction::verify_stream`), the scripts run: every unproven
+//! transaction's inputs are executed against the parent outputs the BEEF
+//! carries, and an Atomic subject is held to its rule. A valid payment is
+//! never refused for its size or its counts; a refusal of the bytes names
+//! the offset and the reader's kind. This crate carries no limit, no count
+//! bound and no 413 (the posture of 2026-10-09, "a BEEF of any size").
+//!
+//! ## What the words map to (0.5.0)
+//!
+//! | core | adapter | a host answers |
+//! |---|---|---|
+//! | `Verified { satoshis }` | `Ok(satoshis)` | serve |
+//! | `NoHeaderService` | `Err(NoHeaderService)` | 500 `ERR_SERVER_MISCONFIGURED`: a misconfiguration, fix the deployment |
+//! | `Unverifiable { reason }`, `reason.is_server_side()` (`HeaderLookupFailed`) | `Err(Unverifiable { reason })`, warning logged | 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: retry the SAME payment later |
+//! | `Unverifiable { reason }`, the payer's (`InvalidBeef`, `SpendRefused`, `NoProof`, `OutputMissing`, `NoTransaction`, `MalformedTransaction`, `KeyDerivation` of the sender's key) | `Err(Unverifiable { reason })` | 400 `ERR_PAYMENT_INVALID`, the quote kept: send another payment |
+//! | `Underpaid { paid, required }` | `Err(Underpaid { satoshis: paid, required })` | 400 `ERR_PAYMENT_INVALID`, the quote kept |
+//! | `WrongScript { expected, actual }` | `Err(WrongScript { expected, actual })` | 400 `ERR_PAYMENT_INVALID`, the quote kept |
+//! | `RootMismatch { height, root }` | `Err(RootMismatch { height, root })` | 400 `ERR_PAYMENT_INVALID`: a fraud signal |
+//! | `PaymentFault::KeyDerivation` (the SERVER's key) | `Err(KeyDerivation)` | 500: the host's own fault |
+//!
+//! [`PaymentVerifyError::is_server_side`] is the one predicate a host needs
+//! for the 503 row: `true` for `Unverifiable` with a server-side reason and
+//! for nothing else (`NoHeaderService` is a misconfiguration, 500, not a
+//! transient 503).
 //!
 //! **A header lookup the service cannot answer fails closed (0.4.0).** Once
 //! a header service is named, a lookup it cannot answer (unreachable, HTTP
 //! error, unparseable body, height not yet indexed) leaves the root
 //! unchecked, and an unchecked root is not evidence: the core answers
-//! `Unverifiable` and [`accept_verdict`] refuses it with
-//! [`PaymentVerifyError::Unverifiable`]. 0.3.x accepted that case with a
+//! `Unverifiable` with `HeaderLookupFailed { height }` (the lowest such
+//! height) and [`accept_verdict`] refuses it. 0.3.x accepted that case with a
 //! logged warning; the rule adopted on 2026-10-08 ended that. The refusal is
-//! the server's condition, not the client's fault: render it 503-class
-//! (`ERR_HEADER_SERVICE_UNAVAILABLE` on the middleware's own path), keep the
-//! quote, and let the client retry the same payment once the service
-//! answers. A root that differs from the header is `RootMismatch`,
-//! fail-closed, as before. Hosts that want the words themselves call the
-//! core (or [`verify_brc29_payment_verdict`]) and match them; none of the
-//! six may be served on but `Verified`, except the named opt-out's own
-//! `Unverifiable` through [`verify_brc29_payment_structural_only`].
+//! the server's condition, not the client's fault: render it 503-class, keep
+//! the quote, and let the client retry the same payment once the service
+//! answers.
+//!
+//! **A missing proof is the payer's (0.5.0, ruled 2026-10-09).** A BEEF that
+//! carries no BUMP, an unproven transaction with no input, a transaction
+//! whose input names a parent the BEEF does not carry: the server never
+//! fetches a missing proof; the refusal names the transaction whose proof is
+//! absent, and the host answers 400 with the quote kept. A spend the script
+//! interpreter refuses (`SpendRefused`) is the payer's too. Hosts that want
+//! the words themselves call the core (or [`verify_brc29_payment_verdict`])
+//! and match them; none of the six may be served on but `Verified`, except
+//! the named opt-out's own `Unverifiable` through
+//! [`verify_brc29_payment_structural_only`].
 //!
 //! ## Header service: required
 //!
@@ -67,7 +92,7 @@
 //! | the `.invalid` placeholder (trailing slash or dot or not, any case), any `.invalid` host | `Err(NoHeaderService)` |
 //! | no `http://` / `https://` scheme, no host | `Err(NoHeaderService)` |
 //! | userinfo (`@`), `%`, `\`, whitespace, control or non-ASCII characters, a non-numeric port, a label that is not a hostname | `Err(NoHeaderService)` |
-//! | service unreachable, HTTP error, unparseable answer, height not indexed | `Err(Unverifiable)`, warning logged (fail-closed; 503-class, the quote kept) |
+//! | service unreachable, HTTP error, unparseable answer, height not indexed | `Err(Unverifiable { reason: HeaderLookupFailed { height, .. } })`, warning logged (fail-closed; 503-class, the quote kept) |
 //! | the header at that height carries a different root | `Err(RootMismatch)` (fail-closed) |
 //! | the header carries the proof's root | `Ok(satoshis)` |
 //!
@@ -81,23 +106,26 @@
 //! verifies the derivation-prefix HMAC, runs the core's output check
 //! (`bsv_middleware_core::verify_payment_output`: script and amount, 0.3.8)
 //! on output 0 and decides its words in one match of its own
-//! (`middleware::payment`; `Unverifiable` there is `503
-//! ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept), consumes the prefix
+//! (`middleware::payment`; a server-side `Unverifiable` there is `503
+//! ERR_HEADER_SERVICE_UNAVAILABLE` with the quote kept, a payer-side one
+//! `400 ERR_INVALID_PAYMENT` with the quote kept), consumes the prefix
 //! once, and hands the transaction to the wallet storage
 //! server. The storage server's
 //! `internalizeAction` checks neither the script nor the amount (the
 //! reference keeps the script check in its signer, which is not on this
 //! path), so the middleware's check is the only one on it. The middleware
-//! does not run BEEF structure or SPV. The full [`verify_brc29_payment`] is
+//! does not run the reader or SPV. The full [`verify_brc29_payment`] is
 //! for callers that run their **own** payment flow (a custom 402 handler, a
 //! pre-charge + refund model, a non-wallet settlement path) and want, locally
 //! and before any remote call, an output that pays this server's derived key,
-//! carrying at least the quoted satoshis, inside a complete proof.
+//! carrying at least the quoted satoshis, inside a valid, spendable, proven
+//! BEEF.
 
 use std::future::Future;
 
 use bsv_middleware_core::{
     HeaderService, LookupFn, MerkleRoot, PaymentFault, PaymentVerdict, ServiceError,
+    UnverifiableReason, VerifiedPayment,
 };
 use serde::Deserialize;
 
@@ -115,35 +143,37 @@ pub const DEFAULT_CHAINTRACKS_URL: &str = "https://chaintracks.invalid";
 /// Errors from BRC-29 payment verification.
 ///
 /// Every variant means: reject without internalizing, and no refund is owed
-/// (no funds were accepted). Most are client-fault, a 400/402-class answer.
-/// Three are the SERVER's own: [`NoHeaderService`](Self::NoHeaderService)
+/// (no funds were accepted). Most are the payer's, a 400-class answer with
+/// the quote kept. Two are the SERVER's own: [`NoHeaderService`](Self::NoHeaderService)
 /// (no usable `header_url`) and a [`KeyDerivation`](Self::KeyDerivation)
-/// error naming the server key, which are 500-class (fix the deployment);
-/// and [`Unverifiable`](Self::Unverifiable) (the header service could not
-/// answer), which is 503-class: transient, nothing charged, the quote kept,
-/// the client retries the same payment later.
+/// error naming the server key, which are 500-class (fix the deployment).
+/// One is the server's transient condition: [`Unverifiable`](Self::Unverifiable)
+/// with a server-side reason ([`is_server_side`](Self::is_server_side)), the
+/// header service could not answer, 503-class: nothing charged, the quote
+/// kept, the client retries the same payment later.
 ///
 /// Since 0.4.0 this is the adapter's rendering of the core's
 /// [`PaymentVerdict`] and [`PaymentFault`] (see the module docs for the
-/// mapping); the 0.3 variants keep their messages. `Unverifiable` is new in
-/// 0.4.0: a match that already has a `_` arm compiles unchanged, but that
-/// arm answers the client's 400, so hosts should add a 503 arm for it.
+/// mapping). 0.5.0 (breaking): `Unverifiable` carries the core's
+/// [`UnverifiableReason`] in place of `{ satoshis, reason: String }`, and the
+/// 0.3 variants `BadTransaction`, `MissingOutput` and `BadBeef` are gone: a
+/// payer's bytes are an `Unverifiable` reason now (`MalformedTransaction`,
+/// `OutputMissing`, `InvalidBeef`, `SpendRefused`, `NoProof`), every one of
+/// them payer-side. A host's match: `NoHeaderService` 500,
+/// `Unverifiable` with `is_server_side()` 503, everything else 400.
 #[derive(Debug)]
 pub enum PaymentVerifyError {
-    /// Transaction could not be parsed from BEEF bytes.
-    BadTransaction(String),
-    /// The transaction has no output at the required index.
-    MissingOutput { index: usize, output_count: usize },
     /// The output's locking script does not pay the server's derived key.
     WrongScript { expected: String, actual: String },
     /// The output pays the right key but less than the quoted price.
     Underpaid { satoshis: u64, required: u64 },
-    /// Key derivation failed (invalid keys or derivation inputs).
+    /// The SERVER's key does not derive (an invalid server private key, or a
+    /// derivation the wallet refused): the host's own fault, 500-class.
+    /// Through [`expected_brc29_locking_script`] (the bare helper) either
+    /// key's failure is this error; through the verifiers a sender key that
+    /// does not derive is `Unverifiable` with
+    /// [`UnverifiableReason::KeyDerivation`], the payer's.
     KeyDerivation(String),
-    /// The BEEF is structurally incomplete: missing inputs, txid-only gaps,
-    /// or a proof chain that does not verify. The payment cannot be trusted
-    /// to be real and confirmable.
-    BadBeef(String),
     /// A merkle root in the proof does NOT match the block header at that
     /// height: a fraud signal, never an outage.
     RootMismatch { height: u32, root: String },
@@ -153,32 +183,36 @@ pub enum PaymentVerifyError {
     /// skip. Pass your own header service, or opt out of SPV by name with
     /// [`verify_brc29_payment_structural_only`].
     NoHeaderService,
-    /// The output pays correctly and the proof is complete, but at least one
-    /// merkle root could NOT be checked against a block header: the header
-    /// service could not answer (unreachable, HTTP error, unparseable body,
-    /// height not yet indexed). Fail-closed since 0.4.0 (0.3.x accepted
-    /// with a warning): an unchecked root is not evidence. The server's
-    /// condition, not the client's fault: answer 503-class
-    /// (`ERR_HEADER_SERVICE_UNAVAILABLE`), keep the quote, and let the
-    /// client retry the same payment once the service answers. `satoshis`
-    /// is what the output carries, for the log and the body only.
-    Unverifiable { satoshis: u64, reason: String },
+    /// The payment cannot be verified; `reason` says what and whose side.
+    /// Server-side ([`UnverifiableReason::is_server_side`], the header
+    /// service could not answer at `HeaderLookupFailed.height`): fail-closed
+    /// since 0.4.0, 503-class (`ERR_HEADER_SERVICE_UNAVAILABLE`), the quote
+    /// kept, the client retries the same payment once the service answers.
+    /// Payer-side (invalid BEEF bytes, a spend the interpreter refused, no
+    /// proof, no such output, no transaction, a sender key that does not
+    /// derive): 400-class, the quote kept, the client sends another payment.
+    Unverifiable { reason: UnverifiableReason },
+    /// The payment's byte source failed while it was being read: never for
+    /// bytes in hand (the 0.5.0 functions take a slice); the arm a host that
+    /// streams a body will meet.
+    Source(String),
+}
+
+impl PaymentVerifyError {
+    /// `true` when the server, not the payment, is why the payment was
+    /// refused for the moment: [`Unverifiable`](Self::Unverifiable) with a
+    /// server-side reason (the header service could not answer). Render it
+    /// 503 with the quote kept. `false` for every other variant,
+    /// [`NoHeaderService`](Self::NoHeaderService) included: that one is a
+    /// misconfiguration, the host's 500, not a transient condition.
+    pub fn is_server_side(&self) -> bool {
+        matches!(self, PaymentVerifyError::Unverifiable { reason } if reason.is_server_side())
+    }
 }
 
 impl std::fmt::Display for PaymentVerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PaymentVerifyError::BadTransaction(msg) => {
-                write!(f, "Payment transaction unparseable: {}", msg)
-            }
-            PaymentVerifyError::MissingOutput {
-                index,
-                output_count,
-            } => write!(
-                f,
-                "Payment transaction has no output at index {} ({} outputs present)",
-                index, output_count
-            ),
             PaymentVerifyError::WrongScript { expected, actual } => write!(
                 f,
                 "Payment output does not pay this server's BRC-29 derived key (expected script {}, got {})",
@@ -195,9 +229,6 @@ impl std::fmt::Display for PaymentVerifyError {
             PaymentVerifyError::KeyDerivation(msg) => {
                 write!(f, "Key derivation failed: {}", msg)
             }
-            PaymentVerifyError::BadBeef(msg) => {
-                write!(f, "Payment proof is incomplete or unverifiable: {}", msg)
-            }
             PaymentVerifyError::RootMismatch { height, root } => write!(
                 f,
                 "Payment merkle root {} at height {} does not match the block header",
@@ -207,31 +238,32 @@ impl std::fmt::Display for PaymentVerifyError {
                 f,
                 "No header service configured for SPV: pass your own ChainTracks-compatible base URL as header_url, or opt out by name with verify_brc29_payment_structural_only"
             ),
-            PaymentVerifyError::Unverifiable { satoshis, reason } => write!(
+            PaymentVerifyError::Unverifiable { reason } if reason.is_server_side() => write!(
                 f,
-                "Payment not verified: its merkle root could not be checked against a block header ({}); the output carries {} satoshis. Refused until the header service answers; the quote is unchanged",
-                reason, satoshis
+                "Payment not verified: {}. Refused until the header service answers; nothing was charged and the quote is unchanged, retry the same payment",
+                reason
             ),
+            PaymentVerifyError::Unverifiable { reason } => {
+                write!(f, "Payment not verified: {}", reason)
+            }
+            PaymentVerifyError::Source(msg) => {
+                write!(f, "The payment's byte source failed: {}", msg)
+            }
         }
     }
 }
 
 impl std::error::Error for PaymentVerifyError {}
 
-/// The core's faults, variant for variant.
+/// The core's faults, variant for variant: the host's own.
 impl From<PaymentFault> for PaymentVerifyError {
     fn from(fault: PaymentFault) -> Self {
         match fault {
-            PaymentFault::BadTransaction(m) => PaymentVerifyError::BadTransaction(m),
-            PaymentFault::MissingOutput {
-                index,
-                output_count,
-            } => PaymentVerifyError::MissingOutput {
-                index,
-                output_count,
-            },
             PaymentFault::KeyDerivation(m) => PaymentVerifyError::KeyDerivation(m),
-            PaymentFault::BadBeef(m) => PaymentVerifyError::BadBeef(m),
+            PaymentFault::Source(m) => PaymentVerifyError::Source(m),
+            // `PaymentFault` is non-exhaustive: a fault the core adds later is
+            // still the host's own, rendered by its text.
+            other => PaymentVerifyError::KeyDerivation(other.to_string()),
         }
     }
 }
@@ -239,21 +271,24 @@ impl From<PaymentFault> for PaymentVerifyError {
 /// The one visible match that collapses the core's words to this adapter's
 /// 0.3 result: `Verified` is `Ok(satoshis)`, the only `Ok`; every other word
 /// is the same-named `Err`. `Unverifiable` is
-/// [`PaymentVerifyError::Unverifiable`] with the reason logged as a warning:
-/// a root that could not be checked is refused (**fail-closed**, 0.4.0; the
-/// rule of 2026-10-08), and the host renders it 503-class with the quote
-/// kept. No path through this function serves with a root unchecked; the
-/// named opt-out [`verify_brc29_payment_structural_only`] does not use it
-/// for its own `Unverifiable`.
+/// [`PaymentVerifyError::Unverifiable`] with the reason, logged as a warning
+/// when it is the server's side (a root that could not be checked is
+/// refused, **fail-closed**, 0.4.0; the host renders it 503-class with the
+/// quote kept) and as the payer's refusal otherwise (400-class). No path
+/// through this function serves with a root unchecked; the named opt-out
+/// [`verify_brc29_payment_structural_only`] does not use it for its own
+/// `Unverifiable`.
 pub fn accept_verdict(verdict: PaymentVerdict) -> std::result::Result<u64, PaymentVerifyError> {
     match verdict {
         PaymentVerdict::Verified { satoshis } => Ok(satoshis),
-        PaymentVerdict::Unverifiable { satoshis, reason } => {
-            warn_log(&format!(
-                "[payment_verify] SPV refused, root unchecked ({} satoshis not served): {}",
-                satoshis, reason
-            ));
-            Err(PaymentVerifyError::Unverifiable { satoshis, reason })
+        PaymentVerdict::Unverifiable { reason } => {
+            if reason.is_server_side() {
+                warn_log(&format!(
+                    "[payment_verify] SPV refused, root unchecked (not served): {}",
+                    reason
+                ));
+            }
+            Err(PaymentVerifyError::Unverifiable { reason })
         }
         PaymentVerdict::Underpaid { paid, required } => Err(PaymentVerifyError::Underpaid {
             satoshis: paid,
@@ -499,7 +534,9 @@ fn warn_log(message: &str) {
 
 /// Compute the P2PKH locking script (hex) the sender must have paid for a
 /// BRC-29 payment to (`server_key`, `sender_identity_key`, prefix, suffix)
-/// (`bsv_middleware_core::brc29::expected_locking_script`).
+/// (`bsv_middleware_core::brc29::expected_locking_script`). A bare helper
+/// with no verdict to answer in: either key that does not parse is
+/// [`PaymentVerifyError::KeyDerivation`] here.
 pub fn expected_brc29_locking_script(
     server_key: &str,
     sender_identity_key: &str,
@@ -517,7 +554,10 @@ pub fn expected_brc29_locking_script(
 /// Verify that output `output_index` of the BEEF-encoded payment transaction
 /// pays the server's BRC-29 derived key at least `required_satoshis`
 /// (`bsv_middleware_core::brc29::verify_payment_output`, rendered through
-/// [`accept_verdict`]).
+/// [`accept_verdict`]): the output check alone, offline, no reader, no proof,
+/// no header service. Bytes that are no BEEF, a BEEF without the named
+/// output and a sender key that does not derive are payer-side
+/// `Unverifiable` errors.
 ///
 /// Call this AFTER nonce/quote verification and BEFORE `internalizeAction`.
 /// Returns the actual satoshis carried by the output on success.
@@ -545,7 +585,8 @@ pub fn verify_brc29_payment_output(
 /// (`bsv_middleware_core::verify_brc29_payment`), for hosts that render the
 /// words themselves instead of taking this adapter's [`accept_verdict`]
 /// rendering. No word is accepted on the host's behalf: `Unverifiable` is
-/// always a refusal (503-class, the quote kept). `None` is `NoHeaderService`.
+/// always a refusal (503-class when `reason.is_server_side()`, the quote
+/// kept; 400-class otherwise). `None` is `NoHeaderService`.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment_verdict<H: HeaderService + ?Sized>(
     server_key: &str,
@@ -570,18 +611,19 @@ pub async fn verify_brc29_payment_verdict<H: HeaderService + ?Sized>(
     .await?)
 }
 
-/// Steps 1 and 2 of [`verify_brc29_payment`] with the header lookup supplied
-/// by the caller instead of a `header_url`: script + amount, BEEF structure,
-/// then SPV through `lookup`.
+/// [`verify_brc29_payment`] with the header lookup supplied by the caller
+/// instead of a `header_url`: the reader, the output, the proof, then SPV
+/// through `lookup`.
 ///
 /// `lookup(height)` is your header service: `Ok(merkle_root_hex)` for the
 /// block at `height` (compared case-insensitively; a different root is
 /// [`PaymentVerifyError::RootMismatch`], fail-closed) or `Err(reason)` when it
-/// cannot answer ([`PaymentVerifyError::Unverifiable`], fail-closed as well:
-/// the payment is refused with the reason, 503-class at the host, the quote
-/// kept). There is no configuration gate here, since there is no URL to
-/// check; a lookup that always errors refuses every proven payment, so a
-/// host with no header service must opt out by name with
+/// cannot answer ([`PaymentVerifyError::Unverifiable`] with
+/// `HeaderLookupFailed`, fail-closed as well: the payment is refused with
+/// the reason, 503-class at the host, the quote kept). There is no
+/// configuration gate here, since there is no URL to check; a lookup that
+/// always errors refuses every proven payment, so a host with no header
+/// service must opt out by name with
 /// [`verify_brc29_payment_structural_only`] instead. For a service binding,
 /// a cached header store, or a conformance runner
 /// (`conformance/brc29-payment-vectors.json`) that answers from a fixture.
@@ -628,12 +670,18 @@ where
 /// `internalizeAction`; on `Ok` the payment is safe to internalize and serve,
 /// on `Err` reject without serving (no funds accepted, so no refund is owed).
 ///
-/// Runs, in order:
+/// Runs, in order (the core's
+/// [`verify_brc29_payment`](bsv_middleware_core::verify_brc29_payment)):
 ///   0. configuration gate: `header_url` must name a header service (below).
-///   1. script + amount ([`verify_brc29_payment_output`]): the output pays the
-///      server's derived key at least `required_satoshis`.
-///   2. BEEF structural completeness + SPV: the proof chain is complete and
-///      each merkle root matches a real block header.
+///   1. the bytes are a valid BEEF by the streaming reader, the scripts run
+///      (every unproven transaction spends the parent outputs the BEEF
+///      carries; an Atomic subject is the tip of its ancestry);
+///   2. the subject's output `output_index` pays the server's derived key at
+///      least `required_satoshis` (script before amount);
+///   3. a proof is present (no BUMP, or an unproven transaction with no
+///      input, is `NoProof`: the payer's);
+///   4. each merkle root, lowest height first, matches the block header the
+///      service answers.
 ///
 /// **`header_url` is required.** Pass the base URL of your own
 /// ChainTracks-compatible header service (for example a ChainTracks deployment
@@ -644,12 +692,12 @@ where
 /// [`PaymentVerifyError::NoHeaderService`] before any other check: fail-closed,
 /// never a silent skip. Once a service is named, a lookup it cannot answer
 /// (unreachable, HTTP error, unparseable answer, height not indexed) is
-/// [`PaymentVerifyError::Unverifiable`]: fail-closed since 0.4.0, refused
-/// with the reason, for the host to answer 503-class with the quote kept so
-/// the client retries once the service answers; a root that differs from
-/// the header is [`PaymentVerifyError::RootMismatch`]. Adopters with no
-/// header service opt out of SPV by name with
-/// [`verify_brc29_payment_structural_only`].
+/// [`PaymentVerifyError::Unverifiable`] with a server-side reason:
+/// fail-closed since 0.4.0, refused with the reason, for the host to answer
+/// 503-class with the quote kept so the client retries once the service
+/// answers; a root that differs from the header is
+/// [`PaymentVerifyError::RootMismatch`]. Adopters with no header service opt
+/// out of SPV by name with [`verify_brc29_payment_structural_only`].
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_brc29_payment(
     server_key: &str,
@@ -661,11 +709,40 @@ pub async fn verify_brc29_payment(
     required_satoshis: u64,
     header_url: Option<&str>,
 ) -> std::result::Result<u64, PaymentVerifyError> {
+    verify_brc29_payment_verified(
+        server_key,
+        sender_identity_key,
+        derivation_prefix,
+        derivation_suffix,
+        tx_bytes,
+        output_index,
+        required_satoshis,
+        header_url,
+    )
+    .await
+    .map(|verified| verified.satoshis)
+}
+
+/// [`verify_brc29_payment`] with the subject's txid beside the amount
+/// ([`VerifiedPayment`]): the txid the reader hashed while the bytes passed,
+/// so a host records and internalizes without parsing the BEEF a second
+/// time. Same arguments, same gate, same refusals.
+#[allow(clippy::too_many_arguments)]
+pub async fn verify_brc29_payment_verified(
+    server_key: &str,
+    sender_identity_key: &str,
+    derivation_prefix: &str,
+    derivation_suffix: &str,
+    tx_bytes: &[u8],
+    output_index: usize,
+    required_satoshis: u64,
+    header_url: Option<&str>,
+) -> std::result::Result<VerifiedPayment, PaymentVerifyError> {
     // 0. No header service, no verdict: the gate classifies the URL, and the
     //    core refuses `None` before any other work, so a misconfigured
     //    deployment never looks like one that verifies.
     let service = UrlHeaderService::resolve(header_url).ok();
-    let verdict = verify_brc29_payment_verdict(
+    match bsv_middleware_core::verify_brc29_payment_verified(
         server_key,
         sender_identity_key,
         derivation_prefix,
@@ -675,13 +752,20 @@ pub async fn verify_brc29_payment(
         required_satoshis,
         service.as_ref(),
     )
-    .await?;
-    accept_verdict(verdict)
+    .await?
+    {
+        Ok(verified) => Ok(verified),
+        // The core's refusal side never carries `Verified`; `accept_verdict`
+        // renders the five refusal words.
+        Err(word) => {
+            Err(accept_verdict(word).expect_err("the core's refusal side never carries Verified"))
+        }
+    }
 }
 
-/// [`verify_brc29_payment`] **without SPV**: script + amount and BEEF
-/// structural completeness only. The merkle roots in the proof are NOT
-/// checked against block headers.
+/// [`verify_brc29_payment`] **without SPV**: the BEEF's structure by the
+/// streaming reader (no script is run), the output, the proof's presence;
+/// the merkle roots in the proof are NOT checked against block headers.
 ///
 /// **Opt-in, by name, for adopters that have no header service.** Prefer
 /// [`verify_brc29_payment`] with your own header service: a structurally
@@ -692,10 +776,12 @@ pub async fn verify_brc29_payment(
 ///
 /// This is the ONE function in this crate that answers `Ok` with merkle
 /// roots unchecked, and only because the caller named it: the core answers
-/// the skip as `Unverifiable` so it stays visible in the word, and this
-/// function (not [`accept_verdict`], which refuses that word) serves it with
-/// a warning logged. Every other word is [`accept_verdict`]'s same-named
-/// `Err`.
+/// the skip as `Unverifiable` with
+/// [`UnverifiableReason::RootsUnchecked`] so it stays visible in the word,
+/// and this function (not [`accept_verdict`], which refuses that word) serves
+/// it with a warning logged. Every other word is [`accept_verdict`]'s
+/// same-named `Err`: invalid bytes, a wrong or short output and a missing
+/// proof are refused here as well.
 pub fn verify_brc29_payment_structural_only(
     server_key: &str,
     sender_identity_key: &str,
@@ -715,10 +801,12 @@ pub fn verify_brc29_payment_structural_only(
         required_satoshis,
     )? {
         // The skip the caller asked for by name: served, and said so.
-        PaymentVerdict::Unverifiable { satoshis, reason } => {
+        PaymentVerdict::Unverifiable {
+            reason: UnverifiableReason::RootsUnchecked { satoshis, roots },
+        } => {
             warn_log(&format!(
-                "[payment_verify] structural-only (named opt-out): serving {} satoshis with {}",
-                satoshis, reason
+                "[payment_verify] structural-only (named opt-out): serving {} satoshis with {} merkle root(s) unchecked",
+                satoshis, roots
             ));
             Ok(satoshis)
         }
@@ -732,7 +820,7 @@ mod tests {
     use bsv_middleware_core::BRC29_PROTOCOL_ID;
     use bsv_sdk::primitives::hash::hash160;
     use bsv_sdk::primitives::{PrivateKey, PublicKey};
-    use bsv_sdk::script::LockingScript;
+    use bsv_sdk::script::{LockingScript, UnlockingScript};
     use bsv_sdk::transaction::{
         Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
     };
@@ -748,6 +836,7 @@ mod tests {
 
     /// Block height of the one-leaf proof in [`beef_with_proven_payment`].
     const PROOF_HEIGHT: u32 = 850_000;
+    const OP_TRUE: &[u8] = &[0x51];
 
     fn sender_identity() -> String {
         let sender_priv = PrivateKey::from_hex(SENDER_KEY).unwrap();
@@ -773,7 +862,8 @@ mod tests {
 
     /// A BEEF holding ONE transaction that spends an output this BEEF does not
     /// carry and pays `satoshis` to `script_hex`. `from_beef` resolves it (the
-    /// output is readable), while `verify_valid` refuses it (missing input).
+    /// output is readable), while the reader refuses it (its input names an
+    /// element the BEEF does not carry).
     fn beef_with_unproven_payment(script_hex: &str, satoshis: u64) -> Vec<u8> {
         let mut beef = Beef::new();
         beef.merge_transaction(payment_tx(script_hex, satoshis));
@@ -782,7 +872,7 @@ mod tests {
 
     /// A BEEF holding ONE transaction proven by a one-leaf BUMP at
     /// `PROOF_HEIGHT` (a block of one transaction, whose merkle root IS the
-    /// txid), paying `satoshis` to `script_hex`. `verify_valid` accepts it and
+    /// txid), paying `satoshis` to `script_hex`. The reader accepts it and
     /// reports exactly one root, so SPV can be driven by an injected lookup.
     /// Returns the bytes and the txid (= the root the lookup must answer).
     fn beef_with_proven_payment(script_hex: &str, satoshis: u64) -> (Vec<u8>, String) {
@@ -799,24 +889,73 @@ mod tests {
         (beef.to_binary(), txid)
     }
 
+    /// A transaction with no input paying `outputs` (satoshis, script bytes).
+    fn rootless(outputs: &[(u64, Vec<u8>)]) -> Transaction {
+        let mut tx = Transaction::new();
+        for (satoshis, script) in outputs {
+            tx.add_output(TransactionOutput::new(
+                *satoshis,
+                LockingScript::from_binary(script).unwrap(),
+            ))
+            .unwrap();
+        }
+        tx
+    }
+
+    /// A transaction spending `parent:0` with an EMPTY unlocking script.
+    fn spending(parent: &Transaction, outputs: &[(u64, Vec<u8>)]) -> Transaction {
+        let mut tx = rootless(outputs);
+        let mut input = TransactionInput::new(parent.id(), 0);
+        input.unlocking_script = Some(UnlockingScript::new());
+        tx.inputs.push(input);
+        tx
+    }
+
+    /// A BEEF of `txs` in order, the first proven at `PROOF_HEIGHT` when
+    /// `proven`; the bytes and the first txid (the root).
+    fn beef_of(txs: &[&Transaction], proven: bool) -> (Vec<u8>, String) {
+        let mut beef = Beef::new();
+        let root = txs[0].id();
+        let bump = proven.then(|| {
+            beef.merge_bump(
+                MerklePath::new(
+                    PROOF_HEIGHT,
+                    vec![vec![MerklePathLeaf::new_txid(0, root.clone())]],
+                )
+                .unwrap(),
+            )
+        });
+        for (i, tx) in txs.iter().enumerate() {
+            beef.merge_raw_tx(tx.to_binary(), bump.filter(|_| i == 0));
+        }
+        (beef.to_binary(), root)
+    }
+
+    fn p2pkh(hash: &[u8; 20]) -> Vec<u8> {
+        let mut s = vec![0x76, 0xa9, 0x14];
+        s.extend_from_slice(hash);
+        s.extend_from_slice(&[0x88, 0xac]);
+        s
+    }
+
     fn our_script() -> String {
         expected_brc29_locking_script(SERVER_KEY, &sender_identity(), "prefix", "suffix").unwrap()
     }
 
-    /// The full verification of a correct, proven 1000-sat payment with the
-    /// header service replaced by `answer` (the same answer at every height);
-    /// also returns the heights the lookup was asked for.
-    async fn verify_proven_with(
+    /// The full verification of `beef` with the header service replaced by
+    /// `answer` (the same answer at every height); also returns the heights
+    /// the lookup was asked for.
+    async fn verify_with(
+        beef: &[u8],
         answer: std::result::Result<String, String>,
     ) -> (std::result::Result<u64, PaymentVerifyError>, Vec<u32>) {
-        let (beef, _) = beef_with_proven_payment(&our_script(), 1000);
         let asked = RefCell::new(Vec::new());
         let result = verify_brc29_payment_with_header_lookup(
             SERVER_KEY,
             &sender_identity(),
             "prefix",
             "suffix",
-            &beef,
+            beef,
             0,
             1000,
             |height| {
@@ -827,6 +966,21 @@ mod tests {
         )
         .await;
         (result, asked.into_inner())
+    }
+
+    /// The full verification of a correct, proven 1000-sat payment.
+    async fn verify_proven_with(
+        answer: std::result::Result<String, String>,
+    ) -> (std::result::Result<u64, PaymentVerifyError>, Vec<u32>) {
+        let (beef, _) = beef_with_proven_payment(&our_script(), 1000);
+        verify_with(&beef, answer).await
+    }
+
+    fn reason_of(err: &PaymentVerifyError) -> &UnverifiableReason {
+        match err {
+            PaymentVerifyError::Unverifiable { reason } => reason,
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
     }
 
     /// The script the SENDER computes (their wallet, for_self=false toward the
@@ -886,8 +1040,11 @@ mod tests {
         assert_ne!(a, b, "different server keys must produce different scripts");
     }
 
+    /// The bare helper reports either key as `KeyDerivation`; through the
+    /// verifiers the server's key stays `KeyDerivation` (the host's 500) and
+    /// the sender's is a payer-side `Unverifiable` (400).
     #[test]
-    fn test_invalid_keys_are_key_derivation_errors() {
+    fn test_invalid_keys_are_key_derivation_errors_and_the_verifier_splits_the_sides() {
         let bad_server =
             expected_brc29_locking_script("zz", &sender_identity(), "prefix", "suffix")
                 .unwrap_err();
@@ -896,10 +1053,44 @@ mod tests {
             expected_brc29_locking_script(SERVER_KEY, "not-a-pubkey", "prefix", "suffix")
                 .unwrap_err();
         assert!(matches!(bad_sender, PaymentVerifyError::KeyDerivation(_)));
+
+        let (beef, _) = beef_with_proven_payment(&our_script(), 1000);
+        let err = verify_brc29_payment_output(
+            "zz",
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &beef,
+            0,
+            1000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PaymentVerifyError::KeyDerivation(_)), "{err}");
+        assert!(
+            !err.is_server_side(),
+            "a misconfiguration, not a transient 503"
+        );
+        let err = verify_brc29_payment_output(
+            SERVER_KEY,
+            "not-a-pubkey",
+            "prefix",
+            "suffix",
+            &beef,
+            0,
+            1000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason_of(&err), UnverifiableReason::KeyDerivation(_)),
+            "{err}"
+        );
+        assert!(!err.is_server_side());
     }
 
+    /// Bytes that are no BEEF are the payer's `MalformedTransaction` through
+    /// the output check: never a fault, never server-side.
     #[test]
-    fn test_bad_tx_bytes_rejected() {
+    fn test_bad_tx_bytes_are_a_payer_side_refusal() {
         let err = verify_brc29_payment_output(
             SERVER_KEY,
             &sender_identity(),
@@ -910,7 +1101,11 @@ mod tests {
             1000,
         )
         .unwrap_err();
-        assert!(matches!(err, PaymentVerifyError::BadTransaction(_)));
+        assert!(
+            matches!(reason_of(&err), UnverifiableReason::MalformedTransaction(_)),
+            "{err}"
+        );
+        assert!(!err.is_server_side());
     }
 
     #[test]
@@ -989,8 +1184,9 @@ mod tests {
         assert!(matches!(err, PaymentVerifyError::WrongScript { .. }));
     }
 
+    /// No output at the named index is the payer's `OutputMissing`.
     #[test]
-    fn test_missing_output_index_rejected() {
+    fn test_missing_output_index_is_payer_side() {
         let beef = beef_with_unproven_payment(&our_script(), 1000);
         let err = verify_brc29_payment_output(
             SERVER_KEY,
@@ -1002,38 +1198,38 @@ mod tests {
             1000,
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            PaymentVerifyError::MissingOutput {
-                index: 3,
+        assert_eq!(
+            *reason_of(&err),
+            UnverifiableReason::OutputMissing {
+                output_index: 3,
                 output_count: 1
             }
-        ));
+        );
     }
 
     /// The full check: a transaction that pays us correctly but whose BEEF
-    /// carries no ancestry/proof is refused as `BadBeef` (never reaches the
-    /// header service), so a bare, unconfirmable payment cannot buy service.
+    /// does not carry the parent its input names is refused by the reader
+    /// as invalid bytes (`InputNamesNoElement`, naming the absent
+    /// transaction), never reaching the header service, so a bare,
+    /// unconfirmable payment cannot buy service. The payer's side.
     #[tokio::test]
     async fn test_unproven_beef_fails_full_verification() {
         let beef = beef_with_unproven_payment(&our_script(), 1000);
-        let err = verify_brc29_payment(
-            SERVER_KEY,
-            &sender_identity(),
-            "prefix",
-            "suffix",
-            &beef,
-            0,
-            1000,
-            Some(HEADERS_URL),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, PaymentVerifyError::BadBeef(_)), "{err}");
+        let (err, asked) = verify_with(&beef, Ok("00".repeat(32))).await;
+        let err = err.unwrap_err();
+        match reason_of(&err) {
+            UnverifiableReason::InvalidBeef { kind, reason, .. } => {
+                assert_eq!(kind, "InputNamesNoElement");
+                assert!(reason.contains(&"11".repeat(32)), "{reason}");
+            }
+            other => panic!("expected InvalidBeef, got {other:?}"),
+        }
+        assert!(!err.is_server_side());
+        assert!(err.to_string().contains(&"11".repeat(32)), "{err}");
+        assert!(asked.is_empty());
     }
 
-    /// Step 1 (script + amount) runs before any BEEF/SPV work, so garbage
-    /// bytes surface as `BadTransaction` without a network round trip.
+    /// Garbage bytes are refused by the reader at offset 0 without a lookup.
     #[tokio::test]
     async fn test_full_verification_bad_bytes_rejected_offline() {
         let err = verify_brc29_payment(
@@ -1048,7 +1244,60 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, PaymentVerifyError::BadTransaction(_)));
+        assert!(
+            matches!(
+                reason_of(&err),
+                UnverifiableReason::InvalidBeef { offset: 0, kind, .. } if kind == "BadVersion"
+            ),
+            "{err}"
+        );
+    }
+
+    /// The scripts run (0.5.0): a payment spending a proven parent locked to
+    /// a key, with no signature, is `SpendRefused`; the lookup is not asked.
+    /// 0.4.x checked the structure alone and served it.
+    #[tokio::test]
+    async fn test_unsigned_spend_is_refused_by_the_reader() {
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(1000, p2pkh(&[7u8; 20]))]);
+        let subject = spending(&parent, &[(1000, hex::decode(our_script()).unwrap())]);
+        let (beef, root) = beef_of(&[&parent, &subject], true);
+        let (err, asked) = verify_with(&beef, Ok(root)).await;
+        let err = err.unwrap_err();
+        assert!(
+            matches!(
+                reason_of(&err),
+                UnverifiableReason::SpendRefused { txid, input: Some(0), .. } if *txid == subject.id()
+            ),
+            "{err}"
+        );
+        assert!(!err.is_server_side());
+        assert!(asked.is_empty());
+
+        // Spendable (the parent is OP_TRUE): verified, one lookup.
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, hex::decode(our_script()).unwrap())]);
+        let (beef, root) = beef_of(&[&parent, &subject], true);
+        let (ok, asked) = verify_with(&beef, Ok(root)).await;
+        assert_eq!(ok.unwrap(), 1000);
+        assert_eq!(asked, vec![PROOF_HEIGHT]);
+    }
+
+    /// No proof is the payer's (ruled 2026-10-09): an unproven transaction
+    /// with no input anchors nothing, the refusal names it, no lookup.
+    #[tokio::test]
+    async fn test_no_proof_is_the_payers_side() {
+        let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, hex::decode(our_script()).unwrap())]);
+        let (beef, _) = beef_of(&[&parent, &subject], false);
+        let (err, asked) = verify_with(&beef, Ok("00".repeat(32))).await;
+        let err = err.unwrap_err();
+        assert_eq!(
+            *reason_of(&err),
+            UnverifiableReason::NoProof { txid: parent.id() }
+        );
+        assert!(!err.is_server_side());
+        assert!(err.to_string().contains(&parent.id()), "{err}");
+        assert!(asked.is_empty());
     }
 
     #[test]
@@ -1227,9 +1476,10 @@ mod tests {
     }
 
     /// The one visible match, as a table: every core word lands on its 0.3
-    /// result; `Verified` is the only `Ok`, and `Unverifiable` is refused
-    /// (fail-closed, 0.4.0) as the same-named `Err` carrying the amount and
-    /// the reason, so no host serves on a root that was not checked.
+    /// result; `Verified` is the only `Ok`, and every `Unverifiable` is
+    /// refused (fail-closed) as the same-named `Err` carrying the reason, so
+    /// no host serves on a root that was not checked or a proof that is
+    /// absent. `is_server_side` is true for the header lookup alone.
     #[test]
     fn test_accept_verdict_table() {
         assert_eq!(
@@ -1237,19 +1487,39 @@ mod tests {
             7
         );
         let refused = accept_verdict(PaymentVerdict::Unverifiable {
-            satoshis: 9,
-            reason: "HTTP 503".into(),
+            reason: UnverifiableReason::HeaderLookupFailed {
+                height: 9,
+                reason: "HTTP 503".into(),
+            },
         })
         .unwrap_err();
         assert!(
-            matches!(&refused, PaymentVerifyError::Unverifiable { satoshis: 9, reason }
-                if reason == "HTTP 503"),
-            "fail-closed: {refused:?}"
+            refused.is_server_side(),
+            "fail-closed, the server's side: {refused:?}"
         );
         let text = refused.to_string();
         assert!(
-            text.contains("not verified") && text.contains("HTTP 503") && text.contains("quote"),
+            text.contains("not verified")
+                && text.contains("height 9")
+                && text.contains("HTTP 503")
+                && text.contains("retry the same payment"),
             "{text}"
+        );
+        let payer = accept_verdict(PaymentVerdict::Unverifiable {
+            reason: UnverifiableReason::NoProof { txid: "ab".into() },
+        })
+        .unwrap_err();
+        assert!(!payer.is_server_side(), "{payer:?}");
+        assert!(payer.to_string().contains("ab"), "{payer}");
+        let opted = accept_verdict(PaymentVerdict::Unverifiable {
+            reason: UnverifiableReason::RootsUnchecked {
+                satoshis: 5,
+                roots: 1,
+            },
+        });
+        assert!(
+            opted.is_err(),
+            "accept_verdict never serves the opt-out's word; only the named function does"
         );
         assert!(matches!(
             accept_verdict(PaymentVerdict::Underpaid {
@@ -1272,6 +1542,10 @@ mod tests {
             accept_verdict(PaymentVerdict::NoHeaderService),
             Err(PaymentVerifyError::NoHeaderService)
         ));
+        assert!(
+            !PaymentVerifyError::NoHeaderService.is_server_side(),
+            "a misconfiguration is the host's 500, not a 503"
+        );
         assert!(matches!(
             accept_verdict(PaymentVerdict::RootMismatch {
                 height: 4,
@@ -1281,39 +1555,24 @@ mod tests {
         ));
     }
 
-    /// The core's faults land on the same-named 0.3 errors, message intact.
+    /// The core's faults land on the same-named errors, message intact.
     #[test]
     fn test_fault_mapping_table() {
         let faults = [
-            PaymentFault::BadTransaction("x".into()),
-            PaymentFault::MissingOutput {
-                index: 2,
-                output_count: 1,
-            },
             PaymentFault::KeyDerivation("k".into()),
-            PaymentFault::BadBeef("b".into()),
+            PaymentFault::Source("s".into()),
         ];
         for fault in faults {
             let text = fault.to_string();
             let err = PaymentVerifyError::from(fault.clone());
             let same_variant = match (&fault, &err) {
-                (PaymentFault::BadTransaction(a), PaymentVerifyError::BadTransaction(b)) => a == b,
-                (
-                    PaymentFault::MissingOutput {
-                        index: a,
-                        output_count: b,
-                    },
-                    PaymentVerifyError::MissingOutput {
-                        index: c,
-                        output_count: d,
-                    },
-                ) => a == c && b == d,
                 (PaymentFault::KeyDerivation(a), PaymentVerifyError::KeyDerivation(b)) => a == b,
-                (PaymentFault::BadBeef(a), PaymentVerifyError::BadBeef(b)) => a == b,
+                (PaymentFault::Source(a), PaymentVerifyError::Source(b)) => a == b,
                 _ => false,
             };
             assert!(same_variant, "{fault:?} -> {err:?}");
-            assert_eq!(err.to_string(), text, "the message is the core's");
+            assert!(!err.is_server_side());
+            let _ = text;
         }
     }
 
@@ -1337,7 +1596,7 @@ mod tests {
     /// injected: the lookup is asked exactly once, at the proof's height; a
     /// matching header accepts, a different one is `RootMismatch` naming the
     /// height and root, and a service error is refused as `Unverifiable`
-    /// carrying the paid amount and the reason (fail-closed).
+    /// with `HeaderLookupFailed` at that height (fail-closed, server-side).
     #[tokio::test]
     async fn test_full_verification_spv_outcomes_table() {
         let (_, txid) = beef_with_proven_payment(&our_script(), 1000);
@@ -1360,18 +1619,43 @@ mod tests {
 
         let (refused, asked) = verify_proven_with(Err("fetch height: timeout".to_string())).await;
         let refused = refused.unwrap_err();
-        assert!(
-            matches!(&refused, PaymentVerifyError::Unverifiable { satoshis: 1000, reason }
-                if reason.contains("timeout") && reason.contains(&PROOF_HEIGHT.to_string())),
-            "a service error fails closed: {refused:?}"
+        assert_eq!(
+            *reason_of(&refused),
+            UnverifiableReason::HeaderLookupFailed {
+                height: PROOF_HEIGHT,
+                reason: "fetch height: timeout".into()
+            },
+            "a service error fails closed on the server's side"
         );
+        assert!(refused.is_server_side());
         assert_eq!(asked, vec![PROOF_HEIGHT]);
     }
 
-    /// A lookup that never answers refuses every proven payment: there is
-    /// no accidental structural-only path through the lookup form. The named
-    /// opt-out is the one function that serves with roots unchecked, and it
-    /// says so in its log, not in its result.
+    /// The txid form refuses through the same gate; the txid itself is the
+    /// core's (pinned there), carried through unchanged.
+    #[tokio::test]
+    async fn test_verified_form_shares_the_gate() {
+        let (beef, _) = beef_with_proven_payment(&our_script(), 1000);
+        let err = verify_brc29_payment_verified(
+            SERVER_KEY,
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &beef,
+            0,
+            1000,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PaymentVerifyError::NoHeaderService));
+        let _: fn(VerifiedPayment) -> (u64, String) = |v| (v.satoshis, v.txid);
+    }
+
+    /// The named opt-out is the one function that serves with roots
+    /// unchecked, and it says so in its log, not in its result. Every other
+    /// refusal still refuses through it: a short output, invalid bytes, a
+    /// missing proof.
     #[test]
     fn test_structural_only_is_the_named_opt_out_and_serves_by_name() {
         let (proven, _) = beef_with_proven_payment(&our_script(), 1000);
@@ -1387,8 +1671,7 @@ mod tests {
         .unwrap();
         assert_eq!(served, 1000, "opted out of SPV by name");
 
-        // The other words still refuse through the same function.
-        let short = beef_with_unproven_payment(&our_script(), 999);
+        let (short, _) = beef_with_proven_payment(&our_script(), 999);
         let err = verify_brc29_payment_structural_only(
             SERVER_KEY,
             &sender_identity(),
@@ -1400,12 +1683,61 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PaymentVerifyError::Underpaid { .. }), "{err}");
+
+        let unproven = beef_with_unproven_payment(&our_script(), 1000);
+        let err = verify_brc29_payment_structural_only(
+            SERVER_KEY,
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &unproven,
+            0,
+            1000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason_of(&err), UnverifiableReason::InvalidBeef { kind, .. } if kind == "InputNamesNoElement"),
+            "{err}"
+        );
+
+        let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, hex::decode(our_script()).unwrap())]);
+        let (no_proof, _) = beef_of(&[&parent, &subject], false);
+        let err = verify_brc29_payment_structural_only(
+            SERVER_KEY,
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &no_proof,
+            0,
+            1000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason_of(&err), UnverifiableReason::NoProof { .. }),
+            "no proof is no payment, even by name: {err}"
+        );
+
+        let err = verify_brc29_payment_structural_only(
+            SERVER_KEY,
+            &sender_identity(),
+            "prefix",
+            "suffix",
+            &[0u8; 16],
+            0,
+            1000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(reason_of(&err), UnverifiableReason::InvalidBeef { kind, .. } if kind == "BadVersion"),
+            "{err}"
+        );
     }
 
     /// `verify_brc29_payment` with no usable header service is
     /// `NoHeaderService` for a payment that would otherwise pass: never `Ok`,
-    /// never a skipped root check. The gate runs before step 1, so garbage
-    /// bytes under a missing service are also `NoHeaderService`.
+    /// never a skipped root check. The gate runs before the bytes are read,
+    /// so garbage bytes under a missing service are also `NoHeaderService`.
     #[tokio::test]
     async fn test_full_verification_without_header_service_fails_closed() {
         let (beef, _) = beef_with_proven_payment(&our_script(), 1000);
@@ -1452,65 +1784,6 @@ mod tests {
         assert!(
             matches!(err, PaymentVerifyError::NoHeaderService),
             "the gate runs first: {err}"
-        );
-    }
-
-    /// The named opt-out keeps every offline check (script, amount, BEEF
-    /// structure) and only drops the root-vs-header comparison.
-    #[test]
-    fn test_structural_only_keeps_offline_checks_and_skips_spv() {
-        let (proven, _) = beef_with_proven_payment(&our_script(), 1000);
-        let sats = verify_brc29_payment_structural_only(
-            SERVER_KEY,
-            &sender_identity(),
-            "prefix",
-            "suffix",
-            &proven,
-            0,
-            1000,
-        )
-        .unwrap();
-        assert_eq!(sats, 1000);
-
-        let unproven = beef_with_unproven_payment(&our_script(), 1000);
-        let err = verify_brc29_payment_structural_only(
-            SERVER_KEY,
-            &sender_identity(),
-            "prefix",
-            "suffix",
-            &unproven,
-            0,
-            1000,
-        )
-        .unwrap_err();
-        assert!(matches!(err, PaymentVerifyError::BadBeef(_)), "{err}");
-
-        let (underpaid, _) = beef_with_proven_payment(&our_script(), 999);
-        let err = verify_brc29_payment_structural_only(
-            SERVER_KEY,
-            &sender_identity(),
-            "prefix",
-            "suffix",
-            &underpaid,
-            0,
-            1000,
-        )
-        .unwrap_err();
-        assert!(matches!(err, PaymentVerifyError::Underpaid { .. }), "{err}");
-
-        let err = verify_brc29_payment_structural_only(
-            SERVER_KEY,
-            &sender_identity(),
-            "prefix",
-            "suffix",
-            &[0u8; 16],
-            0,
-            1000,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, PaymentVerifyError::BadTransaction(_)),
-            "{err}"
         );
     }
 
@@ -1563,7 +1836,20 @@ mod tests {
             s.contains("header service") && s.contains("structural_only"),
             "{s}"
         );
-        let boxed: Box<dyn std::error::Error> = Box::new(PaymentVerifyError::BadBeef("x".into()));
-        assert!(boxed.to_string().contains("incomplete"));
+        let s = PaymentVerifyError::Unverifiable {
+            reason: UnverifiableReason::SpendRefused {
+                offset: 40,
+                txid: "cd".into(),
+                input: Some(0),
+                why: "Script(\"x\")".into(),
+            },
+        }
+        .to_string();
+        assert!(
+            s.contains("transaction cd") && !s.contains("retry the same payment"),
+            "a payer-side refusal does not invite the same payment again: {s}"
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(PaymentVerifyError::Source("x".into()));
+        assert!(boxed.to_string().contains("source"));
     }
 }

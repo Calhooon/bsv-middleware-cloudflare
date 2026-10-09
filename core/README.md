@@ -15,18 +15,34 @@ pub enum PaymentVerdict {
     WrongScript { expected: String, actual: String },
     NoHeaderService,
     RootMismatch { height: u32, root: String },
-    Unverifiable { satoshis: u64, reason: String },
+    Unverifiable { reason: UnverifiableReason },
 }
 ```
 
-`verify_brc29_payment` runs, in order: the service gate (`None` is `NoHeaderService`, fail closed, before anything
-else), script and amount (`WrongScript`, `Underpaid`), BEEF structural completeness (a `PaymentFault::BadBeef`),
-then SPV through the header service: a root that differs from its header is `RootMismatch`; a root the service
-could not answer makes the verdict `Unverifiable`, a refusal (fail closed, by the rule adopted 2026-10-08: an
-unchecked root is not evidence; the host answers a 5xx and keeps the quote); every root matched is `Verified`.
+**A BEEF of any size.** A valid payment is never refused for its size or its counts (the owner's ruling of
+2026-10-09): the payment is read once through the streaming reader of bsv-rs 0.4.0 (`transaction::verify_stream`),
+one element in hand, the scripts run; a refusal of the bytes names the offset and the reader's kind. No bound lives
+here.
+
+`verify_brc29_payment` runs, in order: the service gate (`None` is `NoHeaderService`, fail closed, before the bytes
+are read); the reader (a valid BEEF whose unproven transactions spend the parent outputs it carries; invalid bytes
+are `Unverifiable` with `InvalidBeef { offset, kind, .. }`, a refused spend `SpendRefused { txid, input, .. }`, at
+the soonest fault in stream order); the subject's output (`WrongScript`, then `Underpaid`); a proof's presence (none
+is `Unverifiable` with `NoProof { txid }`, the transaction whose proof is absent); then SPV through the header
+service, each distinct root lowest height first: a root that differs from its header is `RootMismatch`; a root the
+service could not answer makes the verdict `Unverifiable` with `HeaderLookupFailed { height, .. }`, a refusal (fail
+closed, by the rule adopted 2026-10-08: an unchecked root is not evidence); every root matched is `Verified`.
+`verify_brc29_payment_verified` answers the same with the subject's txid (`VerifiedPayment { satoshis, txid }`).
+
+`UnverifiableReason` splits the class (the no-root ruling of 2026-10-09): `is_server_side()` is true for
+`HeaderLookupFailed` alone (the host's 5xx with the quote kept; the same payment retried later) and false for every
+other reason (the payer's: the host's 4xx, no fields, another payment). `PaymentFault` (an `Err`) is the host's own
+fault alone: the server's key does not derive. A payer's bytes never produce an `Err`.
+
 Only `Verified` serves (`is_verified`; every other word `is_refused`). `verify_brc29_payment_structural_only` is
-the named opt-out: no SPV, and a proof with roots is answered `Unverifiable` so the skip is visible; a host that
-serves on that answer does so because its caller named the opt-out, never through the full check.
+the named opt-out: the reader's structure with no script run, the output, the proof's presence, and the roots NOT
+asked; a payment that passes is `Unverifiable` with `RootsUnchecked { satoshis, roots }` so the skip is visible; a
+host that serves on that answer does so because its caller named the opt-out, never through the full check.
 
 **The header service is a trait.** No URL lives in the core.
 
@@ -50,7 +66,8 @@ never a fresh claim. `MemoryStore` implements both for tests and single-process 
 
 - `brc29`: BRC-29 derivation (`expected_locking_script`, the sender's side, the derivation-prefix HMAC nonce)
   and the pays-us-correctly check (`verify_payment_output`).
-- `spv`: the per-root decision (`decide_root`, pinned by a table) and the loop over a proof's roots.
+- `spv`: the per-root decision (`decide_root`, pinned by a table) and the loop over a proof's roots
+  (`check_roots`: the first mismatch decides, the lowest unanswered height is the `HeaderLookupFailed` height).
 - `brc104`: BRC-104 header names, the signed request and response payloads, the header pairs a message is sent as.
 - `auth`: BRC-103 message build and verify over a `SessionBinding`: sign, verify against the SESSION's identity
   (the header is a claim), the handshake's `InitialResponse`, the signed general message that carries a response.
@@ -70,13 +87,14 @@ them, declares no executor, and its tests run on `tokio`'s current-thread runtim
 ## Conformance
 
 `tests/conformance_brc29.rs` runs the implementation-neutral BRC-29 payment vectors
-(`conformance/brc29-payment-vectors.json`, 20 cases) through `verify_brc29_payment` with a stub service, reading
-the file the way a second implementation does: from JSON only, and checks the outcome as well as the word: only
-`Verified` serves, and `spv-lookup-error` is refused as `Unverifiable` (the ruling of 2026-10-08, in the file's
-`rulings`; the glossary still spells that word by its retired name `AcceptedUnverified`). The copy under this
-crate's `conformance/` is shipped in the package so the published crate runs
-the vectors on its own; the canonical copy is the repository root's (produced and pinned by the Workers adapter's
-runner, which also pins this copy byte-identical to it).
+(`conformance/brc29-payment-vectors.json`, 22 cases, the stack review repository's owned file) through
+`verify_brc29_payment` with a stub service, reading the file the way a second implementation does: from JSON only,
+and checks the outcome as well as the word: only `Verified` serves; `spv-lookup-error` is refused as `Unverifiable`
+with `fields.height` (the ruling of 2026-10-08, the server's side); `spv-no-root` and `spv-incomplete-beef` are
+refused as `Unverifiable` with no fields (the ruling of 2026-10-09, the payer's side, the refusal naming the absent
+transaction, nothing asked of the service). The copy under this crate's `conformance/` is shipped in the package so
+the published crate runs the vectors on its own; the repository root's copy is pinned to the owner's bytes by
+digest, and this copy byte-identical to it, by the Workers adapter's runner.
 
 ## Build
 

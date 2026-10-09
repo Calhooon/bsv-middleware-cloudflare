@@ -4,21 +4,23 @@
 internalizing it: does output `output_index` of the payment transaction pay this server's BRC-29 derived key at
 least the quoted satoshis, and does the transaction's merkle proof tie to a real block header?
 
-The file is implementation-neutral. Copy it verbatim; do not edit it by hand. It is produced by
-`bsv-middleware-cloudflare` (`tests/conformance_brc29.rs`, `build_vectors`) from fixed synthetic inputs and pinned
-byte-for-byte by that crate's tests, so any change shows up as a reviewed diff there first. The `bsv-middleware-core`
-package ships its own copy (`core/conformance/` in this repository), pinned byte-identical to this one by the same
-tests, so the published core runs the file without the repository. All keys are synthetic
-(private keys `0x01`, `0x02`, `0x03`); `headers.example`, `real.example` and `chaintracks.invalid` are RFC 2606
-reserved names.
+The file is implementation-neutral and OWNED by the stack review repository (bsv-stack-lean,
+`conformance/brc29-payment-vectors.json`; 22 cases since 2026-10-09). Copy it verbatim; do not edit it by hand. The
+copy here is the owner's bytes with one line changed, the `producer`, pinned by digest in
+`tests/conformance_brc29.rs` (`VECTORS_SHA256`), so a new owned file is a reviewed diff. Twenty of its cases are
+synthetic payments this crate's producer (`build_cases`, fixed inputs) regenerates, and the runner holds the file's
+cases to the regenerated ones field for field (the owner's `note` and `crate_result` texts aside); the two no-root
+cases of 2026-10-09 and the `rulings` list are the owner's alone. The `bsv-middleware-core` package ships its own
+copy (`core/conformance/` in this repository), pinned byte-identical to this one, so the published core runs the
+file without the repository. All keys are synthetic (private keys `0x01`, `0x02`, `0x03`); `headers.example`,
+`real.example` and `chaintracks.invalid` are RFC 2606 reserved names.
 
 ## Schema (`brc29-payment-vectors/1`)
 
 Top level: `schema`, `producer`, `description`, `words` (the six outcome words, defined below), `derivation` (how the
 expected script is derived), `cases`, and `rulings` (the file owner's rulings on a case's word: `date`, `case`, `word`,
-`by`, `why`; a ruled case's `expected.word` is the ruled word). The canonical copy of this file is owned by the stack
-review repository; this crate's emitter reproduces it byte for byte except the `producer` line, the ruling's `why`
-(public wording here) and, on a ruled case, `crate_result` and `note`, which record this crate's own answer.
+`by`, `why`; a ruled case's `expected.word` is the ruled word). The canonical copy of this file is the stack review
+repository's; this repository's copy is byte-identical to it (sha256 `836579ad…`), the `producer` line included.
 
 Each case:
 
@@ -33,42 +35,52 @@ Each case:
 | `expected_locking_script` | Hex P2PKH the server expects: `76a914 <hash160(child pubkey)> 88ac`. |
 | `transaction.beef_hex` | The payment as BEEF (hex). The subject transaction is the last one in the BEEF. |
 | `transaction.txid`, `transaction.outputs[]` | The subject transaction's id and its outputs (`satoshis`, `locking_script` hex), for implementations that only check outputs. |
-| `transaction.proof` | `{height, merkle_root}` the BEEF's merkle path computes (a one-leaf block, so the root is the txid). |
+| `transaction.proof` | `{height, merkle_root}` the BEEF's merkle path computes (a one-leaf block, so the root is the txid); `null` on the no-root cases, whose BEEF carries no BUMP. |
 | `output_index` | The output that must pay. Always `0`: the reference middleware internalizes output 0 only. |
 | `required_satoshis` | The quoted price. |
 | `header_service.url` | The configured header-service base URL, `null` for none. |
-| `header_service.lookup` | The header service's answer for this case: `{"answer":"root","height":h,"merkle_root":hex}` (answers that root at `h`, nothing at other heights) or `{"answer":"error","reason":...}` (cannot answer). `null` on `config` cases, where it is never asked. |
+| `header_service.lookup` | The header service's answer for this case: `{"answer":"root","height":h,"merkle_root":hex}` (answers that root at `h`, nothing at other heights) or `{"answer":"error","reason":...}` (cannot answer). `null` on `config` cases and on the no-root cases, where it is never asked. |
 | `expected.word`, `expected.fields` | The intended outcome. |
-| `crate_result` | What `bsv-middleware-cloudflare` returned when the file was produced (`Ok(sats)` or `Err(<PaymentVerifyError variant>)`), for reference. Other implementations compare against `expected`, not this string. |
+| `crate_result` | What `bsv-middleware-cloudflare` returned when the case was produced (`Ok(sats)` or `Err(<PaymentVerifyError variant>)`), for reference; `null` on the owner's two no-root cases. Informational only, and older cases carry older shapes: every implementation, this crate included, compares against `expected`. |
 
 ### The six words
 
 | Word | Accept? | `fields` | crate (`PaymentVerifyError`) |
 |---|---|---|---|
 | `Verified` | yes | `satoshis` (the output's amount, which may exceed the price) | `Ok(satoshis)` |
-| `Unverifiable` (the glossary still spells it `AcceptedUnverified`, its retired name) | **no**: the root could not be checked (fail-closed, ruled 2026-10-08; 503-class at the host, the quote kept) | `satoshis` | `Unverifiable { satoshis, reason }` + a logged warning |
+| `Unverifiable` | **no**: a merkle root could not be checked (fail-closed). The server's side (the header service errored, ruled 2026-10-08): 503-class at the host, the quote kept, the same payment retried. The payer's side (the BEEF gives no root: no proof, an incomplete ancestry; ruled 2026-10-09): 400-class, another payment. | `height` (the lowest height the service could not answer for) on the server's side; none on the payer's | `Unverifiable { reason }`; `reason.is_server_side()` tells the sides |
 | `Underpaid` | no | `paid`, `required` | `Underpaid { satoshis, required }` |
 | `WrongScript` | no | `expected_script`, `actual_script` | `WrongScript { expected, actual }` |
 | `NoHeaderService` | no (server misconfigured, 500-class) | none | `NoHeaderService` |
 | `RootMismatch` | no (fraud signal) | `height`, `merkle_root` (the proof's root) | `RootMismatch { height, root }` |
 
-`Unverifiable` is the header service's failure to answer: the root was not checked, and an unchecked root is not
-evidence, so the payment is **refused** (the ruling of 2026-10-08, recorded in `rulings`). It is the server's
-condition, not the client's fault: a host answers 5xx (this crate's middleware: `503 ERR_HEADER_SERVICE_UNAVAILABLE`)
-and keeps the quote, so the client retries the same payment once the service answers. Until 0.3.8 this crate
-accepted the case with a logged warning under the word `AcceptedUnverified`; that word is retired, and the `words`
-glossary still carries its entry until the file owner renames it. `Verified` is the only word that serves.
+`Unverifiable` is a root that could not be checked, and an unchecked root is not evidence, so the payment is
+**refused** (the rulings of 2026-10-08 and 2026-10-09, recorded in `rulings`). Its reason says whose side: a header
+service that could not answer is the server's condition, not the client's fault (a host answers 5xx, this crate's
+middleware `503 ERR_HEADER_SERVICE_UNAVAILABLE`, keeps the quote, and the client retries the same payment once the
+service answers); a BEEF that gives no root to check (no BUMP, an unproven transaction with no input, an input
+naming a transaction the BEEF does not carry) is the payer's (a host answers 4xx with no fields, the server never
+fetches a missing proof, and the payer sends a proven BEEF). Until 0.3.8 this crate accepted the lookup-error case
+with a logged warning under the retired word `AcceptedUnverified`. `Verified` is the only word that serves.
 
 ## Order of checks
 
 1. **config**: refuse with `NoHeaderService` if `header_service.url` is null, blank, the `.invalid` placeholder in any
    spelling, or a value whose host cannot be classified without decoding (percent-encoding, backslash, userinfo).
    This runs before anything else, so these cases carry an otherwise-valid payment.
-2. **output**: parse the BEEF, take output `output_index`; its script must equal `expected_locking_script`
-   (`WrongScript`), then its satoshis must be `>= required_satoshis` (`Underpaid`). Script is checked before amount.
-3. **spv**: the BEEF must be structurally complete; for each merkle root (lowest height first) ask the header
-   service; a different root is `RootMismatch`, an error (or a height the service has not indexed) is `Unverifiable`
-   (refused, fail-closed), a case-insensitive match continues. All roots matched is `Verified`.
+2. **the bytes**: the BEEF must be valid (V1, V2 or Atomic) with its scripts run: every unproven transaction's
+   inputs name earlier transactions in the BEEF and spend them; an invalid BEEF or a refused spend is `Unverifiable`
+   with no fields (the payer's). An implementation that checks the structure alone passes the 22 cases too, but
+   serves an unsigned spend beside a proven stranger (bsv-middleware-core 0.1.0 did; 0.2.0 runs the scripts).
+3. **output**: take output `output_index` of the subject (the Atomic BEEF's named transaction, else the last); its
+   script must equal `expected_locking_script` (`WrongScript`), then its satoshis must be `>= required_satoshis`
+   (`Underpaid`). Script is checked before amount.
+4. **spv**: a proof must be present: a BEEF with no BUMP, an unproven transaction with no input, or an input naming a
+   transaction the BEEF does not carry is `Unverifiable` with no fields (the payer's; nothing is asked of the header
+   service). Then for each distinct merkle root (lowest height first) ask the header service; a different root is
+   `RootMismatch`, an error (or a height the service has not indexed) is `Unverifiable` with `fields.height` (the
+   lowest such height; refused, fail-closed, the server's), a case-insensitive match continues. All roots matched is
+   `Verified`.
 
 ## Running it from a second implementation
 
@@ -92,9 +104,11 @@ Only these four (`stage: "spv"`, `requires_merkle_lookup: true`):
 
 - `spv-root-match`, `spv-root-match-uppercase` → `Verified`
 - `spv-root-mismatch` → `RootMismatch`
-- `spv-lookup-error` → `Unverifiable` (refused; ruled 2026-10-08)
+- `spv-lookup-error` → `Unverifiable`, `fields.height` (refused; ruled 2026-10-08)
 
-The six `no-header-service-*` cases need a configuration gate but no lookup. The other ten need neither.
+Two more `spv` cases need no lookup (`requires_merkle_lookup: false`, `lookup: null`): `spv-no-root` and
+`spv-incomplete-beef` → `Unverifiable` with no fields (refused; ruled 2026-10-09). The six `no-header-service-*`
+cases need a configuration gate but no lookup. The other ten need neither.
 
 ## Notes on specific cases
 
@@ -106,3 +120,17 @@ The six `no-header-service-*` cases need a configuration gate but no lookup. The
 - **`wrong-script-stale-prefix`** and **`wrong-script-another-server`**: replaying a paid transaction against a new
   quote, or against another server, fails the script compare because both the prefix and the server identity are part
   of the derivation.
+- **`spv-no-root`** and **`spv-incomplete-beef`** (the owner's, produced by the stack review repository's
+  `tools/brc29_noroot_cases.py`; `crate_result: null`): the payment pays correctly, and the BEEF gives no root to
+  check. `spv-no-root` carries the subject and the parent it spends, neither proven, the parent's input naming a
+  transaction the BEEF does not carry; `spv-incomplete-beef` carries the subject alone, its input naming a parent the
+  BEEF does not carry. `Unverifiable`, no fields, the payer's side: nothing is asked of the header service, and the
+  refusal names the absent transaction (bsv-rs 0.4.0's reader refuses both as `InputNamesNoElement` at the input
+  that names it). A missing proof is never fetched by the server.
+
+## Taking a new owned file
+
+Copy the owner's bytes unchanged over `conformance/brc29-payment-vectors.json` and
+`core/conformance/brc29-payment-vectors.json` (the `producer` line is the owner's and stays), update `VECTORS_SHA256` in `tests/conformance_brc29.rs`, and run
+both runners: `cargo test --test conformance_brc29` at the root and `cargo test -p bsv-middleware-core --test
+conformance_brc29`. Never retype a case.

@@ -18,6 +18,8 @@ use crate::error::{AuthCloudflareError, Result};
 use crate::middleware::auth::{add_cors_headers, sign_json_response, AuthSession};
 use crate::storage::{KvSessionStorage, SessionStorage};
 use crate::types::{AuthContext, BsvPayment, ErrorResponse, PaymentContext};
+#[cfg(test)]
+use bsv_middleware_core::UnverifiableReason;
 use bsv_middleware_core::{verify_payment_output, PaymentFault, PaymentVerdict};
 use bsv_sdk::auth::utils::{create_nonce, verify_nonce};
 use bsv_sdk::primitives::{from_base64, PrivateKey};
@@ -198,13 +200,17 @@ where
 ///    no fresh challenge, the prefix not consumed, the wallet not called,
 ///    so the client corrects the payment and retries under the same prefix
 ///    (0.4.0; 0.3.8 answered 402 with a fresh challenge). An unreadable
-///    payment, or a proof contradicting a block header, is 400 as well; a
-///    server that cannot judge (`NoHeaderService`) 500; a root the header
-///    service could not check (`Unverifiable`) is refused with
-///    503 `ERR_HEADER_SERVICE_UNAVAILABLE` and the quote kept (fail-closed,
-///    0.4.0: nothing is served on an unchecked root; the client retries the
-///    same payment later). `satoshis_paid` is the amount read, not the
-///    price.
+///    payment, a proof contradicting a block header, or a payment that
+///    cannot be verified for a reason that is the payer's (`Unverifiable`
+///    with a payer-side reason: invalid BEEF bytes, a refused spend, no
+///    proof, no such output; the no-root ruling of 2026-10-09) is 400 as
+///    well, the quote kept; a server that cannot judge (`NoHeaderService`,
+///    or the server's own key not deriving: a `PaymentFault`) 500; a root
+///    the header service could not check (`Unverifiable` with a server-side
+///    reason) is refused with 503 `ERR_HEADER_SERVICE_UNAVAILABLE` and the
+///    quote kept (fail-closed, 0.4.0: nothing is served on an unchecked
+///    root; the client retries the same payment later). `satoshis_paid` is
+///    the amount read, not the price.
 ///
 ///    This path runs no SPV of its own: output 0's script and amount are
 ///    checked here, and nothing on this path checks the transaction's
@@ -366,12 +372,15 @@ enum PaymentDecision {
     /// called ([`PaymentResult::Failed`]). The client corrects the payment
     /// and retries under the same prefix.
     NotCovered { description: String },
-    /// The payment transaction cannot be read, has no output 0, or carries a
-    /// proof that contradicts a block header → 400 `ERR_INVALID_PAYMENT`;
-    /// the prefix is not consumed ([`PaymentResult::Failed`]).
+    /// The payment transaction cannot be read, has no output 0, carries a
+    /// proof that contradicts a block header, or cannot be verified for a
+    /// reason that is the payer's (invalid BEEF bytes, a refused spend, no
+    /// proof) → 400 `ERR_INVALID_PAYMENT`, the quote kept; the prefix is not
+    /// consumed ([`PaymentResult::Failed`]).
     InvalidPayment { description: String },
     /// The server cannot judge the payment (the core answered
-    /// `NoHeaderService`) → 500 `ERR_SERVER_MISCONFIGURED`: the server's own
+    /// `NoHeaderService`, or the server's own key does not derive: a
+    /// `PaymentFault`) → 500 `ERR_SERVER_MISCONFIGURED`: the server's own
     /// fault, never a client error; the prefix is not consumed
     /// ([`PaymentResult::Failed`]).
     ServerFault { description: String },
@@ -395,9 +404,9 @@ enum OutputJudgement {
     /// 400 `ERR_INVALID_PAYMENT`, the quote kept: no fresh challenge, the
     /// prefix not consumed, the wallet never called.
     NotCovered { description: String },
-    /// 400 `ERR_INVALID_PAYMENT`; the prefix is kept.
+    /// 400 `ERR_INVALID_PAYMENT`, the quote kept; the prefix is kept.
     Invalid { description: String },
-    /// 500 `ERR_SERVER_MISCONFIGURED`; the prefix is kept.
+    /// 500 `ERR_SERVER_MISCONFIGURED`: the server's own; the prefix is kept.
     ServerFault { description: String },
     /// 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: the root could
     /// not be checked, so nothing is served (fail-closed); the client
@@ -419,12 +428,14 @@ const HEADER_SERVICE_UNAVAILABLE: (u16, &str) = (503, "ERR_HEADER_SERVICE_UNAVAI
 /// | `Underpaid` / `WrongScript` | 400, the quote kept: no fresh challenge, prefix not consumed, wallet not called |
 /// | `NoHeaderService` | 500: the server's own fault |
 /// | `RootMismatch` | 400: a proof that contradicts a block header is a fraud signal, refused |
-/// | `Unverifiable` | 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: refused, fail-closed (0.4.0); the client retries later |
-/// | a `PaymentFault` | 400: unreadable, no such output, keys that do not derive, incomplete proof |
+/// | `Unverifiable`, `reason.is_server_side()` | 503 `ERR_HEADER_SERVICE_UNAVAILABLE`, the quote kept: refused, fail-closed (0.4.0); the client retries the same payment later |
+/// | `Unverifiable`, the payer's reason | 400, the quote kept: unreadable bytes, no such output, a sender key that does not derive, invalid BEEF, a refused spend, no proof (0.5.0; the no-root ruling of 2026-10-09) |
+/// | a `PaymentFault` | 500: the server's own key does not derive (0.5.0; a payer's bytes are never a fault) |
 ///
 /// Only `Verified` serves. The output check ([`verify_payment_output`])
-/// answers `Verified`, `Underpaid`, `WrongScript` or a fault; the SPV words
-/// are the path's standing answer should the check grow a proof step.
+/// answers `Verified`, `Underpaid`, `WrongScript`, a payer-side
+/// `Unverifiable` or the server's fault; the SPV words are the path's
+/// standing answer should the check grow a proof step.
 fn judge_paying_output(
     answer: std::result::Result<PaymentVerdict, PaymentFault>,
 ) -> OutputJudgement {
@@ -446,12 +457,22 @@ fn judge_paying_output(
         // A root that could not be checked is not evidence: refused, as the
         // server's transient condition (503) with the quote kept, never
         // served and never blamed on the client (fail-closed, 0.4.0).
-        Ok(verdict @ PaymentVerdict::Unverifiable { .. }) => {
+        Ok(verdict @ PaymentVerdict::Unverifiable { .. })
+            if verdict.is_server_side_unverifiable() =>
+        {
             OutputJudgement::HeaderServiceUnavailable {
                 description: verdict.to_string(),
             }
         }
-        Err(fault) => OutputJudgement::Invalid {
+        // The payer's: unreadable bytes, no such output, a sender key that
+        // does not derive, invalid BEEF, a refused spend, no proof. 400 with
+        // the quote kept (0.5.0; the no-root ruling of 2026-10-09).
+        Ok(verdict @ PaymentVerdict::Unverifiable { .. }) => OutputJudgement::Invalid {
+            description: verdict.to_string(),
+        },
+        // A fault is the server's own (its key does not derive): never the
+        // payer's bytes since 0.5.0.
+        Err(fault) => OutputJudgement::ServerFault {
             description: fault.to_string(),
         },
     }
@@ -1441,12 +1462,14 @@ mod tests {
         #[test]
         fn unverifiable_is_refused_as_header_service_unavailable_with_the_quote_kept() {
             let j = judge_paying_output(Ok(PaymentVerdict::Unverifiable {
-                satoshis: 7,
-                reason: "HTTP 503".into(),
+                reason: UnverifiableReason::HeaderLookupFailed {
+                    height: 7,
+                    reason: "HTTP 503".into(),
+                },
             }));
             assert!(
                 matches!(&j, OutputJudgement::HeaderServiceUnavailable { description }
-                    if description.contains("HTTP 503") && description.contains("7 satoshis")),
+                    if description.contains("HTTP 503") && description.contains("height 7")),
                 "{j:?}"
             );
             assert_eq!(
@@ -1462,21 +1485,54 @@ mod tests {
             );
         }
 
+        /// The payer's side of `Unverifiable` (0.5.0, the no-root ruling of
+        /// 2026-10-09): unreadable bytes, no such output, invalid BEEF, a
+        /// refused spend, no proof. A 400 with the quote kept, never the 503
+        /// of the server's own outage.
         #[test]
-        fn every_fault_is_an_invalid_payment() {
-            for fault in [
-                PaymentFault::BadTransaction("x".into()),
-                PaymentFault::MissingOutput {
-                    index: 0,
+        fn payer_side_unverifiable_is_an_invalid_payment_with_the_quote_kept() {
+            for reason in [
+                UnverifiableReason::MalformedTransaction("x".into()),
+                UnverifiableReason::OutputMissing {
+                    output_index: 0,
                     output_count: 0,
                 },
+                UnverifiableReason::KeyDerivation("sender".into()),
+                UnverifiableReason::InvalidBeef {
+                    offset: 12,
+                    kind: "InputNamesNoElement".into(),
+                    reason: "x".into(),
+                },
+                UnverifiableReason::SpendRefused {
+                    offset: 40,
+                    txid: "ab".into(),
+                    input: Some(0),
+                    why: "Script".into(),
+                },
+                UnverifiableReason::NoProof { txid: "ab".into() },
+                UnverifiableReason::NoTransaction,
+            ] {
+                let verdict = PaymentVerdict::Unverifiable { reason };
+                let text = verdict.to_string();
+                let j = judge_paying_output(Ok(verdict));
+                assert!(
+                    matches!(&j, OutputJudgement::Invalid { description } if *description == text),
+                    "{j:?}"
+                );
+            }
+        }
+
+        /// A fault is the server's own (0.5.0): its key does not derive.
+        #[test]
+        fn every_fault_is_the_servers_own() {
+            for fault in [
                 PaymentFault::KeyDerivation("x".into()),
-                PaymentFault::BadBeef("x".into()),
+                PaymentFault::Source("x".into()),
             ] {
                 let text = fault.to_string();
                 let j = judge_paying_output(Err(fault));
                 assert!(
-                    matches!(&j, OutputJudgement::Invalid { description } if *description == text),
+                    matches!(&j, OutputJudgement::ServerFault { description } if *description == text),
                     "{j:?}"
                 );
             }

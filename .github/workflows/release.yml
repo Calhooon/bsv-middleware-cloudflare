@@ -1,0 +1,92 @@
+name: release
+
+# Publishes to crates.io from a tag, through trusted publishing (OIDC). No
+# token is stored anywhere; nothing publishes from a laptop. Two crates, two
+# tag shapes: `core-v<version>` publishes bsv-middleware-core (core/), `v<version>`
+# publishes bsv-middleware-cloudflare (the root). The adapter depends on the
+# core by version, so the core's tag goes first and the adapter's after it is
+# on crates.io. Modelled on Calhooon/bsv-middleware-rs's release.yml.
+#
+# Until the crates.io trusted-publishing entries exist for this repository
+# (crates.io -> each crate -> Settings -> Trusted Publishing: repository
+# Calhooon/bsv-middleware-cloudflare, workflow release.yml), the `publish`
+# step cannot authenticate and the captain publishes with a token under the
+# release hold. Adding the entries is the owner's.
+on:
+  push:
+    tags: ['v*', 'core-v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      crate: ${{ steps.which.outputs.crate }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Which crate the tag names
+        id: which
+        run: |
+          case "$GITHUB_REF_NAME" in
+            core-v*) echo "crate=bsv-middleware-core" >> "$GITHUB_OUTPUT" ;;
+            v*)      echo "crate=bsv-middleware-cloudflare" >> "$GITHUB_OUTPUT" ;;
+            *)       echo "::error::tag $GITHUB_REF_NAME names no crate"; exit 1 ;;
+          esac
+
+      - name: The tag equals the crate's manifest version
+        run: |
+          crate="${{ steps.which.outputs.crate }}"
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version')
+          case "$GITHUB_REF_NAME" in
+            core-v*) want="core-v$version" ;;
+            *)       want="v$version" ;;
+          esac
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match $crate version $version (expected $want)"
+            exit 1
+          fi
+
+      # Tags are outside branch protection; refuse one that main does not hold.
+      - name: The tagged commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  ci:
+    needs: tag
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [tag, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      # For the adapter this resolves bsv-middleware-core from crates.io at
+      # the version the manifest names: the core's tag must have published.
+      - name: Dry run
+        run: cargo publish --dry-run -p ${{ needs.tag.outputs.crate }}
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish
+        run: cargo publish -p ${{ needs.tag.outputs.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

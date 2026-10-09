@@ -12,13 +12,19 @@
 //! - [`verdict`]: the six words a payment check answers with, as ONE enum
 //!   ([`PaymentVerdict`]): `Verified`, `Underpaid`, `WrongScript`,
 //!   `NoHeaderService`, `RootMismatch`, `Unverifiable`. Never a boolean.
+//!   `Unverifiable` carries an [`UnverifiableReason`] that says whose side
+//!   it is on (`is_server_side`); [`PaymentFault`] is the host's own fault
+//!   alone. [`VerifiedPayment`] is the amount and the subject's txid.
 //! - [`header_service`]: SPV's one seam, the [`HeaderService`] trait. No
 //!   URL type lives here; `None` fails closed.
 //! - [`brc29`]: BRC-29 derivation and the pays-us-correctly check
 //!   ([`expected_locking_script`], [`verify_payment_output`]).
 //! - [`spv`]: the per-root decision and the loop over a proof's roots.
 //! - [`payment_verify`]: [`verify_brc29_payment`] (the full check through a
-//!   service) and [`verify_brc29_payment_structural_only`] (the named opt-out).
+//!   service: the payment read ONCE through the streaming reader of bsv-rs
+//!   0.4.0 with the scripts run, then the output, then each root asked),
+//!   [`verify_brc29_payment_verified`] (the same, with the subject's txid)
+//!   and [`verify_brc29_payment_structural_only`] (the named opt-out).
 //! - [`store`]: the single-use stores as traits ([`PaymentNonceStore`],
 //!   [`ClaimStore`]) and an in-memory implementation.
 //! - [`brc104`]: BRC-104 header names, the signed request and response
@@ -39,16 +45,24 @@
 //! answers with data; the host owns every side effect and renders the words
 //! as HTTP. One rendering is fixed by rule, not by host policy: only
 //! [`PaymentVerdict::Verified`] serves, and [`PaymentVerdict::Unverifiable`]
-//! is a refusal (fail closed, 2026-10-08) rendered as a server-side 5xx with
-//! the quote kept.
+//! is a refusal (fail closed, 2026-10-08): a server-side reason (a header
+//! the service could not answer for) is a 5xx with the quote kept, a
+//! payer-side reason (invalid bytes, a refused spend, no proof) is a 4xx
+//! (the no-root ruling of 2026-10-09).
+//!
+//! ## A BEEF of any size
+//!
+//! No limit, no count and no size bound lives here (the posture of
+//! 2026-10-09): a valid payment of any size is read, one element at a time,
+//! and a refusal is for invalid bytes only, named by offset and kind.
 //!
 //! ## Conformance
 //!
 //! `tests/conformance_brc29.rs` runs the implementation-neutral BRC-29
 //! payment vectors (this crate's `conformance/brc29-payment-vectors.json`,
-//! a copy of the repository root's canonical file that the Workers adapter
-//! produces and pins byte-identical) through [`verify_brc29_payment`] with
-//! a stub service.
+//! a copy of the file the stack review repository owns, 22 cases, pinned
+//! byte-identical to the repository root's copy by the Workers adapter)
+//! through [`verify_brc29_payment`] with a stub service.
 
 pub mod auth;
 pub mod brc104;
@@ -67,8 +81,10 @@ pub use auth::{AuthError, SessionBinding};
 pub use brc104::{auth_headers, HttpRequestData, HttpResponseData};
 pub use brc29::{expected_locking_script, verify_payment_output, BRC29_PROTOCOL_ID};
 pub use header_service::{HeaderService, LookupFn, MerkleRoot, NoService, ServiceError};
-pub use payment_verify::{verify_brc29_payment, verify_brc29_payment_structural_only};
-pub use spv::{decide_root, RootDecision};
+pub use payment_verify::{
+    verify_brc29_payment, verify_brc29_payment_structural_only, verify_brc29_payment_verified,
+};
+pub use spv::{check_roots, decide_root, RootDecision, RootsOutcome};
 pub use store::{ClaimStore, MemoryStore, PaymentNonceStore, StoreError, PAYMENT_NONCE_SCOPE};
 pub use types::{AuthContext, BsvPayment, PaymentContext};
-pub use verdict::{PaymentFault, PaymentVerdict};
+pub use verdict::{PaymentFault, PaymentVerdict, UnverifiableReason, VerifiedPayment};

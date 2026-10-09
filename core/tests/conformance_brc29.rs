@@ -3,20 +3,20 @@
 //! [`verify_brc29_payment`] with the header service replaced by a stub that
 //! answers from the case's `header_service.lookup`.
 //!
-//! The file is owned and produced by the Workers adapter
-//! (`tests/conformance_brc29.rs` at the repository root, which pins its
-//! bytes at `conformance/brc29-payment-vectors.json` there). This crate
-//! ships its own copy under `core/conformance/` so the published package
-//! runs the file on its own; the adapter's runner asserts the two copies
-//! are byte-identical, so the root copy stays the canonical one. This
-//! runner reads it the way a second implementation does: from
-//! JSON only, comparing `expected.word` and `expected.fields`. The six
-//! words are the core's [`PaymentVerdict`]; `spv-lookup-error` expects
-//! `Unverifiable`, a refusal (the ruling of 2026-10-08, recorded in the
-//! file's `rulings`), and this runner checks that the core's answer there
-//! is refused, not only spelled right. The file's `words` glossary still
-//! carries the retired spelling `AcceptedUnverified` for that word; it is
-//! the file owner's to rename. `config` cases carry the adapter's URL
+//! The file is owned by the stack review repository (bsv-stack-lean, 22
+//! cases since 2026-10-09). This crate ships its own copy under
+//! `core/conformance/` so the published package runs the file on its own;
+//! the Workers adapter's runner (`tests/conformance_brc29.rs` at the
+//! repository root) pins the two copies byte-identical and the root copy to
+//! the owner's by digest. This runner reads it the way a second
+//! implementation does: from JSON only, comparing `expected.word` and
+//! `expected.fields`. The six words are the core's [`PaymentVerdict`].
+//! `Unverifiable` emits `fields.height` when its reason is the server's (the
+//! lowest height the service could not answer for: `spv-lookup-error`, the
+//! ruling of 2026-10-08) and no fields when it is the payer's (the no-root
+//! class: `spv-no-root`, `spv-incomplete-beef`, ruled 2026-10-09); this
+//! runner also holds those two to the payer's side and to a refusal that
+//! names the absent transaction. `config` cases carry the adapter's URL
 //! gate's refusal: the core has no URL, so a refused configuration is
 //! `None` service.
 
@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use bsv_middleware_core::brc29::{expected_locking_script, sender_locking_script};
 use bsv_middleware_core::{
     verify_brc29_payment, verify_payment_output, LookupFn, MerkleRoot, NoService, PaymentFault,
-    PaymentVerdict, ServiceError,
+    PaymentVerdict, ServiceError, UnverifiableReason,
 };
 use bsv_sdk::primitives::PrivateKey;
 use bsv_sdk::transaction::Transaction;
@@ -34,6 +34,8 @@ use serde_json::{json, Value};
 /// This crate's copy of the vector file (inside the package, so the
 /// published tarball runs it); the adapter pins it equal to the root copy.
 const VECTORS: &str = include_str!("../conformance/brc29-payment-vectors.json");
+const CASES: usize = 22;
+const NO_ROOT_CASES: [&str; 2] = ["spv-no-root", "spv-incomplete-beef"];
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key]
@@ -48,8 +50,14 @@ fn u(v: &Value, key: &str) -> u64 {
 }
 
 /// The header lookup a case describes: `answer: "root"` answers
-/// `merkle_root` at `height` (and nothing else), `answer: "error"` fails.
+/// `merkle_root` at `height` (and nothing else), `answer: "error"` fails;
+/// a `null` lookup (the no-root cases) is never asked, and errors if it is.
 fn lookup_answer(lookup: &Value, height: u32) -> Result<Option<MerkleRoot>, ServiceError> {
+    if lookup.is_null() {
+        return Err(ServiceError::new(format!(
+            "the header service was asked at height {height}"
+        )));
+    }
     match s(lookup, "answer") {
         "root" if u(lookup, "height") == u64::from(height) => {
             Ok(Some(MerkleRoot::new(s(lookup, "merkle_root"))))
@@ -66,9 +74,12 @@ fn word_of(answer: &Result<PaymentVerdict, PaymentFault>) -> (String, Value) {
         Ok(PaymentVerdict::Verified { satoshis }) => {
             ("Verified".into(), json!({ "satoshis": satoshis }))
         }
-        Ok(PaymentVerdict::Unverifiable { satoshis, .. }) => {
-            ("Unverifiable".into(), json!({ "satoshis": satoshis }))
-        }
+        Ok(PaymentVerdict::Unverifiable { reason }) => match reason {
+            UnverifiableReason::HeaderLookupFailed { height, .. } => {
+                ("Unverifiable".into(), json!({ "height": height }))
+            }
+            _ => ("Unverifiable".into(), json!({})),
+        },
         Ok(PaymentVerdict::Underpaid { paid, required }) => (
             "Underpaid".into(),
             json!({ "paid": paid, "required": required }),
@@ -135,10 +146,24 @@ async fn run_case(case: &Value) -> (Result<PaymentVerdict, PaymentFault>, Vec<u3
     (answer, asked.into_inner())
 }
 
+/// Every txid a case's BEEF names: the subject's, and each input's source
+/// up the linked ancestry.
+fn txids_named(tx: &Transaction, out: &mut Vec<String>) {
+    out.push(tx.id());
+    for input in &tx.inputs {
+        if let Some(source) = &input.source_txid {
+            out.push(source.clone());
+        }
+        if let Some(parent) = &input.source_transaction {
+            txids_named(parent, out);
+        }
+    }
+}
+
 /// The checks every case gets that do not depend on the verdict: the
 /// identity and script derivations from BOTH sides, and that the listed
 /// outputs are the outputs of the BEEF's subject transaction.
-fn check_case_is_self_consistent(case: &Value, name: &str) {
+fn check_case_is_self_consistent(case: &Value, name: &str) -> Transaction {
     let server = PrivateKey::from_hex(s(case, "server_private_key")).unwrap();
     assert_eq!(
         server.public_key().to_hex(),
@@ -181,6 +206,7 @@ fn check_case_is_self_consistent(case: &Value, name: &str) {
             "{name}"
         );
     }
+    tx
 }
 
 #[tokio::test]
@@ -188,17 +214,19 @@ async fn every_brc29_vector_gives_its_word_through_the_trait() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
     assert_eq!(doc["schema"], "brc29-payment-vectors/1");
     let cases = doc["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 20, "the 20 vectors");
+    assert_eq!(cases.len(), CASES, "the 22 vectors");
     let words = doc["words"].as_object().unwrap();
     assert_eq!(words.len(), 6, "six words");
 
     let mut mismatches = Vec::new();
+    let mut table = Vec::new();
     for case in cases {
         let name = s(case, "name");
-        check_case_is_self_consistent(case, name);
+        let subject = check_case_is_self_consistent(case, name);
 
         let (answer, asked) = run_case(case).await;
         let (word, fields) = word_of(&answer);
+        table.push(format!("{name}: {word} {fields}"));
         let expected = &case["expected"];
         if word != s(expected, "word") || fields != expected["fields"] {
             mismatches.push(format!(
@@ -233,6 +261,28 @@ async fn every_brc29_vector_gives_its_word_through_the_trait() {
                 "{name}: asked once, at the proof's height"
             );
         }
+        // The no-root class (ruled 2026-10-09): the payer's side, no fields,
+        // the refusal names a transaction of the case (the one whose proof
+        // is absent), the service never asked.
+        if NO_ROOT_CASES.contains(&name) {
+            let verdict = answer.as_ref().unwrap();
+            assert!(
+                !verdict.is_server_side_unverifiable(),
+                "{name}: the payer's side: {verdict:?}"
+            );
+            let PaymentVerdict::Unverifiable { reason } = verdict else {
+                panic!("{name}: expected Unverifiable, got {verdict:?}");
+            };
+            assert!(!reason.is_server_side());
+            let shown = verdict.to_string();
+            let mut named = Vec::new();
+            txids_named(&subject, &mut named);
+            assert!(
+                named.iter().any(|txid| shown.contains(txid)),
+                "{name}: the refusal must name a transaction of the case: {shown}"
+            );
+            assert!(asked.is_empty(), "{name}: nothing asked of the service");
+        }
 
         // The pays-us-correctly check alone must give the same word on every
         // `stage: "output"` case.
@@ -255,6 +305,11 @@ async fn every_brc29_vector_gives_its_word_through_the_trait() {
             }
         }
     }
+    eprintln!(
+        "conformance table ({} cases):\n{}",
+        table.len(),
+        table.join("\n")
+    );
     assert!(
         mismatches.is_empty(),
         "conformance mismatches:\n{}",
@@ -262,9 +317,7 @@ async fn every_brc29_vector_gives_its_word_through_the_trait() {
     );
 }
 
-/// The file's six words are the core's six; the glossary still spells
-/// `Unverifiable` by its retired name `AcceptedUnverified` (the file
-/// owner's to rename), while the ruled case uses the core's word.
+/// The file's six words are the core's six, under the core's spellings.
 #[test]
 fn the_vector_words_are_the_cores_words() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
@@ -275,7 +328,7 @@ fn the_vector_words_are_the_cores_words() {
         .map(String::as_str)
         .collect();
     file_words.sort_unstable();
-    let core_words = [
+    let mut core_words = [
         PaymentVerdict::Verified { satoshis: 0 }.word(),
         PaymentVerdict::Underpaid {
             paid: 0,
@@ -294,52 +347,57 @@ fn the_vector_words_are_the_cores_words() {
         }
         .word(),
         PaymentVerdict::Unverifiable {
-            satoshis: 0,
-            reason: String::new(),
+            reason: UnverifiableReason::NoTransaction,
         }
         .word(),
     ];
-    let mut spelled: Vec<&str> = core_words
-        .iter()
-        .map(|w| {
-            if *w == "Unverifiable" {
-                "AcceptedUnverified"
-            } else {
-                w
-            }
-        })
-        .collect();
-    spelled.sort_unstable();
-    assert_eq!(file_words, spelled);
+    core_words.sort_unstable();
+    assert_eq!(file_words, core_words);
 }
 
-/// The ruling the file records: `spv-lookup-error` expects `Unverifiable`
-/// (fail closed), the case agrees with its ruling, and the ruled word is one
-/// of the core's six. A second implementation reads the same list.
+/// The rulings the file records: `spv-lookup-error` (2026-10-08, the
+/// server's side, `fields.height`) and the two no-root cases (2026-10-09,
+/// the payer's side, no fields) expect `Unverifiable`; each case agrees
+/// with its ruling. A second implementation reads the same list.
 #[test]
-fn the_lookup_error_case_is_ruled_unverifiable() {
+fn the_ruled_cases_are_unverifiable() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
     let rulings = doc["rulings"].as_array().expect("a rulings list");
-    let ruling = rulings
-        .iter()
-        .find(|r| s(r, "case") == "spv-lookup-error")
-        .expect("the lookup-error ruling");
-    assert_eq!(s(ruling, "word"), "Unverifiable");
-    assert_eq!(s(ruling, "date"), "2026-10-08");
-    let case = doc["cases"]
-        .as_array()
-        .unwrap()
+    let cases = doc["cases"].as_array().unwrap();
+    let mut ruled = Vec::new();
+    for ruling in rulings {
+        assert_eq!(s(ruling, "word"), "Unverifiable");
+        let case = cases
+            .iter()
+            .find(|c| s(c, "name") == s(ruling, "case"))
+            .unwrap_or_else(|| panic!("the ruled case {}", ruling["case"]));
+        assert_eq!(s(&case["expected"], "word"), "Unverifiable");
+        ruled.push((s(ruling, "date"), s(ruling, "case")));
+    }
+    assert_eq!(
+        ruled,
+        [
+            ("2026-10-08", "spv-lookup-error"),
+            ("2026-10-09", "spv-no-root"),
+            ("2026-10-09", "spv-incomplete-beef"),
+        ]
+    );
+    let lookup_error = cases
         .iter()
         .find(|c| s(c, "name") == "spv-lookup-error")
-        .expect("the case");
-    assert_eq!(s(&case["expected"], "word"), "Unverifiable");
-    assert_eq!(s(&case["header_service"]["lookup"], "answer"), "error");
+        .unwrap();
     assert_eq!(
-        PaymentVerdict::Unverifiable {
-            satoshis: 0,
-            reason: String::new()
-        }
-        .word(),
-        s(ruling, "word")
+        s(&lookup_error["header_service"]["lookup"], "answer"),
+        "error"
     );
+    assert_eq!(
+        lookup_error["expected"]["fields"],
+        json!({ "height": 850_000 })
+    );
+    for name in NO_ROOT_CASES {
+        let case = cases.iter().find(|c| s(c, "name") == name).unwrap();
+        assert_eq!(case["expected"]["fields"], json!({}), "{name}: no fields");
+        assert!(case["header_service"]["lookup"].is_null());
+        assert!(case["crate_result"].is_null(), "{name}: the owner's case");
+    }
 }
