@@ -20,9 +20,9 @@ pub enum PaymentVerdict {
 ```
 
 **A BEEF of any size.** A valid payment is never refused for its size or its counts (the owner's ruling of
-2026-10-09): the payment is read once through the streaming reader of bsv-rs 0.4.0 (`transaction::verify_stream`),
-one element in hand, the scripts run; a refusal of the bytes names the offset and the reader's kind. No bound lives
-here.
+2026-10-09): the payment is read once through the streaming reader of bsv-rs 0.4 (0.4.1 at least;
+`transaction::verify_stream`), one element in hand, the scripts run; a refusal of the bytes names the offset and the
+reader's kind. No bound lives here.
 
 `verify_brc29_payment` runs, in order: the service gate (`None` is `NoHeaderService`, fail closed, before the bytes
 are read); the reader (a valid BEEF whose unproven transactions spend the parent outputs it carries; invalid bytes

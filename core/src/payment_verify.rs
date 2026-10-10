@@ -5,7 +5,7 @@
 //!
 //! A valid payment is never refused for its size or its counts (the ruling
 //! of 2026-10-09, "a BEEF of any size"). The payment is read ONCE through
-//! the streaming reader of bsv-rs 0.4.0
+//! the streaming reader of bsv-rs 0.4 (0.4.1 at least)
 //! ([`bsv_sdk::transaction::verify_stream`]): the reader holds one element
 //! of the BEEF and its index, never the BEEF; a tap beside it notes the
 //! subject's output as the bytes pass. A refusal of the bytes names the
@@ -39,8 +39,10 @@
 //!    script equals the expected BRC-29 script, else
 //!    [`WrongScript`](PaymentVerdict::WrongScript); its satoshis are at
 //!    least the price, else [`Underpaid`](PaymentVerdict::Underpaid);
-//! 3. the BEEF carries a proof and every unproven transaction has an input
-//!    (so every ancestry ends at a proven transaction), else `Unverifiable`
+//! 3. the BEEF carries a proof (so every ancestry ends at a proven
+//!    transaction: the reader holds every unproven transaction to an input,
+//!    a transaction with no input being invalid bytes since bsv-rs 0.4.1,
+//!    `InvalidBeef` with the kind `NoInputs`), else `Unverifiable`
 //!    ([`NoProof`](UnverifiableReason::NoProof), naming the transaction
 //!    whose proof is absent: the payer's side, ruled 2026-10-09; the server
 //!    never fetches a missing proof);
@@ -277,7 +279,10 @@ struct Tap<'p> {
     /// The subject whose output `paid` judged.
     subject: Option<Hash32>,
     /// The first unproven transaction with no input: nothing beneath it is
-    /// proven, and the reader's structure rule has no input to hold it by.
+    /// proven. Defense in depth since bsv-rs 0.4.1, whose decoder refuses
+    /// such a transaction as invalid bytes (`NoInputs`, at its leading byte)
+    /// before this tap could note it; 0.4.0's reader read it as valid with
+    /// no root, and this field was the refusal (`NoProof`, naming it).
     unanchored: Option<Hash32>,
     /// A BUMP claims a height no header service can be asked for.
     beyond_headers: Option<Refusal>,
@@ -493,6 +498,7 @@ mod tests {
     use super::*;
     use crate::brc29::test_support::*;
     use crate::header_service::{MerkleRoot, NoService, ServiceError};
+    use bsv_sdk::transaction::beef_stream::{InputRef, OutputRef, TxBody};
     use bsv_sdk::transaction::{Beef, Kind, Transaction};
     use std::cell::RefCell;
 
@@ -564,6 +570,50 @@ mod tests {
     /// its root (= its txid).
     fn proven_parent(lock: Vec<u8>, amount: u64) -> Transaction {
         spending(&rootless(&[(1, vec![0x52])]), &[(amount, lock)])
+    }
+
+    /// `tx` as the decoder hands a raw transaction to the tap, built by
+    /// hand (bsv-rs 0.4.1's decoder refuses one with no input before the
+    /// tap sees it): the txid in wire order, the one output's `script`
+    /// located in the raw bytes (the last field before the lock time). The
+    /// tap counts the inputs and reads nothing of them.
+    fn element_of(tx: &Transaction, script: &[u8], offset: u64) -> Element {
+        let raw = tx.to_binary();
+        let mut txid: Hash32 = hex::decode(tx.id()).unwrap().try_into().unwrap();
+        txid.reverse();
+        let end = raw.len() - 4;
+        let located = end - script.len()..end;
+        assert_eq!(
+            &raw[located.clone()],
+            script,
+            "the script's place in the raw bytes"
+        );
+        let inputs = tx
+            .inputs
+            .iter()
+            .map(|_| InputRef {
+                at: 0,
+                prev: [0u8; 32],
+                vout: 0,
+                script: 0..0,
+                sequence: 0,
+            })
+            .collect();
+        Element::Tx {
+            offset,
+            txid,
+            bump_index: None,
+            body: TxBody {
+                raw,
+                version: 1,
+                inputs,
+                outputs: vec![OutputRef {
+                    satoshis: tx.outputs[0].satoshis.unwrap(),
+                    script: located,
+                }],
+                lock_time: 0,
+            },
+        }
     }
 
     // ---- the stack-lean question: are the scripts run? ----
@@ -677,71 +727,164 @@ mod tests {
 
     // ---- the no-root class (ruled 2026-10-09): the payer's side ----
 
-    /// What bsv-rs 0.4.0's reader itself says of an unproven transaction
-    /// with no input: pinned here so the core's `NoProof` stands on a known
-    /// answer. (The sibling crate's 0.4.0 reads it as `Valid` with no root;
-    /// a later reader may call it invalid bytes.)
+    /// What the reader itself says of an unproven transaction with no
+    /// input: invalid bytes at the transaction's leading byte,
+    /// `Kind::NoInputs` (bsv-rs 0.4.1, bsv-stack-lean #58; the rule is the
+    /// node's). Red at 0.4.0, whose reader read it as `Valid` with no root
+    /// and left the refusal to the core's `NoProof`: the witness of the
+    /// bump. The leading byte is at 7: the version (4), the BUMP count (1),
+    /// the transaction count (1), the transaction's has-BUMP byte (1).
     #[test]
     fn what_the_reader_says_of_a_no_input_unproven_transaction() {
         let (alone, _) = beef_of(&[&rootless(&[(1000, OP_TRUE.to_vec())])], false);
         let verdict = verify_stream(&alone[..], RootsAskedAfter, None).unwrap();
         assert_eq!(
             verdict,
-            Verdict::Valid {
-                subject: None,
-                roots: vec![]
+            Verdict::Invalid {
+                offset: 7,
+                kind: Kind::NoInputs,
+                reason: Reason::NoInputs
             },
-            "bsv-rs 0.4.0: valid bytes, no root"
+            "bsv-rs 0.4.1: a transaction with no input is invalid bytes"
         );
     }
 
-    /// An unproven transaction with no input anchors nothing: alone, under
-    /// a paying subject, or beside a proven stranger whose root IS the
-    /// header's, the payment is `NoProof`, naming the transaction whose
-    /// proof is absent, and no header is asked. The payer's side.
+    /// An unproven transaction with no input is invalid bytes to the reader
+    /// (bsv-rs 0.4.1): alone or under a paying subject, the payment is
+    /// `Unverifiable` with `InvalidBeef { kind: "NoInputs" }` at the
+    /// transaction's leading byte, the offset in the words, the payer's
+    /// side, and no header is asked. 0.4.0's reader read the bytes as valid
+    /// with no root and the core's own `NoProof` refused them; that rule
+    /// stays beneath the reader's
+    /// (`the_doors_no_proof_stands_beneath_the_reader`).
     #[tokio::test]
     async fn a_transaction_with_no_input_and_no_proof_anchors_nothing() {
         let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
         let subject = spending(&parent, &[(1000, our_script_bytes())]);
         let (alone, _) = beef_of(&[&rootless(&[(1000, our_script_bytes())])], false);
         let (under, _) = beef_of(&[&parent, &subject], false);
-        let stranger = spending(&rootless(&[(1, vec![0x52])]), &[(7, vec![0x53])]);
-        let (beside, root) = beef_of(&[&stranger, &parent, &subject], true);
 
         let headers = Stub::root("00".repeat(32).as_str());
-        let verdict = full(&alone, &headers).await;
-        let alone_txid = rootless(&[(1000, our_script_bytes())]).id();
-        assert_eq!(
-            *reason_of(&verdict),
-            UnverifiableReason::NoProof {
-                txid: alone_txid.clone()
-            }
-        );
-        assert!(verdict.to_string().contains(&alone_txid), "{verdict}");
-
-        let verdict = full(&under, &headers).await;
-        assert_eq!(
-            *reason_of(&verdict),
-            UnverifiableReason::NoProof { txid: parent.id() },
-            "the parent with no input is the transaction whose proof is absent"
-        );
+        for (shape, beef) in [("alone", &alone), ("under a subject", &under)] {
+            let verdict = full(beef, &headers).await;
+            assert_eq!(
+                *reason_of(&verdict),
+                UnverifiableReason::InvalidBeef {
+                    offset: 7,
+                    kind: "NoInputs".into(),
+                    reason: "invalid BEEF at byte 7: NoInputs".into()
+                },
+                "{shape}: the transaction with no input, at its leading byte"
+            );
+            assert!(!reason_of(&verdict).is_server_side(), "the payer's side");
+            let shown = verdict.to_string();
+            assert!(
+                shown.contains("offset 7") && shown.contains("NoInputs"),
+                "{shown}"
+            );
+        }
         assert!(headers.asked().is_empty());
 
-        // Every root the BEEF carries is the header's, and it is still no
-        // proof of the subject: the stranger proves nothing beneath it.
-        let carried = Stub::root(&root);
-        let verdict = full(&beside, &carried).await;
-        assert_eq!(
-            *reason_of(&verdict),
-            UnverifiableReason::NoProof { txid: parent.id() }
-        );
-        assert!(!reason_of(&verdict).is_server_side(), "the payer's side");
-        assert!(carried.asked().is_empty());
-
-        // The named opt-out holds the same line: no proof is no payment.
+        // The named opt-out reads the same bytes: invalid, even by name.
         assert!(matches!(
             reason_of(&structural(&under)),
-            UnverifiableReason::NoProof { .. }
+            UnverifiableReason::InvalidBeef { offset: 7, kind, .. } if kind == "NoInputs"
+        ));
+    }
+
+    /// The witness of bsv-stack-lean #58 (the captain ran it on 0.4.0 and
+    /// 0.4.1, 2026-10-09): a parent with no input beside a proven stranger
+    /// whose BUMP is the only proof in the BEEF, the subject paying us out
+    /// of that parent, the stranger's root the header's. Refused, never
+    /// `Verified`, the payer's side, and the stranger's root is never asked
+    /// of the header service. On 0.4.0 the core's tap refused it as
+    /// `NoProof` naming the parent; on 0.4.1 the reader refuses it as
+    /// `NoInputs` at the parent's leading byte, which is what this asserts.
+    #[tokio::test]
+    async fn witness_no_input_parent_beside_a_proven_stranger_is_refused() {
+        let stranger = spending(&rootless(&[(1, vec![0x52])]), &[(1, vec![0x51])]);
+        let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, our_script_bytes())]);
+        let (beef, root) = beef_of(&[&stranger, &parent, &subject], true);
+        let headers = Stub::root(&root);
+        let verdict = full(&beef, &headers).await;
+        println!("witness (core): {verdict}");
+        assert_ne!(verdict, PaymentVerdict::Verified { satoshis: 1000 });
+        assert!(
+            matches!(reason_of(&verdict), UnverifiableReason::InvalidBeef { kind, .. } if kind == "NoInputs"),
+            "{verdict:?}"
+        );
+        assert!(!reason_of(&verdict).is_server_side(), "the payer's side");
+        assert!(
+            headers.asked().is_empty(),
+            "the stranger's root is never asked"
+        );
+        // The same bytes through the named opt-out: refused the same way.
+        assert!(matches!(
+            reason_of(&structural(&beef)),
+            UnverifiableReason::InvalidBeef { kind, .. } if kind == "NoInputs"
+        ));
+    }
+
+    /// The door's own rule, beneath the reader's. Were the reader to read a
+    /// transaction with no input as valid with no root (bsv-rs 0.4.0's
+    /// word), the tap refuses the payment `NoProof` naming that
+    /// transaction; and a valid reading of a BEEF with no BUMP is `NoProof`
+    /// naming the subject. Unreachable through bsv-rs 0.4.1's reader, which
+    /// refuses the first shape as `NoInputs` (its decoder, before the tap
+    /// sees the element) and the second as `InputNamesNoElement` or
+    /// `StubNotProven` (every ancestry ends at a proven transaction or a
+    /// proven txid-only entry, so a valid BEEF that pays carries a BUMP):
+    /// kept as defense in depth and exercised here on the tap, the reader's
+    /// word supplied.
+    #[test]
+    fn the_doors_no_proof_stands_beneath_the_reader() {
+        let expected = our_script();
+        let valid_no_root = || Verdict::Valid {
+            subject: None,
+            roots: vec![],
+        };
+        let refused = |settled: Result<Settled, PaymentVerdict>| settled.err().expect("refused");
+
+        // A parent with no input under the subject, the elements built by
+        // hand: the parent is named.
+        let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, our_script_bytes())]);
+        let mut tap = Tap::new(&expected, 0, 1000);
+        tap.note(&element_of(&parent, OP_TRUE, 7));
+        tap.note(&element_of(&subject, &our_script_bytes(), 40));
+        assert_eq!(
+            refused(tap.settle(valid_no_root())),
+            PaymentVerdict::Unverifiable {
+                reason: UnverifiableReason::NoProof { txid: parent.id() }
+            }
+        );
+
+        // No BUMP at all, every transaction with an input, the bytes fed
+        // through the tee as the reader's source: the subject is named.
+        let parent = spending(&rootless(&[(1, vec![0x52])]), &[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, our_script_bytes())]);
+        let (no_bump, _) = beef_of(&[&parent, &subject], false);
+        let mut tap = Tap::new(&expected, 0, 1000);
+        let mut tee = Tee {
+            source: &no_bump[..],
+            tap: &mut tap,
+        };
+        std::io::copy(&mut tee, &mut std::io::sink()).unwrap();
+        assert_eq!(
+            refused(tap.settle(valid_no_root())),
+            PaymentVerdict::Unverifiable {
+                reason: UnverifiableReason::NoProof { txid: subject.id() }
+            }
+        );
+        // The reader's own word for those bytes: the parent's input names a
+        // transaction the BEEF does not carry.
+        assert!(matches!(
+            verify_stream(&no_bump[..], RootsAskedAfter, None).unwrap(),
+            Verdict::Invalid {
+                kind: Kind::InputNamesNoElement,
+                ..
+            }
         ));
     }
 

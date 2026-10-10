@@ -69,9 +69,10 @@ pub enum PaymentVerdict {
 #[non_exhaustive]
 pub enum UnverifiableReason {
     /// The BEEF's bytes are invalid: the stream offset of the byte and one
-    /// of the streaming reader's eighteen kinds (bsv-rs 0.4.0,
-    /// `transaction::beef_stream::Kind`, as its name). The reading stopped
-    /// there. The payer's side.
+    /// of the streaming reader's kinds (bsv-rs 0.4.1 or later,
+    /// `transaction::beef_stream::Kind`, as its name; `NoInputs`, since
+    /// 0.4.1, for a raw transaction with no input, at its leading byte). The
+    /// reading stopped there. The payer's side.
     InvalidBeef {
         /// The stream offset of the byte the refusal names.
         offset: u64,
@@ -116,12 +117,17 @@ pub enum UnverifiableReason {
     /// this.
     KeyDerivation(String),
     /// The BEEF is valid and gives no root to check for `txid`: it carries
-    /// no BUMP, or an unproven transaction has no input, so nothing beneath
-    /// it is proven. The payer's side (the ruling of 2026-10-09): the server
-    /// never fetches a missing proof; the payer sends a proven BEEF.
+    /// no BUMP, so nothing is proven. The payer's side (the ruling of
+    /// 2026-10-09): the server never fetches a missing proof; the payer
+    /// sends a proven BEEF. A transaction with no input is invalid bytes to
+    /// the reader (bsv-rs 0.4.1, [`InvalidBeef`](Self::InvalidBeef) with the
+    /// kind `NoInputs` at its leading byte), refused before this word;
+    /// 0.4.0's reader read it as valid with no root and this word refused it,
+    /// and that rule stays beneath the reader's as defense in depth.
     NoProof {
         /// The transaction whose proof is absent (display hex): the
-        /// unproven transaction with no input, else the subject.
+        /// subject; beneath the reader, an unproven transaction with no
+        /// input.
         txid: String,
     },
     /// The header service could not answer for `height` (outage, timeout,
@@ -190,7 +196,7 @@ impl fmt::Display for UnverifiableReason {
             Self::KeyDerivation(e) => write!(f, "sender key does not derive a BRC-29 key: {e}"),
             Self::NoProof { txid } => write!(
                 f,
-                "no merkle proof for transaction {txid}: the BEEF gives no root to check (no BUMP, or an unproven transaction with no input); send a proven BEEF"
+                "no merkle proof for transaction {txid}: the BEEF gives no root to check (no BUMP, or an ancestry that reaches no proof); send a proven BEEF"
             ),
             Self::HeaderLookupFailed { height, reason } => write!(
                 f,

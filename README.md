@@ -169,8 +169,9 @@ proves, before any wallet call, that the payment *pays this server correctly* an
 (`VerifiedPayment { satoshis, txid }`), so a host records the payment without parsing the BEEF a second time.
 
 **A BEEF of any size.** A valid payment is never refused for its size or its counts (the owner's ruling of
-2026-10-09): the payment is read once through the streaming reader of bsv-rs 0.4.0, one element in hand, and a
-refusal of the bytes names the offset and the reader's kind. This crate carries no limit, no count bound and no 413.
+2026-10-09): the payment is read once through the streaming reader of bsv-rs 0.4 (0.4.1 at least), one element in
+hand, and a refusal of the bytes names the offset and the reader's kind. This crate carries no limit, no count bound
+and no 413.
 
 The check runs, in order:
 
@@ -185,9 +186,11 @@ The check runs, in order:
    `expected_brc29_locking_script`, and carries at least `required_satoshis`. One byte-compare rejects underpayment,
    zero-sat outputs, outputs paying any other key, a transaction built for another quote nonce, and a transaction built
    for another server.
-4. **A proof is present**: no BUMP, or an unproven transaction with no input, is `Unverifiable` with `NoProof { txid }`
-   (the transaction whose proof is absent). The payer's side (ruled 2026-10-09): the server never fetches a missing
-   proof; the payer sends a proven BEEF.
+4. **A proof is present**: no BUMP, or an ancestry that reaches no proof, is `Unverifiable` with `NoProof { txid }`
+   (the transaction whose proof is absent). A transaction with no input is invalid bytes, refused by the reader in
+   check 2 as `InvalidBeef { kind: "NoInputs", .. }` at its leading byte (bsv-rs 0.4.1; 0.4.0's reader read it as
+   valid with no root and this check refused it). The payer's side either way (ruled 2026-10-09): the server never
+   fetches a missing proof; the payer sends a proven BEEF.
 5. **SPV**: each distinct merkle root, lowest height first, is checked against block headers from a
    ChainTracks-compatible service (`GET {header_url}/findHeaderHexForHeight?height=N`). Fail-closed both ways: a root
    the service cannot answer for (outage, timeout, HTTP error, height not yet indexed) is `Unverifiable` with
@@ -271,4 +274,4 @@ and export the class from the worker crate: `pub use bsv_middleware_cloudflare::
 
 ## Releases
 
-Tags `core-v*` and `v*` publish `bsv-middleware-core` and `bsv-middleware-cloudflare` through crates.io trusted publishing (`.github/workflows/release.yml`). The trusted-publishing entries on crates.io are the owner's to add; until they exist, releases go out by the captain's token under the release hold, and the tags are pushed after.
+Tags `core-v*` and `v*` publish `bsv-middleware-core` and `bsv-middleware-cloudflare` through crates.io trusted publishing (`.github/workflows/release.yml`); the trusted-publishing entries exist on crates.io for both crates (verified 2026-10-10: both tag shapes authenticate). Releases go out by the tags, `core-v*` first, then `v*` once the core version is on crates.io (the adapter's package step resolves the core from crates.io alone).

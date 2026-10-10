@@ -7,10 +7,14 @@ adapted for the Workers runtime (KV for state, async everywhere, explicit respon
 **Detailed module-level docs are in `src/CLAUDE.md`.** This file is a quick orientation.
 
 Since 0.4.0 this is a two-crate workspace: `core/` is `bsv-middleware-core` (the runtime-free rules: no worker,
-no fetch, no KV/DO/D1, no clock; 0.2.0), and the root crate is the Workers adapter over it (0.5.0). Every 0.3 public
+no fetch, no KV/DO/D1, no clock; 0.2.1), and the root crate is the Workers adapter over it (0.5.1). Every 0.3 public
 item of the adapter keeps its name, path and signature; `src/api_surface_tests.rs` pins the fleet's call shapes.
-Since 0.5.0 the payment is read through bsv-rs 0.4.0's streaming reader with the scripts run, and nothing is refused
+Since 0.5.0 the payment is read through bsv-rs 0.4's streaming reader with the scripts run, and nothing is refused
 for its size or its counts (the posture of 2026-10-09, "a BEEF of any size"): no limit, no 413, no `BeefLimits`.
+Since 0.5.1 (core 0.2.1) the floor is bsv-rs 0.4.1: a raw transaction with no input is the reader's invalid bytes
+(`InvalidBeef { kind: "NoInputs", .. }` at its leading byte, bsv-stack-lean #58/#59; the same change as
+bsv-middleware-rs 0.4.1), and the core's own `NoProof` for that shape stays beneath the reader as defense in depth.
+No behavior change for a host: payer-side, 400 either way; the 22 vectors are unchanged.
 
 ## Build
 
@@ -40,7 +44,7 @@ core/src/                — bsv-middleware-core (no runtime dependency)
 ├── header_service.rs   — HeaderService trait, MerkleRoot, ServiceError, LookupFn, NoService
 ├── brc29.rs            — derivation (expected / sender locking script, prefix HMAC nonce), verify_payment_output
 ├── spv.rs              — decide_root, check_roots (the roots come from the reader; the lowest unanswered height)
-├── payment_verify.rs   — verify_brc29_payment / verify_brc29_payment_verified (ONE pass through bsv-rs 0.4.0's
+├── payment_verify.rs   — verify_brc29_payment / verify_brc29_payment_verified (ONE pass through bsv-rs 0.4's
 │                         verify_stream with every root granted, a Tap judging the subject's output as the bytes
 │                         pass, then the roots asked of the service), verify_brc29_payment_structural_only
 ├── store.rs            — PaymentNonceStore + ClaimStore traits, MemoryStore, PAYMENT_NONCE_SCOPE
@@ -106,7 +110,7 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
   `Unverifiable` server-side 503 `ERR_HEADER_SERVICE_UNAVAILABLE`; every other refusal 400 `ERR_PAYMENT_INVALID`.
   Code that wants the words uses `verify_brc29_payment_verdict` or `bsv_middleware_cloudflare::core` directly;
   `verify_brc29_payment_verified` hands back `VerifiedPayment { satoshis, txid }` so a host never re-parses the BEEF.
-  The core's full check reads the bytes ONCE through bsv-rs 0.4.0's `verify_stream` (scripts run: every unproven
+  The core's full check reads the bytes ONCE through bsv-rs 0.4's `verify_stream` (scripts run: every unproven
   transaction's inputs executed against the parent outputs the BEEF carries; an Atomic subject the tip of its
   ancestry), the roots granted to a `RootsAskedAfter` and asked of the async `HeaderService` afterwards, lowest
   height first; order: no service → the bytes (soonest fault) → the output (`WrongScript`, `Underpaid`) → a proof →

@@ -7,11 +7,11 @@ name: release
 # core by version, so the core's tag goes first and the adapter's after it is
 # on crates.io. Modelled on Calhooon/bsv-middleware-rs's release.yml.
 #
-# Until the crates.io trusted-publishing entries exist for this repository
-# (crates.io -> each crate -> Settings -> Trusted Publishing: repository
-# Calhooon/bsv-middleware-cloudflare, workflow release.yml), the `publish`
-# step cannot authenticate and the captain publishes with a token under the
-# release hold. Adding the entries is the owner's.
+# The trusted-publishing entries exist on crates.io for both crates (each
+# crate -> Settings -> Trusted Publishing: repository
+# Calhooon/bsv-middleware-cloudflare, workflow release.yml; verified
+# 2026-10-10, both tag shapes authenticate). Releases go out by the tags:
+# `core-v<version>` first, `v<version>` once the core version is on crates.io.
 on:
   push:
     tags: ['v*', 'core-v*']
