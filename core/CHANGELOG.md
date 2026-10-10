@@ -3,6 +3,42 @@
 All notable changes to `bsv-middleware-core`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## 0.2.1 — 2026-10-10
+
+bsv-rs 0.4.1 is the floor. A raw transaction with no input is invalid bytes to the streaming reader (bsv-stack-lean
+#58, #59; the rule is the node's, cited by bsv-rs): `verify_stream`, `verify_stream_structure` and
+`verify_stream_async` answer `Invalid { offset, kind: NoInputs, reason: NoInputs }` at the transaction's leading
+byte, with or without a BUMP index, and `BeefDecoder` refuses the element when its last byte is read. Through
+`verify_brc29_payment` and the named opt-out the word is `Unverifiable { reason: InvalidBeef { offset, kind:
+"NoInputs", .. } }`, where 0.2.0 on bsv-rs 0.4.0 answered `NoProof { txid }` from the tap's own rule (the reader
+read the bytes as valid with no root). That rule stays, beneath the reader's, as defense in depth: the tap's
+`unanchored` field, named so in its doc. No behavior change for a host: the refusal class is unchanged (the payer's,
+`is_server_side()` false), and nothing is asked of the header service. The same change as bsv-middleware-rs 0.4.1.
+The 22 conformance vectors pass unchanged.
+
+### Changed
+
+- `Cargo.toml`: `bsv-rs = "0.4.1"`. A fresh resolve takes the newest 0.4.x (0.4.3 at this date, which also refuses a
+  transaction with an input and no output, `NoOutputs`: the same class, `InvalidBeef`).
+- `UnverifiableReason::NoProof`'s doc and `Display`: no BUMP, or an ancestry that reaches no proof; a transaction with
+  no input is the reader's `InvalidBeef` with the kind `NoInputs`, refused before this word.
+
+### Tests
+
+- `what_the_reader_says_of_a_no_input_unproven_transaction` asserts `Invalid { offset: 7, kind: NoInputs, reason:
+  NoInputs }` (the leading byte of the first transaction; red at 0.4.0, the witness of the bump) where it asserted
+  `Valid { roots: [] }`; `a_transaction_with_no_input_and_no_proof_anchors_nothing` asserts `InvalidBeef { kind:
+  "NoInputs" }` at offset 7, the offset in the words, alone and under a subject, through the full check and the named
+  opt-out, where it asserted `NoProof`.
+- `witness_no_input_parent_beside_a_proven_stranger_is_refused` (bsv-stack-lean #58): a parent with no input beside a
+  proven stranger whose BUMP is the only proof in the BEEF, the subject paying out of that parent, the stranger's root
+  the header's. Refused, never `Verified`, the payer's side, the stranger's root never asked. On 0.4.0 the tap
+  refused it as `NoProof`; on 0.4.1 the reader refuses it as `NoInputs`.
+- `the_doors_no_proof_stands_beneath_the_reader`: the tap's own rule, the reader's word supplied (`Valid`, no root):
+  a parent with no input, the elements built by hand, is `NoProof` naming the parent; a BEEF with no BUMP fed through
+  the tee is `NoProof` naming the subject. Both shapes are the reader's refusals at 0.4.1 (`NoInputs`,
+  `InputNamesNoElement`), so the word is unreachable through it: kept as defense in depth.
+
 ## 0.2.0 — 2026-10-09
 
 The payment door reads a BEEF of any size, and the scripts run. The posture, as a rule (the owner's ruling of

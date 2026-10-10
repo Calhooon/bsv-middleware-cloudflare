@@ -19,7 +19,7 @@
 //!
 //! ## A payment of any size (0.5.0)
 //!
-//! The payment is read ONCE through the streaming reader of bsv-rs 0.4.0
+//! The payment is read ONCE through the streaming reader of bsv-rs 0.4 (0.4.1 at least)
 //! (`transaction::verify_stream`), the scripts run: every unproven
 //! transaction's inputs are executed against the parent outputs the BEEF
 //! carries, and an Atomic subject is held to its rule. A valid payment is
@@ -57,8 +57,10 @@
 //! answers.
 //!
 //! **A missing proof is the payer's (0.5.0, ruled 2026-10-09).** A BEEF that
-//! carries no BUMP, an unproven transaction with no input, a transaction
-//! whose input names a parent the BEEF does not carry: the server never
+//! carries no BUMP, a transaction whose input names a parent the BEEF does
+//! not carry, a transaction with no input (invalid bytes to the reader since
+//! bsv-rs 0.4.1, `InvalidBeef` with the kind `NoInputs` at its leading byte;
+//! 0.5.0 on 0.4.0 refused that shape as `NoProof`): the server never
 //! fetches a missing proof; the refusal names the transaction whose proof is
 //! absent, and the host answers 400 with the quote kept. A spend the script
 //! interpreter refuses (`SpendRefused`) is the payer's too. Hosts that want
@@ -159,8 +161,9 @@ pub const DEFAULT_CHAINTRACKS_URL: &str = "https://chaintracks.invalid";
 /// 0.3 variants `BadTransaction`, `MissingOutput` and `BadBeef` are gone: a
 /// payer's bytes are an `Unverifiable` reason now (`MalformedTransaction`,
 /// `OutputMissing`, `InvalidBeef`, `SpendRefused`, `NoProof`), every one of
-/// them payer-side. A host's match: `NoHeaderService` 500,
-/// `Unverifiable` with `is_server_side()` 503, everything else 400.
+/// them payer-side. A host's match: `NoHeaderService` and the server's
+/// `KeyDerivation` 500 (the host's own, as is `Source`), `Unverifiable` with
+/// `is_server_side()` 503, everything else 400 (the payer's, quote kept).
 #[derive(Debug)]
 pub enum PaymentVerifyError {
     /// The output's locking script does not pay the server's derived key.
@@ -1282,8 +1285,15 @@ mod tests {
         assert_eq!(asked, vec![PROOF_HEIGHT]);
     }
 
-    /// No proof is the payer's (ruled 2026-10-09): an unproven transaction
-    /// with no input anchors nothing, the refusal names it, no lookup.
+    /// No proof is the payer's (ruled 2026-10-09). An unproven transaction
+    /// with no input is invalid bytes to the reader since bsv-rs 0.4.1
+    /// (bsv-stack-lean #58): `InvalidBeef { kind: "NoInputs" }` at the
+    /// transaction's leading byte (7: the version, the two counts, the
+    /// has-BUMP byte), the offset in the words, no lookup. 0.5.0 on 0.4.0
+    /// refused the same bytes as the door's own `NoProof { txid: parent }`;
+    /// that rule stays beneath the reader's in the core, and the word's
+    /// class (the payer's, the txid in its words) is pinned in the
+    /// `accept_verdict` table below.
     #[tokio::test]
     async fn test_no_proof_is_the_payers_side() {
         let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
@@ -1293,11 +1303,44 @@ mod tests {
         let err = err.unwrap_err();
         assert_eq!(
             *reason_of(&err),
-            UnverifiableReason::NoProof { txid: parent.id() }
+            UnverifiableReason::InvalidBeef {
+                offset: 7,
+                kind: "NoInputs".into(),
+                reason: "invalid BEEF at byte 7: NoInputs".into()
+            }
         );
         assert!(!err.is_server_side());
-        assert!(err.to_string().contains(&parent.id()), "{err}");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("offset 7") && shown.contains("NoInputs"),
+            "{shown}"
+        );
         assert!(asked.is_empty());
+    }
+
+    /// The witness of bsv-stack-lean #58 (the captain ran it on 0.4.0 and
+    /// 0.4.1, 2026-10-09): a parent with no input beside a proven stranger
+    /// whose BUMP is the only proof in the BEEF, the subject paying us out
+    /// of that parent, the stranger's root the header's. Refused, never
+    /// served, the payer's side, and the stranger's root is never asked of
+    /// the header service. On 0.4.0 the core's tap refused it as `NoProof`
+    /// naming the parent; on 0.4.1 the reader refuses it as `NoInputs` at
+    /// the parent's leading byte, which is what this asserts.
+    #[tokio::test]
+    async fn witness_no_input_parent_beside_a_proven_stranger_is_refused() {
+        let stranger = spending(&rootless(&[(1, vec![0x52])]), &[(1, vec![0x51])]);
+        let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
+        let subject = spending(&parent, &[(1000, hex::decode(our_script()).unwrap())]);
+        let (beef, root) = beef_of(&[&stranger, &parent, &subject], true);
+        let (result, asked) = verify_with(&beef, Ok(root)).await;
+        let err = result.unwrap_err();
+        println!("witness (adapter): {err}");
+        assert!(
+            matches!(reason_of(&err), UnverifiableReason::InvalidBeef { kind, .. } if kind == "NoInputs"),
+            "{err:?}"
+        );
+        assert!(!err.is_server_side(), "the payer's side");
+        assert!(asked.is_empty(), "the stranger's root is never asked");
     }
 
     #[test]
@@ -1654,8 +1697,8 @@ mod tests {
 
     /// The named opt-out is the one function that serves with roots
     /// unchecked, and it says so in its log, not in its result. Every other
-    /// refusal still refuses through it: a short output, invalid bytes, a
-    /// missing proof.
+    /// refusal still refuses through it: a short output, invalid bytes (a
+    /// parent the BEEF does not carry, a transaction with no input, garbage).
     #[test]
     fn test_structural_only_is_the_named_opt_out_and_serves_by_name() {
         let (proven, _) = beef_with_proven_payment(&our_script(), 1000);
@@ -1700,22 +1743,26 @@ mod tests {
             "{err}"
         );
 
+        // A parent with no input: invalid bytes to the reader (bsv-rs 0.4.1,
+        // `NoInputs` at its leading byte), refused even by name. 0.4.0's
+        // reader read it as valid with no root and the door's `NoProof`
+        // refused it.
         let parent = rootless(&[(1000, OP_TRUE.to_vec())]);
         let subject = spending(&parent, &[(1000, hex::decode(our_script()).unwrap())]);
-        let (no_proof, _) = beef_of(&[&parent, &subject], false);
+        let (no_input, _) = beef_of(&[&parent, &subject], false);
         let err = verify_brc29_payment_structural_only(
             SERVER_KEY,
             &sender_identity(),
             "prefix",
             "suffix",
-            &no_proof,
+            &no_input,
             0,
             1000,
         )
         .unwrap_err();
         assert!(
-            matches!(reason_of(&err), UnverifiableReason::NoProof { .. }),
-            "no proof is no payment, even by name: {err}"
+            matches!(reason_of(&err), UnverifiableReason::InvalidBeef { offset: 7, kind, .. } if kind == "NoInputs"),
+            "a transaction with no input is invalid bytes, even by name: {err}"
         );
 
         let err = verify_brc29_payment_structural_only(

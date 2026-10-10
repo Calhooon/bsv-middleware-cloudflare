@@ -58,10 +58,11 @@ Each case:
 **refused** (the rulings of 2026-10-08 and 2026-10-09, recorded in `rulings`). Its reason says whose side: a header
 service that could not answer is the server's condition, not the client's fault (a host answers 5xx, this crate's
 middleware `503 ERR_HEADER_SERVICE_UNAVAILABLE`, keeps the quote, and the client retries the same payment once the
-service answers); a BEEF that gives no root to check (no BUMP, an unproven transaction with no input, an input
-naming a transaction the BEEF does not carry) is the payer's (a host answers 4xx with no fields, the server never
-fetches a missing proof, and the payer sends a proven BEEF). Until 0.3.8 this crate accepted the lookup-error case
-with a logged warning under the retired word `AcceptedUnverified`. `Verified` is the only word that serves.
+service answers); a BEEF that gives no root to check (no BUMP, an input naming a transaction the BEEF does not
+carry, a transaction with no input: invalid bytes to bsv-rs 0.4.1's reader, `NoInputs`) is the payer's (a host
+answers 4xx with no fields, the server never fetches a missing proof, and the payer sends a proven BEEF). Until 0.3.8
+this crate accepted the lookup-error case with a logged warning under the retired word `AcceptedUnverified`.
+`Verified` is the only word that serves.
 
 ## Order of checks
 
@@ -75,9 +76,10 @@ with a logged warning under the retired word `AcceptedUnverified`. `Verified` is
 3. **output**: take output `output_index` of the subject (the Atomic BEEF's named transaction, else the last); its
    script must equal `expected_locking_script` (`WrongScript`), then its satoshis must be `>= required_satoshis`
    (`Underpaid`). Script is checked before amount.
-4. **spv**: a proof must be present: a BEEF with no BUMP, an unproven transaction with no input, or an input naming a
-   transaction the BEEF does not carry is `Unverifiable` with no fields (the payer's; nothing is asked of the header
-   service). Then for each distinct merkle root (lowest height first) ask the header service; a different root is
+4. **spv**: a proof must be present: a BEEF with no BUMP, an input naming a transaction the BEEF does not carry, or a
+   transaction with no input (invalid bytes to bsv-rs 0.4.1's reader, `NoInputs`) is `Unverifiable` with no fields
+   (the payer's; nothing is asked of the header service). Then for each distinct merkle root (lowest height first)
+   ask the header service; a different root is
    `RootMismatch`, an error (or a height the service has not indexed) is `Unverifiable` with `fields.height` (the
    lowest such height; refused, fail-closed, the server's), a case-insensitive match continues. All roots matched is
    `Verified`.
@@ -125,7 +127,7 @@ cases need a configuration gate but no lookup. The other ten need neither.
   check. `spv-no-root` carries the subject and the parent it spends, neither proven, the parent's input naming a
   transaction the BEEF does not carry; `spv-incomplete-beef` carries the subject alone, its input naming a parent the
   BEEF does not carry. `Unverifiable`, no fields, the payer's side: nothing is asked of the header service, and the
-  refusal names the absent transaction (bsv-rs 0.4.0's reader refuses both as `InputNamesNoElement` at the input
+  refusal names the absent transaction (bsv-rs 0.4's reader refuses both as `InputNamesNoElement` at the input
   that names it). A missing proof is never fetched by the server.
 
 ## Taking a new owned file
