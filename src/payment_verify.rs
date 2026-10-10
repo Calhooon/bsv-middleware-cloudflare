@@ -161,8 +161,9 @@ pub const DEFAULT_CHAINTRACKS_URL: &str = "https://chaintracks.invalid";
 /// 0.3 variants `BadTransaction`, `MissingOutput` and `BadBeef` are gone: a
 /// payer's bytes are an `Unverifiable` reason now (`MalformedTransaction`,
 /// `OutputMissing`, `InvalidBeef`, `SpendRefused`, `NoProof`), every one of
-/// them payer-side. A host's match: `NoHeaderService` 500,
-/// `Unverifiable` with `is_server_side()` 503, everything else 400.
+/// them payer-side. A host's match: `NoHeaderService` and the server's
+/// `KeyDerivation` 500 (the host's own, as is `Source`), `Unverifiable` with
+/// `is_server_side()` 503, everything else 400 (the payer's, quote kept).
 #[derive(Debug)]
 pub enum PaymentVerifyError {
     /// The output's locking script does not pay the server's derived key.
