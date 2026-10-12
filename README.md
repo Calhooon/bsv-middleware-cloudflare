@@ -1,4 +1,4 @@
-# bsv-middleware-cloudflare
+# bsv-middleware-cloudflare 
 
 BSV authentication and payment middleware for Cloudflare Workers. Rust compiled to WASM.
 
