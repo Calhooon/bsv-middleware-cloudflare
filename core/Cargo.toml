@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 [dependencies]
 # BSV SDK: keys, BRC-42 derivation, BRC-103 message types, BEEF and merkle paths.
 # No `wasm` feature here: the host crate turns it on for a wasm32 build.
-bsv-sdk = { package = "bsv-rs", version = "0.8.11", features = ["auth", "wallet", "transaction"] }
+bsv-sdk = { package = "bsv-rs", version = "0.8.12", features = ["auth", "wallet", "transaction"] }
 
 async-trait = "0.1"
 

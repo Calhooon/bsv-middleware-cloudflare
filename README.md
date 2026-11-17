@@ -46,12 +46,12 @@ Error codes, HTTP statuses, and all `x-bsv-auth-*` / `x-bsv-payment-*` header na
 ## Install
 
 ```toml
-bsv-middleware-cloudflare = "0.7.2"
+bsv-middleware-cloudflare = "0.7.5"
 # Runtime-free hosts:
-bsv-middleware-core = "0.4.1"
+bsv-middleware-core = "0.4.4"
 ```
 
-Both crates require bsv-rs 0.7.0 or later in 0.7.x (caret). Work limits are optional, default `None`.
+Both crates require bsv-rs 0.8.12 or later in 0.8.x (caret). Work limits are optional, default `None`.
 A local evaluator decline names the resource and input as payer-side `Unverifiable` (`SpendRefused`),
 400 `ERR_PAYMENT_INVALID` in the adapter. A lone hashed leaf at a nonzero offset is refused by the
 SDK's `MerklePath`, with a payer-side refusal naming the offset. See [the migration](CHANGELOG.md).
@@ -347,7 +347,7 @@ across edges (about 60 seconds) can admit competing transactions. A DO auth
 backend does not make this KV payment backend exact; select D1 separately.
 
 ```toml
-bsv-middleware-cloudflare = { version = "0.7.2", features = ["d1-claims"] }
+bsv-middleware-cloudflare = { version = "0.7.5", features = ["d1-claims"] }
 ```
 
 ## Session storage backends
