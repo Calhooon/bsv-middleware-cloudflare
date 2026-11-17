@@ -3,6 +3,13 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## Core 0.4.3 and adapter 0.7.4 - 2026-11-17
+
+- The payment check reads the payment's subject and no longer links its ancestry. `verify_payment_output` and `payment_subject_txid` (and through them the adapter's `process_payment_with_storage{,_signed}` and `verify_brc29_payment_output`) read the subject with bsv-rs `Transaction::from_beef_subject` in place of `Transaction::from_beef`. The selection is unchanged: the Atomic BEEF's named transaction, otherwise the last entry. The streaming verifier (`verify_brc29_payment*`) is unchanged. The adapter depends on core `0.4.3`.
+- The verdicts and the subject are unchanged for every payment that verified. `core/tests/payment_subject_read.rs` runs the linking read beside the new one over the 22 vectors, the shapes the crate's fixtures build, the work-budget fixtures (`core/tests/work_budget.rs`) and 1,800 generated BEEFs (Atomic BEEF naming the tip, an ancestor or an absent txid; BEEF V1 and V2 whose last entry is the tip or an ancestor; two tips; txid-only entries; a duplicated entry; each also truncated and with one byte changed): wherever the linking read read a subject, the same txid and the same verdict; wherever it refused, the same refusal, word for word.
+- The read's memory follows the body. `core/tests/payment_read_memory.rs` holds each of the two reads to a peak heap of at most 48 times the BEEF's size on payments the size of a 128 KiB header whose subject spends one wide or proven parent through many inputs.
+- Migration for every host: re-pin adapter 0.7.4 / core 0.4.3. No call shape moves; the 22 vectors are unchanged.
+
 ## Core 0.4.2 and adapter 0.7.3 - 2026-11-17
 
 - Both SDK floors move from `bsv-rs = "0.8"` to `bsv-rs = "0.8.11"` (caret, so a later 0.8 patch resolves), feature lists and Rust 1.88 unchanged. The adapter depends on core `0.4.2`. The crate files of core 0.4.1 and adapter 0.7.2 shipped a lock holding bsv-rs 0.8.0; a requirement of `"0.8.11"` no longer admits it. No source change; the 22 vectors are unchanged.
