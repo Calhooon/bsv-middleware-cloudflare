@@ -485,3 +485,66 @@ fn ahead_polls_the_held_claim_first_then_after_the_others() {
         vec![(1, 'r'), (0, 'r'), (2, 'r'), (0, 'w'), (2, 'w'), (1, 'w')]
     );
 }
+
+/// An atomic store whose waiting claims park on a lock's waker list and are
+/// woken only by the release: no claim wakes itself while it waits.
+#[derive(Default)]
+struct ParkingLock {
+    inner: bsv_middleware_core::MemoryStore,
+    held: Cell<bool>,
+    waiters: RefCell<Vec<std::task::Waker>>,
+}
+
+impl ParkingLock {
+    fn acquire(&self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.held.get() {
+                self.waiters.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
+            } else {
+                self.held.set(true);
+                Poll::Ready(())
+            }
+        })
+    }
+
+    fn release(&self) {
+        self.held.set(false);
+        for waker in self.waiters.borrow_mut().drain(..) {
+            waker.wake();
+        }
+    }
+}
+
+impl PaymentPrefixStore for ParkingLock {
+    async fn claim_prefix(
+        &self,
+        prefix: &str,
+        txid: &str,
+        agent: &str,
+    ) -> Result<PrefixClaim, StoreError> {
+        self.acquire().await;
+        tokio::task::yield_now().await;
+        let claim = self.inner.claim_prefix(prefix, txid, agent).await;
+        tokio::task::yield_now().await;
+        self.release();
+        claim
+    }
+
+    async fn release_prefix(&self, prefix: &str, txid: &str) -> Result<(), StoreError> {
+        self.inner.release_prefix(prefix, txid).await
+    }
+}
+
+#[tokio::test]
+async fn a_store_whose_waiters_park_finishes_every_schedule_inside_a_runtime() {
+    let store = ParkingLock::default();
+    let fail = |on: bool| store.inner.fail(on);
+    let report = conformance::prefix_store(&store, "parking")
+        .fault(&fail)
+        .run()
+        .await
+        .unwrap();
+    let n = conformance::SIZES.len();
+    assert_eq!(report.checked.len(), n + n + 1 + n);
+}

@@ -26,13 +26,17 @@
 //!   in the order the claims were made;
 //! - [`Schedule::Reversed`]: the same, in the reverse order;
 //! - [`Schedule::Ahead`]`(i)`, for every `i` below N: claim `i` is polled
-//!   first, then held back (polled once every [`AHEAD_PERIOD`] passes, and
-//!   every pass once the others have finished) while the others are polled
-//!   every pass;
+//!   first, then held back while the others are polled every pass, until
+//!   they have finished or [`HELD_PASSES`] passes have gone by;
 //! - [`Schedule::Random`]`(seed)`, [`RANDOM_SCHEDULES`] seeds by default:
-//!   each pass polls a seeded random subset of the unfinished claims in a
+//!   each of the first [`HELD_PASSES`] passes polls a seeded random subset
+//!   of the unfinished claims, and every later pass all of them, in a
 //!   seeded random order. A violation names its schedule, and with it the
 //!   seed, so the run can be repeated.
+//!
+//! A pass that holds a claim back wakes the task, so the hold is bounded:
+//! after [`HELD_PASSES`] passes every unfinished claim is polled on every
+//! pass and waits on its own waker.
 //!
 //! Each claim of a schedule runs on a fresh key, and the law counts the
 //! winners and names the law, N and the schedule.
@@ -81,9 +85,9 @@ pub const RANDOM_SCHEDULES: usize = 8;
 /// The base seed of the default [`Schedule::Random`] schedules.
 pub const DEFAULT_SEED: u64 = 0x6b69_7473_6565_6400;
 
-/// Under [`Schedule::Ahead`], the held-back claim is polled once every this
-/// many passes until the others have finished.
-pub const AHEAD_PERIOD: usize = 64;
+/// The passes in which [`Schedule::Ahead`] and [`Schedule::Random`] may
+/// leave an unfinished claim unpolled; every later pass polls them all.
+pub const HELD_PASSES: usize = 64;
 
 /// A boxed future that need not be `Send`.
 pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
@@ -165,11 +169,12 @@ pub enum Schedule {
     /// Each pass polls every unfinished claim once, in the reverse order.
     Reversed,
     /// Claim `i` is polled first, once; then each pass polls the others,
-    /// and claim `i` only once every [`AHEAD_PERIOD`] passes until the
-    /// others have finished.
+    /// and claim `i` only once they have finished or [`HELD_PASSES`]
+    /// passes have gone by.
     Ahead(usize),
-    /// Each pass polls a random subset of the unfinished claims (each with
-    /// probability one half) in a random order, both drawn from the seed.
+    /// Each of the first [`HELD_PASSES`] passes polls a random subset of the
+    /// unfinished claims (each with probability one half), every later pass
+    /// all of them, in a random order; both drawn from the seed.
     Random(u64),
 }
 
@@ -274,7 +279,7 @@ impl<F: Future> Driven<F> {
                     std::iter::once(ahead)
                         .chain((0..n).filter(|&i| i != ahead))
                         .collect()
-                } else if others_done || self.pass % AHEAD_PERIOD == AHEAD_PERIOD - 1 {
+                } else if others_done || self.pass >= HELD_PASSES {
                     (0..n).collect()
                 } else {
                     (0..n).filter(|&i| i != ahead).collect()
@@ -285,6 +290,9 @@ impl<F: Future> Driven<F> {
                 for i in (1..n).rev() {
                     let j = (self.next() % (i as u64 + 1)) as usize;
                     order.swap(i, j);
+                }
+                if self.pass >= HELD_PASSES {
+                    return order;
                 }
                 let mut kept = Vec::with_capacity(n);
                 for i in order {
