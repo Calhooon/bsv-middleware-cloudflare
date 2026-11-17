@@ -533,3 +533,220 @@ mod tests {
         );
     }
 }
+
+/// The conformance kit (`bsv_middleware_core::store::conformance`) against
+/// the statements [`D1PrefixStore`] and [`D1ClaimStore`] send, on SQLite:
+/// one upsert and its classifying read in one transaction, as one D1 batch.
+/// Each call awaits before and after its batch, as a D1 call does.
+#[cfg(test)]
+mod conformance_on_sqlite {
+    use super::*;
+    use bsv_middleware_core::store::conformance;
+    use bsv_middleware_core::ClaimStore;
+    use rusqlite::{Connection, OptionalExtension};
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if std::mem::replace(&mut self.0, true) {
+                Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// One D1 database: a SQLite connection, a fault switch (every call
+    /// answers `Err` while it is on, as a D1 error does).
+    struct Sqlite {
+        db: RefCell<Connection>,
+        fail: Cell<bool>,
+    }
+
+    impl Sqlite {
+        fn new() -> Self {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(PAYMENT_CLAIMS_SCHEMA).unwrap();
+            Sqlite {
+                db: RefCell::new(db),
+                fail: Cell::new(false),
+            }
+        }
+
+        fn fault(&self) -> Result<(), StoreError> {
+            if self.fail.get() {
+                Err(StoreError::new("D1_ERROR: injected"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// `D1PrefixStore`'s claim: its txid guard, then `PREFIX_CLAIM_SQL` and
+    /// `PREFIX_READ_SQL` in one transaction, classified by `classify_prefix`.
+    struct PrefixOnSqlite<'a>(&'a Sqlite);
+
+    impl PaymentPrefixStore for PrefixOnSqlite<'_> {
+        async fn claim_prefix(
+            &self,
+            prefix: &str,
+            txid: &str,
+            agent: &str,
+        ) -> Result<PrefixClaim, StoreError> {
+            validate_txid(txid).map_err(StoreError::new)?;
+            YieldOnce(false).await;
+            self.0.fault()?;
+            let result = {
+                let mut db = self.0.db.borrow_mut();
+                let batch = db.transaction().unwrap();
+                let changes = batch
+                    .execute(PREFIX_CLAIM_SQL, [prefix, agent, txid])
+                    .unwrap();
+                let row = batch
+                    .query_row(PREFIX_READ_SQL, [prefix], |row| {
+                        Ok(PrefixRow { txid: row.get(0)? })
+                    })
+                    .optional()
+                    .unwrap();
+                batch.commit().unwrap();
+                classify_prefix(Some(changes), row, txid)
+            };
+            YieldOnce(false).await;
+            result.map_err(StoreError::new)
+        }
+
+        async fn release_prefix(&self, prefix: &str, txid: &str) -> Result<(), StoreError> {
+            YieldOnce(false).await;
+            self.0.fault()?;
+            self.0
+                .db
+                .borrow()
+                .execute(PREFIX_RELEASE_SQL, [prefix, txid])
+                .unwrap();
+            YieldOnce(false).await;
+            Ok(())
+        }
+    }
+
+    /// `D1ClaimStore`: `CLAIM_SQL` won by an inserted row, `RELEASE_SQL`.
+    struct ClaimOnSqlite<'a>(&'a Sqlite);
+
+    impl ClaimStore for ClaimOnSqlite<'_> {
+        async fn claim(&self, key: &str, agent: &str) -> Result<bool, StoreError> {
+            YieldOnce(false).await;
+            self.0.fault()?;
+            let changes = self.0.db.borrow().execute(CLAIM_SQL, [key, agent]).unwrap();
+            YieldOnce(false).await;
+            Ok(claim_won(Some(changes)))
+        }
+
+        async fn release(&self, key: &str) -> Result<(), StoreError> {
+            YieldOnce(false).await;
+            self.0.fault()?;
+            self.0.db.borrow().execute(RELEASE_SQL, [key]).unwrap();
+            Ok(())
+        }
+    }
+
+    /// The same table read by one statement and written by another, with an
+    /// await between them: a key-value namespace's shape on SQL.
+    struct ReadThenWriteOnSqlite<'a>(&'a Sqlite);
+
+    impl PaymentPrefixStore for ReadThenWriteOnSqlite<'_> {
+        async fn claim_prefix(
+            &self,
+            prefix: &str,
+            txid: &str,
+            agent: &str,
+        ) -> Result<PrefixClaim, StoreError> {
+            let row = self
+                .0
+                .db
+                .borrow()
+                .query_row(PREFIX_READ_SQL, [prefix], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()
+                .unwrap();
+            YieldOnce(false).await;
+            match row {
+                Some(Some(bound)) if bound == txid => Ok(PrefixClaim::SameTransaction),
+                Some(Some(_)) => Ok(PrefixClaim::OtherTransaction),
+                Some(None) => Ok(PrefixClaim::Unknown),
+                None => {
+                    self.0
+                        .db
+                        .borrow()
+                        .execute(
+                            "INSERT OR REPLACE INTO payment_claims (nonce, agent, txid) VALUES (?1, ?2, ?3)",
+                            [prefix, agent, txid],
+                        )
+                        .unwrap();
+                    Ok(PrefixClaim::Won)
+                }
+            }
+        }
+
+        async fn release_prefix(&self, _prefix: &str, _txid: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn d1_prefix_store_statements_keep_every_law() {
+        let db = Sqlite::new();
+        let store = PrefixOnSqlite(&db);
+        let fail = |on: bool| db.fail.set(on);
+        let seed: &conformance::LegacySeeder<'_> = &|prefix: String| {
+            let db = &db;
+            Box::pin(async move {
+                db.db
+                    .borrow()
+                    .execute(CLAIM_SQL, [prefix.as_str(), "legacy"])
+                    .map(|_| ())
+                    .map_err(|e| StoreError::new(e.to_string()))
+            })
+        };
+        let report = conformance::block_on(
+            conformance::prefix_store(&store, "d1")
+                .fault(&fail)
+                .legacy(seed)
+                .run(),
+        )
+        .unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.checked.len(), 11);
+    }
+
+    #[test]
+    fn d1_claim_store_statements_keep_every_law() {
+        let db = Sqlite::new();
+        let store = ClaimOnSqlite(&db);
+        let fail = |on: bool| db.fail.set(on);
+        let report =
+            conformance::block_on(conformance::claim_store(&store, "d1").fault(&fail).run())
+                .unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn the_same_table_read_then_written_breaks_the_concurrent_laws() {
+        for &n in conformance::SIZES {
+            let db = Sqlite::new();
+            let store = ReadThenWriteOnSqlite(&db);
+            let v = conformance::block_on(conformance::prefix_one_transaction(&store, "kv", n))
+                .unwrap_err();
+            assert!(v.detail.contains(&format!("answered {n}")), "{v}");
+            let v = conformance::block_on(conformance::prefix_many_transactions(&store, "kv", n))
+                .unwrap_err();
+            assert!(v.detail.contains(&format!("answered {n}")), "{v}");
+        }
+    }
+}

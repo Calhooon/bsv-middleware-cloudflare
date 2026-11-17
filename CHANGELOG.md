@@ -3,6 +3,21 @@
 All notable changes to `bsv-middleware-cloudflare`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## Core 0.4.4 and adapter 0.7.5 - 2026-11-17
+
+- The single-use stores' conformance kit. Core `store::conformance` (feature `conformance`; a release build carries none of it) runs the laws of `PaymentPrefixStore`, `ClaimStore` and `PaymentNonceStore` against any implementation, from a host's own tests: N claims of one prefix by one transaction (one `Won`, every other `SameTransaction`) and by N transactions (one `Won`, every other `OtherTransaction`, then the winner bound for every later claim), N = 2, 8 and 32; the trait's sequential laws; a legacy record (`Unknown`, given a seeder); a fault that is `Err`, never a claim (given a fault switch); one winner among N claims of one key and among N consumptions of one nonce. Entry points: `prefix_store`, `claim_store` and `nonce_store` (`.fault(..)`, `.legacy(..)`, `.sizes(..)`, `.run()`), each law as its own function, `together`, `block_on`, `txid_for`, `Report`, `Violation`.
+- How the claims are started together: `together` polls every unfinished claim once per pass, in order, with the caller's waker. A store whose claim awaits between its read and its write has every read issued before any write, so every claim reads the key absent; the kit counts the winners and names the law and N. The kit has no runtime of its own and accepts stores that are not `Send`, on every target; `block_on` drives stores that complete without an executor, and `run().await` runs inside a host's runtime.
+- The traits' docs say what a backend must offer (a compare-and-set, an upsert under a unique key read back in the same transaction, or a single-threaded actor) and name the kit.
+- The kit's proof in this repository: `MemoryStore` keeps every law; a store that reads, yields once, then writes breaks both concurrent prefix laws, and the claim and nonce laws, at N = 2, 8 and 32 (`core/tests/store_conformance.rs`). The statements of `D1PrefixStore` and `D1ClaimStore` keep every law on SQLite (`payment_claims::conformance_on_sqlite`), beside the existing SQL tests. Both stores keep every law on workerd's D1 (`tests/workerd/`: one test Worker run in Miniflare; the kit in the isolate, a read-await-write store on the same D1 broken at every N, and N = 2, 8 and 32 simultaneous requests per law, one winner each).
+- `KvPrefixStore` and `KvPaymentStorage` are deprecated: a claim there is a KV read and a separate KV write. Payment prefixes bind through `D1PrefixStore` (feature `d1-claims`). Both stay compiled and unchanged; the KV and Durable Object session stores are untouched.
+- Migration for every host: re-pin adapter 0.7.5 / core 0.4.4. No call shape moves; the 22 vectors are unchanged. A host on `KvPrefixStore` moves to `D1PrefixStore`; a host with its own `PaymentPrefixStore` runs the kit in its tests:
+
+  ```rust
+  // [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }
+  use bsv_middleware_core::store::conformance;
+  conformance::prefix_store(&store, "run-1").fault(&|on: bool| store.fail(on)).run().await.unwrap();
+  ```
+
 ## Core 0.4.3 and adapter 0.7.4 - 2026-11-17
 
 - The payment check reads the payment's subject and no longer links its ancestry. `verify_payment_output` and `payment_subject_txid` (and through them the adapter's `process_payment_with_storage{,_signed}` and `verify_brc29_payment_output`) read the subject with bsv-rs `Transaction::from_beef_subject` in place of `Transaction::from_beef`. The selection is unchanged: the Atomic BEEF's named transaction, otherwise the last entry. The streaming verifier (`verify_brc29_payment*`) is unchanged. The adapter depends on core `0.4.3`.

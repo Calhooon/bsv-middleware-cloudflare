@@ -7,11 +7,21 @@ use worker::kv::KvStore;
 /// Payment storage backed by Cloudflare KV.
 ///
 /// This stores payment records for BRC-29 paid requests.
+///
+/// Deprecated in 0.7.5: its records and its derivation-prefix consumption
+/// are KV reads and separate KV writes, which cannot make a payment single
+/// use. A host binds each derivation prefix to its transaction with a
+/// `PaymentPrefixStore`: `D1PrefixStore` (feature `d1-claims`).
+#[deprecated(
+    since = "0.7.5",
+    note = "KV reads and separate writes cannot make a payment single use; bind prefixes with D1PrefixStore (feature `d1-claims`)"
+)]
 pub struct KvPaymentStorage {
     kv: KvStore,
     prefix: String,
 }
 
+#[allow(deprecated)]
 impl KvPaymentStorage {
     /// Creates a new KV payment storage.
     ///

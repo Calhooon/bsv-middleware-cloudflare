@@ -1,0 +1,12 @@
+{
+  "name": "kit-worker-run",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "worker-build --release",
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "miniflare": "4.20260426.0"
+  }
+}

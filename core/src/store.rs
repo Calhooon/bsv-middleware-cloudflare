@@ -6,9 +6,26 @@
 //! idempotency keys (never derivation prefixes). [`PaymentPrefixStore`] binds
 //! a derivation prefix permanently to its first transaction (M14, BRC-105).
 //! All fail closed: a storage fault is `Err`, never a successful claim.
+//!
+//! # What a backend must offer
+//!
+//! A claim must be one indivisible step against the backend: a
+//! compare-and-set (put-if-absent), a write under a unique constraint whose
+//! outcome is read in the same transaction, or a single-threaded actor that
+//! owns the key (a Durable Object, a map on one thread). A read followed by
+//! a separate write is not a claim: two requests that both read before
+//! either writes both win. A key-value namespace without compare-and-set
+//! cannot back these traits.
+//!
+//! With the feature `conformance`, [`conformance`] is the kit that shows an
+//! implementation keeps its trait: simultaneous claims interleaved at every
+//! await, the sequential laws, and fail-closed faults.
 
 use std::fmt;
 use std::future::Future;
+
+#[cfg(feature = "conformance")]
+pub mod conformance;
 
 /// Legacy KV namespace for payment derivation prefixes.
 #[deprecated(since = "0.4.0", note = "use PaymentPrefixStore for payment prefixes")]
@@ -40,6 +57,10 @@ impl std::error::Error for StoreError {}
 
 /// A store of BRC-104 request nonces, scoped by session.
 /// Never use this trait for payment derivation prefixes.
+///
+/// `try_consume` must be atomic against the backend (see the module docs:
+/// a compare-and-set, a unique constraint, or a single-threaded actor);
+/// `conformance::nonce_store` (feature `conformance`) checks it.
 pub trait PaymentNonceStore {
     /// Records `nonce` (within `scope`) as consumed, once.
     ///
@@ -61,6 +82,10 @@ pub trait PaymentNonceStore {
 
 /// An atomic idempotency claim keyed by one string, such as a refund-once key.
 /// Never use this trait for payment derivation prefixes.
+///
+/// `claim` must be atomic against the backend (see the module docs: a
+/// compare-and-set, a unique constraint, or a single-threaded actor);
+/// `conformance::claim_store` (feature `conformance`) checks it.
 pub trait ClaimStore {
     /// Claim `key` for `agent` (recorded for diagnostics only).
     ///
@@ -90,6 +115,30 @@ pub enum PrefixClaim {
 /// Claim atomically before any wallet call. Only the bound txid can re-take a
 /// released record. Held and served records refuse even that txid. Records
 /// never expire. Storage faults are `Err`; callers must fail closed.
+///
+/// # What a backend must offer
+///
+/// `claim_prefix` decides the binding in one indivisible step: a
+/// compare-and-set on the record, an upsert under the prefix's unique key
+/// whose result is read in the same transaction (the adapter's
+/// `D1PrefixStore`: one upsert and its classifying read in one D1 batch), or
+/// a single-threaded actor that owns the prefix. A read, an await, then a
+/// write lets two simultaneous claims both win; a key-value namespace
+/// without compare-and-set cannot implement this trait.
+///
+/// # Showing it
+///
+/// With the feature `conformance`, `conformance::prefix_store` runs the
+/// trait's laws against an implementation: N claims of one prefix by one
+/// transaction and by N transactions, started together and interleaved at
+/// every await (N = 2, 8, 32); the sequential laws below; a legacy record;
+/// a fault that is `Err`. In a host's tests:
+///
+/// ```ignore
+/// // [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }
+/// use bsv_middleware_core::store::conformance;
+/// conformance::prefix_store(&my_store, "run-1").run().await.unwrap();
+/// ```
 pub trait PaymentPrefixStore {
     /// Claim `prefix` for `txid`; `agent` is diagnostic metadata only.
     fn claim_prefix(

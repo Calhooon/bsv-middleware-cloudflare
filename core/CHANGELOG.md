@@ -3,6 +3,11 @@
 All notable changes to `bsv-middleware-core`. Versions below 1.0 may change public API between minor versions;
 patch versions are additive unless a line below says otherwise.
 
+## 0.4.4 (adapter 0.7.5) - 2026-11-17
+
+- Add `store::conformance` (feature `conformance`): the kit a host's tests run against its own `PaymentPrefixStore`, `ClaimStore` or `PaymentNonceStore`. N claims started together and interleaved at every await (N = 2, 8, 32; one winner), the sequential laws, a legacy record, a fault that is `Err`. No runtime of its own; stores that are not `Send` are accepted. See the adapter's changelog for the proof runs (memory, SQLite, workerd's D1).
+- The store traits' docs say what a backend must offer: a compare-and-set, an upsert under a unique key read back in the same transaction, or a single-threaded actor. No call shape moves.
+
 ## 0.4.0 (adapter 0.7.0) - 2026-10-19
 
 - Move both SDK floors to `bsv-rs = "0.7.0"` (caret, a new compatibility line), preserving feature lists and Rust 1.88. The SDK corrects non-FORKID and Chronicle signing digests and adds `SigningContext::script_code`; this repository has no such struct literals. Default FORKID template digests are byte-identical, so the payment door is unaffected.

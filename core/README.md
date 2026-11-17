@@ -130,7 +130,22 @@ a fixture (`LookupFn` wraps a closure).
 permanently (M14, BRC-105). `claim_prefix` returns `PrefixClaim::{Won, SameTransaction,
 OtherTransaction, Unknown}`. Only `Won` proceeds to the wallet. A released record can be re-taken
 only by its own txid; held and served records refuse even that txid. `release_prefix` retains the
-binding forever. The adapter provides exact D1 and eventually consistent KV implementations.
+binding forever. The adapter provides the D1 implementation (`D1PrefixStore`); its KV
+implementation (`KvPrefixStore`) is deprecated.
+
+**What a backend must offer.** A claim is one indivisible step against the backend: a
+compare-and-set, an upsert under a unique key read back in the same transaction, or a
+single-threaded actor that owns the key. A read followed by a separate write is not a claim.
+With the feature `conformance`, `store::conformance` is the kit that shows an implementation
+keeps its trait: N claims of one key started together and interleaved at every await (N = 2, 8,
+32; one winner), the sequential laws, a legacy record, and a fault that is `Err`. A host enables
+it in its development dependencies and runs it in its own tests:
+
+```rust,ignore
+// [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }
+let fail = |on: bool| store.fail(on); // the store's fault switch, if it has one
+conformance::prefix_store(&store, "run-1").fault(&fail).run().await.unwrap();
+```
 
 `PaymentNonceStore` holds BRC-104 request nonces under their session; `ClaimStore` holds idempotency
 keys, such as refund-once keys. Neither is for payment prefixes. All fail closed by contract:

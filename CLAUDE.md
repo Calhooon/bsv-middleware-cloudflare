@@ -49,7 +49,10 @@ core/src/                — bsv-middleware-core (no runtime dependency)
 ├── payment_verify.rs   — verify_brc29_payment / verify_brc29_payment_verified (ONE pass through bsv-rs 0.4's
 │                         verify_stream with every root granted, a Tap judging the subject's output as the bytes
 │                         pass, then the roots asked of the service), verify_brc29_payment_structural_only
-├── store.rs            : PaymentPrefixStore + PrefixClaim, auth PaymentNonceStore, idempotency ClaimStore, MemoryStore
+├── store.rs            : PaymentPrefixStore + PrefixClaim, auth PaymentNonceStore, idempotency ClaimStore, MemoryStore;
+│                         what a backend must offer (compare-and-set, unique key, single-threaded actor)
+├── store/conformance.rs: feature `conformance`: the kit a host runs against its own stores (N claims started
+│                         together through `together`, the sequential laws, legacy, fail closed)
 ├── brc104.rs           — auth_headers, HttpRequestData/HttpResponseData, payloads, varint, signable filters
 ├── auth.rs             — SessionBinding, sign/verify, identity binding, handshake replies, response signing
 ├── session_lane.rs     — the lane's rules (moved whole)

@@ -7,6 +7,8 @@ pub mod kv_session;
 pub mod session_storage;
 
 pub use do_session::{AuthSessionStore, DoSessionStorage};
+#[allow(deprecated)]
 pub use kv_payment::KvPaymentStorage;
+#[allow(deprecated)]
 pub use kv_session::{KvPrefixStore, KvSessionStorage};
 pub use session_storage::{LaneVerdict, LaneVerifyAsk, SessionNonceStore, SessionStorage};

@@ -1,6 +1,6 @@
 [package]
 name = "bsv-middleware-core"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 rust-version = "1.88"
 description = "Runtime-free BSV BRC-103/104 authentication and BRC-29 payment verification: the pure rules behind bsv-middleware-cloudflare"
@@ -31,6 +31,10 @@ getrandom = "0.2"
 default = []
 # `refund`: the BRC-29 refund signer (`refund::signer`) and refund key derivation.
 refund = []
+# `conformance`: `store::conformance`, the kit a host's tests run against its
+# own single-use stores. Enable it in `[dev-dependencies]`; a release build
+# carries none of it.
+conformance = []
 
 [package.metadata.docs.rs]
 all-features = true
