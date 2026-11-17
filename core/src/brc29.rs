@@ -178,13 +178,23 @@ pub(crate) fn judge_output(
     Ok(paid)
 }
 
+/// The payment's subject: the Atomic BEEF's named transaction, otherwise the
+/// last entry, read alone. Its input ancestry is not linked: the output check
+/// and the subject's txid read the subject's own fields, which linking never
+/// changes. Bytes that are not a BEEF, or a BEEF that does not carry its
+/// subject as a transaction, are the payer's
+/// [`MalformedTransaction`](UnverifiableReason::MalformedTransaction).
+fn read_payment_subject(tx_bytes: &[u8]) -> Result<Transaction, UnverifiableReason> {
+    Transaction::from_beef_subject(tx_bytes, None)
+        .map_err(|e| UnverifiableReason::MalformedTransaction(e.to_string()))
+}
+
 /// Read the subject txid using the same selection as [`verify_payment_output`]:
 /// the Atomic BEEF's named transaction, otherwise the last transaction.
-/// This reads the transaction only; it does not verify scripts or proofs.
+/// This reads the subject alone; it does not link its ancestry or verify
+/// scripts or proofs.
 pub fn payment_subject_txid(tx_bytes: &[u8]) -> Result<String, UnverifiableReason> {
-    let tx = Transaction::from_beef(tx_bytes, None)
-        .map_err(|e| UnverifiableReason::MalformedTransaction(e.to_string()))?;
-    Ok(tx.id())
+    Ok(read_payment_subject(tx_bytes)?.id())
 }
 
 /// Does output `output_index` of the BEEF-encoded payment transaction pay the
@@ -202,7 +212,8 @@ pub fn payment_subject_txid(tx_bytes: &[u8]) -> Result<String, UnverifiableReaso
 /// [`KeyDerivation`](UnverifiableReason::KeyDerivation)). The one `Err` is
 /// the server's own key not deriving. Reference rule: the payment is the
 /// named output only, never a search for one that would pay. The subject is
-/// the Atomic BEEF's named transaction, else the last one.
+/// the Atomic BEEF's named transaction, else the last one, read alone (its
+/// input ancestry is not linked).
 pub fn verify_payment_output(
     server_key: &str,
     sender_identity_key: &str,
@@ -222,13 +233,9 @@ pub fn verify_payment_output(
         Err(reason) => return Ok(PaymentVerdict::Unverifiable { reason }),
     };
 
-    let tx = match Transaction::from_beef(tx_bytes, None) {
+    let tx = match read_payment_subject(tx_bytes) {
         Ok(tx) => tx,
-        Err(e) => {
-            return Ok(PaymentVerdict::Unverifiable {
-                reason: UnverifiableReason::MalformedTransaction(e.to_string()),
-            })
-        }
+        Err(reason) => return Ok(PaymentVerdict::Unverifiable { reason }),
     };
 
     let output = tx
