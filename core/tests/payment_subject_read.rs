@@ -1,8 +1,9 @@
-//! The payment check reads the same subject as the linking read it replaced.
+//! The payment check reads the same subject as the reference read kept for
+//! comparison.
 //!
 //! `verify_payment_output` and `payment_subject_txid` read the payment's
-//! subject alone (`Transaction::from_beef_subject`). Through core 0.4.2 they
-//! read it through `Transaction::from_beef`, which also links the subject's
+//! subject alone (`Transaction::from_beef_subject`). The reference read kept
+//! for comparison is `Transaction::from_beef`, which also links the subject's
 //! input ancestry. Both pick the subject the same way: the Atomic BEEF's
 //! named transaction, otherwise the last entry. This differential pin runs the
 //! two reads side by side (`support/subject_read.rs`) over the 22 conformance
@@ -10,9 +11,9 @@
 //! every shape the selection can meet: Atomic BEEF naming the tip, an ancestor
 //! or an absent txid; BEEF V1 and V2 whose last entry is the tip or an
 //! ancestor; two tips; txid-only entries; a duplicated entry; and each of
-//! those truncated or with one byte changed. Wherever the linking read read a
-//! subject, the crate reads the same txid and the same verdict; wherever it
-//! refused, the crate refuses with the same reason, save the link bound.
+//! those truncated or with one byte changed. Wherever the reference read
+//! reads a subject, the crate reads the same txid and the same verdict;
+//! wherever both refuse, with the same reason, word for word.
 //! `work_budget.rs` runs the same comparison over its fixtures.
 
 #[path = "support/subject_read.rs"]
@@ -285,8 +286,7 @@ fn generated(rng: &mut Rng, case: u64) -> (Vec<u8>, usize, u64) {
 }
 
 /// A shared parent of `outputs` outputs of `script_len`-byte scripts spent
-/// by `inputs` inputs of the subject: the shape whose linking meets the link
-/// bound when the parent is heavy and the inputs many.
+/// by `inputs` inputs of the subject.
 fn shared_parent(outputs: usize, script_len: usize, inputs: usize, proven: bool) -> Vec<u8> {
     let parent = tx(
         &[(outside_txid(9), 0)],
@@ -399,7 +399,7 @@ fn vector_terms(case: &Value) -> (Vec<u8>, String, String, String, String, usize
     )
 }
 
-/// The 22 vectors: the same txid and the same verdict as the linking read,
+/// The 22 vectors: the same txid and the same verdict as the reference read,
 /// at the vector's own terms and at every output index the subject has.
 #[test]
 fn the_vectors_read_the_same_subject() {
@@ -454,8 +454,8 @@ fn the_crate_fixtures_read_the_same_subject() {
 }
 
 /// Generated BEEFs of every shape the subject selection meets, each also
-/// truncated and with one byte changed: wherever the linking read read a
-/// subject, the same txid and verdict; wherever it refused, the same refusal.
+/// truncated and with one byte changed: wherever the reference read reads a
+/// subject, the same txid and verdict; wherever it refuses, the same refusal.
 #[test]
 fn generated_beefs_read_the_same_subject() {
     let sender = sender();
@@ -496,9 +496,8 @@ fn generated_beefs_read_the_same_subject() {
     assert!(tally.both_refused >= 300, "{tally:?}");
 }
 
-/// A shared parent spent by many inputs: below the link bound both reads
-/// read the subject; past it the linking read refused the body and the crate
-/// reads the subject the bytes name.
+/// A shared parent spent by many inputs, light and heavy: the crate reads the
+/// subject the bytes name and judges its named output, at every size.
 #[test]
 fn a_shared_parent_reads_the_same_subject() {
     let sender = sender();

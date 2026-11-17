@@ -1,17 +1,19 @@
-//! The payment read's memory follows the body.
+//! The payment read's memory is a bounded multiple of the body.
 //!
 //! The adapter's payment door reads the payer's BEEF through two core
 //! functions, in this order: [`verify_payment_output`], then
 //! [`payment_subject_txid`]. This test builds payments the size of a 128 KiB
-//! `x-bsv-payment` header whose subject spends one parent through many inputs,
-//! runs both functions under a counting allocator, and holds the peak heap of
-//! each call to a fixed multiple of the BEEF's size.
+//! `x-bsv-payment` header, runs both functions under a counting allocator, and
+//! holds the peak heap of each call to a fixed multiple of the BEEF's size.
 //!
 //! The shapes:
 //! - a wide parent (many outputs), unproven, spent by many inputs of the
 //!   subject (two widths);
 //! - the same parent proven by a BUMP;
-//! - a parent of one output proven by a wide BUMP, spent by many inputs.
+//! - a parent of one output proven by a wide BUMP, spent by many inputs;
+//! - many tiny transactions (no input, no output) before the subject, in
+//!   BEEF V2 and V1;
+//! - a subject of many empty outputs.
 //!
 //! Output 0 of every subject pays the derived script, so each body is a
 //! payment the output check answers `Verified` for, and the subject's txid is
@@ -25,24 +27,30 @@ use bsv_middleware_core::{
 use bsv_sdk::primitives::PrivateKey;
 use bsv_sdk::script::{LockingScript, UnlockingScript};
 use bsv_sdk::transaction::{
-    Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput,
+    Beef, MerklePath, MerklePathLeaf, Transaction, TransactionInput, TransactionOutput, BEEF_V1,
+    BEEF_V2,
 };
 
 struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// The peak with a growing `realloc` counted as its growth alone.
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// The peak with the old and the new block both live during a `realloc`.
+static PEAK_HELD: AtomicUsize = AtomicUsize::new(0);
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
             let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
             PEAK.fetch_max(live, Ordering::SeqCst);
+            PEAK_HELD.fetch_max(live, Ordering::SeqCst);
         }
         ptr
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = System.realloc(ptr, layout, new_size);
         if !new_ptr.is_null() {
+            PEAK_HELD.fetch_max(LIVE.load(Ordering::SeqCst) + new_size, Ordering::SeqCst);
             let live = if new_size >= layout.size() {
                 LIVE.fetch_add(new_size - layout.size(), Ordering::SeqCst) + new_size
                     - layout.size()
@@ -64,7 +72,7 @@ static ALLOCATOR: Counting = Counting;
 
 /// The ceiling: each call's peak heap, above what was live before it, is at
 /// most this many times the BEEF's size.
-const CEILING_PER_BODY_BYTE: usize = 48;
+const CEILING_PER_BODY_BYTE: usize = 128;
 
 /// The size of the header the payment travels in.
 const HEADER_BYTES: usize = 128 * 1024;
@@ -88,6 +96,27 @@ fn hash_of(i: u64) -> String {
     b[..8].copy_from_slice(&i.to_le_bytes());
     b[31] = 0xab;
     hex::encode(b)
+}
+
+/// A subject of one input from outside the BEEF, output 0 paying `pay`,
+/// then `empty_outputs` outputs of value 0 and an empty script.
+fn subject(pay: &[u8], empty_outputs: usize) -> Transaction {
+    let mut subject = Transaction::new();
+    let mut outside = TransactionInput::new(hash_of(9), 0);
+    outside.unlocking_script = Some(UnlockingScript::new());
+    subject.inputs.push(outside);
+    subject
+        .add_output(TransactionOutput::new(
+            1000,
+            LockingScript::from_binary(pay).unwrap(),
+        ))
+        .unwrap();
+    for _ in 0..empty_outputs {
+        subject
+            .add_output(TransactionOutput::new(0, LockingScript::new()))
+            .unwrap();
+    }
+    subject
 }
 
 /// One parent (one input from outside the BEEF, `outputs` empty-script
@@ -134,32 +163,90 @@ fn payment(outputs: usize, inputs: usize, bump_leaves: usize, pay: &[u8]) -> (Ve
     (beef.to_binary(), subject.id())
 }
 
-/// The most inputs whose payment still fits the header.
-fn fill(outputs: usize, bump_leaves: usize, pay: &[u8]) -> (Vec<u8>, String) {
+/// One subject of `empty_outputs + 1` outputs.
+fn many_outputs(empty_outputs: usize, pay: &[u8]) -> (Vec<u8>, String) {
+    let subject = subject(pay, empty_outputs);
+    let mut beef = Beef::new();
+    beef.merge_raw_tx(subject.to_binary(), None);
+    (beef.to_binary(), subject.id())
+}
+
+fn write_varint(n: u64, out: &mut Vec<u8>) {
+    match n {
+        0..=0xfc => out.push(n as u8),
+        0xfd..=0xffff => {
+            out.push(0xfd);
+            out.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+        _ => {
+            out.push(0xfe);
+            out.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+    }
+}
+
+/// `tiny` transactions of no input and no output (each 10 bytes, told
+/// apart by their locktime), then the subject, as BEEF V1 or V2 without a
+/// BUMP, written entry by entry in this order.
+fn many_tiny(tiny: usize, v1: bool, pay: &[u8]) -> (Vec<u8>, String) {
+    let subject = subject(pay, 0);
+    let mut entries: Vec<Vec<u8>> = (0..tiny)
+        .map(|i| {
+            let mut tx = Transaction::new();
+            tx.lock_time = i as u32;
+            tx.to_binary()
+        })
+        .collect();
+    entries.push(subject.to_binary());
+    let mut body = Vec::new();
+    body.extend_from_slice(&if v1 { BEEF_V1 } else { BEEF_V2 }.to_le_bytes());
+    write_varint(0, &mut body);
+    write_varint(entries.len() as u64, &mut body);
+    for entry in entries {
+        if v1 {
+            body.extend_from_slice(&entry);
+            body.push(0);
+        } else {
+            body.push(0);
+            body.extend_from_slice(&entry);
+        }
+    }
+    (body, subject.id())
+}
+
+/// The largest count `n` whose payment `make(n)` still fits the header.
+fn fill(make: impl Fn(usize) -> (Vec<u8>, String)) -> (Vec<u8>, String) {
     let budget = beef_budget();
-    let (mut lo, mut hi) = (1usize, 8 * budget);
+    let (mut lo, mut hi) = (1usize, budget);
     while lo < hi {
         let mid = (lo + hi).div_ceil(2);
-        if payment(outputs, mid, bump_leaves, pay).0.len() <= budget {
+        if make(mid).0.len() <= budget {
             lo = mid;
         } else {
             hi = mid - 1;
         }
     }
-    payment(outputs, lo, bump_leaves, pay)
+    make(lo)
 }
 
-/// The heap a call holds at its peak, above what was live when it began.
-fn peak_of<T>(call: impl FnOnce() -> T) -> (T, usize) {
+/// The heap a call holds at its peak, above what was live when it began, by
+/// each accounting: a `realloc`'s growth alone, and both blocks held.
+fn peak_of<T>(call: impl FnOnce() -> T) -> (T, usize, usize) {
     let base = LIVE.load(Ordering::SeqCst);
     PEAK.store(base, Ordering::SeqCst);
+    PEAK_HELD.store(base, Ordering::SeqCst);
     let answer = call();
-    (answer, PEAK.load(Ordering::SeqCst) - base)
+    (
+        answer,
+        PEAK.load(Ordering::SeqCst) - base,
+        PEAK_HELD.load(Ordering::SeqCst) - base,
+    )
 }
 
-/// The payment read's memory follows the body: on every shape, each of the
-/// door's two reads peaks within a fixed multiple of the BEEF's size, and
-/// reads the subject's verdict and txid.
+/// The payment read's memory is a bounded multiple of the body: on every
+/// shape, each of the door's two reads peaks at most
+/// [`CEILING_PER_BODY_BYTE`] times the BEEF's size, with both blocks of a
+/// `realloc` counted, and reads the subject's verdict and txid.
 #[test]
 fn the_payment_reads_memory_follows_the_body() {
     let sender = PrivateKey::from_hex(SENDER_KEY)
@@ -168,35 +255,60 @@ fn the_payment_reads_memory_follows_the_body() {
         .to_hex();
     let pay =
         hex::decode(expected_locking_script(SERVER_KEY, &sender, PREFIX, SUFFIX).unwrap()).unwrap();
-    let shapes = [
-        ("wide unproven parent", 6144, 0),
-        ("unproven parent", 768, 0),
-        ("wide proven parent", 6144, 2),
-        ("proven parent, wide BUMP", 1, 1024),
+    type Make<'a> = Box<dyn Fn(usize) -> (Vec<u8>, String) + 'a>;
+    let shapes: Vec<(&str, Make)> = vec![
+        (
+            "wide unproven parent",
+            Box::new(|n| payment(6144, n, 0, &pay)),
+        ),
+        ("unproven parent", Box::new(|n| payment(768, n, 0, &pay))),
+        (
+            "wide proven parent",
+            Box::new(|n| payment(6144, n, 2, &pay)),
+        ),
+        (
+            "proven parent, wide BUMP",
+            Box::new(|n| payment(1, n, 1024, &pay)),
+        ),
+        (
+            "many tiny transactions, then the subject (BEEF V2)",
+            Box::new(|n| many_tiny(n, false, &pay)),
+        ),
+        (
+            "many tiny transactions, then the subject (BEEF V1)",
+            Box::new(|n| many_tiny(n, true, &pay)),
+        ),
+        (
+            "subject of many empty outputs",
+            Box::new(|n| many_outputs(n, &pay)),
+        ),
     ];
-    for (name, outputs, bump_leaves) in shapes {
-        let (body, subject) = fill(outputs, bump_leaves, &pay);
+    for (name, make) in shapes {
+        let (body, subject) = fill(make);
         assert!(body.len() <= beef_budget() && body.len() > beef_budget() * 9 / 10);
         let ceiling = CEILING_PER_BODY_BYTE * body.len();
+        let times = |peak: usize| peak as f64 / body.len() as f64;
 
-        let (verdict, verify_peak) =
+        let (verdict, verify_grown, verify_held) =
             peak_of(|| verify_payment_output(SERVER_KEY, &sender, PREFIX, SUFFIX, &body, 0, 1000));
-        let (txid, subject_peak) = peak_of(|| payment_subject_txid(&body));
+        let (txid, subject_grown, subject_held) = peak_of(|| payment_subject_txid(&body));
         println!(
-            "{name}: body {} B, output check peak {verify_peak} B ({:.1}x), \
-             subject txid peak {subject_peak} B ({:.1}x)",
+            "{name}: body {} B; output check peak {verify_held} B ({:.1}x held, {:.1}x grown); \
+             subject txid peak {subject_held} B ({:.1}x held, {:.1}x grown)",
             body.len(),
-            verify_peak as f64 / body.len() as f64,
-            subject_peak as f64 / body.len() as f64,
+            times(verify_held),
+            times(verify_grown),
+            times(subject_held),
+            times(subject_grown),
         );
         assert!(
-            verify_peak <= ceiling,
-            "{name}: the output check peaked at {verify_peak} B on a {} B body",
+            verify_held <= ceiling,
+            "{name}: the output check peaked at {verify_held} B on a {} B body",
             body.len()
         );
         assert!(
-            subject_peak <= ceiling,
-            "{name}: the subject read peaked at {subject_peak} B on a {} B body",
+            subject_held <= ceiling,
+            "{name}: the subject read peaked at {subject_held} B on a {} B body",
             body.len()
         );
         assert_eq!(

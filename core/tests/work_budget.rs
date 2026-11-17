@@ -1,6 +1,6 @@
 /// The work-budget fixtures (the vectors as payments, honest chains of
 /// several widths and hops, a locktime, the hostile body) read the same
-/// subject and verdict as the linking read (`payment_subject_read.rs`).
+/// subject and verdict as the reference read (`payment_subject_read.rs`).
 #[test]
 fn work_budget_fixtures_read_the_same_subject() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();
