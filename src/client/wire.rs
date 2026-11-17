@@ -345,8 +345,12 @@ mod tests {
             serde_json::json!({"tw": 1, "ty": 2, "u": 3}),
             serde_json::json!({}),
         ] {
-            let mut with = args.clone();
-            with["tx"] = serde_json::json!(tx);
+            // A `Value` holding `tx` inserted first, then the args: sorted in
+            // a build that sorts, `tx` first under `preserve_order`.
+            let mut with = Map::new();
+            with.insert("tx".into(), serde_json::json!(tx));
+            with.extend(args.as_object().unwrap().clone());
+            let with = Value::Object(with);
             let rid = [3u8; 32];
             let mut p = internalize_payload(3, &auth, &args, &tx).unwrap();
             p.set_request_id(&rid);
@@ -378,6 +382,19 @@ mod tests {
             String::from_utf8(out).unwrap(),
             format!("{{\"tx\":[1,2],{}}}", rest.join(","))
         );
-        assert!(!maps_keep_insertion_order(), "this crate's own build sorts");
+        // Whichever order this build's maps keep, the writer's choice is
+        // the one a `Value` holding `tx` inserted first would write.
+        let mut out = Vec::new();
+        ArgsWithTx {
+            args: map,
+            tx: &[1, 2],
+            tx_first: maps_keep_insertion_order(),
+        }
+        .serialize(&mut serde_json::Serializer::new(&mut out))
+        .unwrap();
+        let mut value = Map::new();
+        value.insert("tx".into(), serde_json::json!([1, 2]));
+        value.extend(map.clone());
+        assert_eq!(out, serde_json::to_vec(&Value::Object(value)).unwrap());
     }
 }
