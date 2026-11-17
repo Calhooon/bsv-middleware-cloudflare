@@ -9,6 +9,7 @@
 
 pub mod json_rpc;
 mod storage;
+pub(crate) mod wire;
 
 pub use json_rpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use storage::{ClientSessionSnapshot, WorkerStorageClient, CLIENT_SESSION_SNAPSHOT_VERSION};

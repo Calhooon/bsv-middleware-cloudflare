@@ -81,7 +81,8 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
 │   └── kv_payment.rs   — payment records, unspent tracking, derivation prefix lifecycle
 ├── client/
 │   ├── json_rpc.rs     — JSON-RPC 2.0 types with tolerant deserialization
-│   └── storage.rs      — WorkerStorageClient: auth'd RPC to a wallet storage server
+│   ├── storage.rs      — WorkerStorageClient: auth'd RPC to a wallet storage server; internalize_action_with_tx
+│   └── wire.rs         — RpcPayload: a request written once into the BRC-104 payload it is signed over
 ├── transport/
 │   └── cloudflare.rs   — CloudflareTransport: BRC-104 header extraction (payload build and
 │                         header names are the core's brc104, re-exported)

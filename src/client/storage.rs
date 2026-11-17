@@ -6,11 +6,12 @@
 //! This is a minimal client exposing only the RPC methods needed for payment
 //! processing: `make_available`, `find_or_insert_user`, and `internalize_action`.
 
-use super::json_rpc::{JsonRpcRequest, JsonRpcResponse};
+use super::json_rpc::JsonRpcResponse;
+use super::wire::{internalize_payload, RpcPayload};
 use crate::error::{AuthCloudflareError, Result};
-use bsv_sdk::auth::transports::HttpRequest;
 use bsv_sdk::auth::types::{AuthMessage, MessageType, AUTH_PROTOCOL_ID};
 use bsv_sdk::auth::utils::create_nonce;
+use bsv_sdk::primitives::hash::sha256;
 use bsv_sdk::primitives::{to_base64, PublicKey};
 use bsv_sdk::wallet::{
     Counterparty, CreateSignatureArgs, Protocol, SecurityLevel, VerifySignatureArgs,
@@ -484,7 +485,8 @@ impl WorkerStorageClient {
     /// Makes an authenticated JSON-RPC call to the storage server.
     ///
     /// 1. Ensures we have a BRC-103/104 session (resumed from KV when cached)
-    /// 2. Sends one freshly signed attempt (`send_rpc_once`)
+    /// 2. Writes the request once (`RpcPayload`) and sends one freshly
+    ///    signed attempt (`send_rpc_once`)
     /// 3. If the server's AUTH LAYER rejected it (stale/expired session —
     ///    the RPC handler never ran, see `is_auth_layer_rejection`),
     ///    re-handshakes, overwrites the KV snapshot, and retries exactly once
@@ -495,8 +497,26 @@ impl WorkerStorageClient {
         params: Vec<Value>,
     ) -> Result<T> {
         self.ensure_session().await?;
+        let payload = RpcPayload::write(self.take_id(), method, &params)?;
+        drop(params);
+        self.rpc_call_payload(payload).await
+    }
 
-        let (mut status, mut id, mut response_text) = self.send_rpc_once(method, &params).await?;
+    /// The request id of the next attempt.
+    fn take_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// [`rpc_call`](Self::rpc_call) for a request already written (with the
+    /// session ensured): one attempt, and one more under a fresh handshake
+    /// and the next request id if the server's auth layer refused the first.
+    async fn rpc_call_payload<T: DeserializeOwned>(
+        &mut self,
+        mut payload: RpcPayload,
+    ) -> Result<T> {
+        let (mut status, mut response_text) = self.send_rpc_once(&mut payload).await?;
 
         if Self::is_auth_layer_rejection(status, &response_text) {
             // Correctness over speed: a stale resumed session (or a session
@@ -508,11 +528,14 @@ impl WorkerStorageClient {
             self.session_resumed = false;
             self.perform_handshake().await?;
             self.persist_session_to_kv().await;
-            let (s, i, t) = self.send_rpc_once(method, &params).await?;
+            let id = self.take_id();
+            payload.set_id(id);
+            let (s, t) = self.send_rpc_once(&mut payload).await?;
             status = s;
-            id = i;
             response_text = t;
         }
+        let id = payload.id;
+        drop(payload);
 
         if !(200..300).contains(&status) {
             return Err(AuthCloudflareError::TransportError(format!(
@@ -551,45 +574,16 @@ impl WorkerStorageClient {
             .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))
     }
 
-    /// Sends ONE signed JSON-RPC attempt over the current session and returns
-    /// `(http_status, jsonrpc_id, body_text)`. Every attempt is independently
-    /// safe: a fresh JSON-RPC id, a fresh 256-bit random request ID, a fresh
-    /// 256-bit random message nonce, and a fresh BRC-42-derived signature —
-    /// nothing per-request is ever reused, whether the session was resumed
-    /// or freshly handshaken.
-    ///
-    /// 1. Builds JSON-RPC request
-    /// 2. Wraps in HttpRequest payload for signing
-    /// 3. Signs with BRC-42 key derivation
-    /// 4. Sends via `worker::Fetch` with BRC-104 auth headers
-    async fn send_rpc_once(
-        &mut self,
-        method: &str,
-        params: &[Value],
-    ) -> Result<(u16, u64, String)> {
-        // Build JSON-RPC request
-        let id = self.next_id;
-        self.next_id += 1;
-        let rpc_req = JsonRpcRequest::new(id, method, params.to_vec());
-        let rpc_body = serde_json::to_vec(&rpc_req)
-            .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
-        let rpc_body_str = String::from_utf8(rpc_body.clone())
-            .map_err(|e| AuthCloudflareError::SerializationError(e.to_string()))?;
-
+    /// Signs one attempt of `payload` over the current session: a fresh
+    /// 256-bit random request ID (written into the payload) and message
+    /// nonce, and the signature over the payload's SHA-256 (what
+    /// `create_signature` computes from the payload as `data`). Returns the
+    /// BRC-104 headers of the attempt.
+    pub(crate) fn sign_attempt(&self, payload: &mut RpcPayload) -> Result<Vec<(String, String)>> {
         // Generate 32-byte random request ID
         let mut request_id = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut request_id);
-
-        // Build HttpRequest payload (BRC-104) for signing
-        let http_request = HttpRequest {
-            request_id,
-            method: "POST".to_string(),
-            path: "/".to_string(),
-            search: String::new(),
-            headers: vec![("content-type".to_string(), "application/json".to_string())],
-            body: rpc_body,
-        };
-        let payload = http_request.to_payload();
+        payload.set_request_id(&request_id);
 
         // Build General AuthMessage
         let my_identity = self.identity_key();
@@ -605,10 +599,9 @@ impl WorkerStorageClient {
             AuthCloudflareError::InvalidAuthentication("no session established".into())
         })?;
         msg.your_nonce = Some(session.peer_nonce.clone());
-        msg.payload = Some(payload);
 
-        // Sign the message using ProtoWallet's sync create_signature
-        let data = msg.signing_data();
+        // A General message signs its payload: the signature is over the
+        // payload's SHA-256, computed here over the one buffer.
         let key_id = msg.get_key_id(Some(&session.peer_nonce));
         let protocol = Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID);
         let counterparty = Counterparty::Other(session.server_identity_key.clone());
@@ -616,8 +609,8 @@ impl WorkerStorageClient {
         let sig_result = self
             .wallet
             .create_signature(CreateSignatureArgs {
-                data: Some(data),
-                hash_to_directly_sign: None,
+                data: None,
+                hash_to_directly_sign: Some(sha256(payload.signed())),
                 protocol_id: protocol,
                 key_id,
                 counterparty: Some(counterparty),
@@ -644,10 +637,22 @@ impl WorkerStorageClient {
         if let Some(ref sig) = msg.signature {
             http_headers.push((headers::SIGNATURE.to_string(), hex::encode(sig)));
         }
+        Ok(http_headers)
+    }
+
+    /// Sends ONE signed attempt of `payload` over the current session and
+    /// returns `(http_status, body_text)`. Every attempt is independently
+    /// safe: a fresh JSON-RPC id (set by the caller on a retry), a fresh
+    /// 256-bit random request ID, a fresh 256-bit random message nonce, and
+    /// a fresh BRC-42-derived signature — nothing per-request is ever
+    /// reused, whether the session was resumed or freshly handshaken. The
+    /// body sent is the payload's tail, as written.
+    async fn send_rpc_once(&mut self, payload: &mut RpcPayload) -> Result<(u16, String)> {
+        let http_headers = self.sign_attempt(payload)?;
 
         // Send the request
         let url = format!("{}/", self.endpoint_url);
-        let mut response = Self::fetch_post(&url, &http_headers, &rpc_body_str).await?;
+        let mut response = Self::fetch_post(&url, &http_headers, payload.body()?).await?;
 
         // NOTE: Do NOT update peer_nonce from the response's x-bsv-auth-nonce header.
         // In the TS SDK, peerSession.peerNonce is set once during handshake and never
@@ -662,7 +667,7 @@ impl WorkerStorageClient {
             AuthCloudflareError::TransportError(format!("Failed to read RPC response: {}", e))
         })?;
 
-        Ok((status, id, response_text))
+        Ok((status, response_text))
     }
 
     // ========================================================================
@@ -690,6 +695,46 @@ impl WorkerStorageClient {
     /// server to record the transaction and credit the outputs to the wallet.
     pub async fn internalize_action(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("internalizeAction", vec![auth, args]).await
+    }
+
+    /// Calls `internalizeAction` with `args` and the transaction `tx` beside
+    /// them, written once: the request is serialized straight into the buffer
+    /// that is signed and sent, `tx` as the array of its byte values (the
+    /// form the wallet storage server reads), and `tx` is released before the
+    /// request is sent.
+    ///
+    /// The request is byte for byte the one [`internalize_action`]
+    /// sends with `args` carrying `"tx": tx` (its byte values): with
+    /// serde_json's sorted maps `tx` takes its sorted place among the keys;
+    /// with `preserve_order` it is the first key, as `json!({"tx": .., ..})`
+    /// writes it. `args` must be an object without a `tx` key.
+    ///
+    /// [`internalize_action`]: Self::internalize_action
+    pub async fn internalize_action_with_tx(
+        &mut self,
+        auth: Value,
+        args: Value,
+        tx: Vec<u8>,
+    ) -> Result<Value> {
+        self.ensure_session().await?;
+        let payload = self.prepare_internalize(auth, args, tx)?;
+        self.rpc_call_payload(payload).await
+    }
+
+    /// The `internalizeAction` request of [`internalize_action_with_tx`],
+    /// written under the next request id; `auth`, `args` and `tx` are
+    /// released once it is written.
+    ///
+    /// [`internalize_action_with_tx`]: Self::internalize_action_with_tx
+    pub(crate) fn prepare_internalize(
+        &mut self,
+        auth: Value,
+        args: Value,
+        tx: Vec<u8>,
+    ) -> Result<RpcPayload> {
+        let payload = internalize_payload(self.take_id(), &auth, &args, &tx)?;
+        drop((auth, args, tx));
+        Ok(payload)
     }
 
     /// Calls `listOutputs` to get wallet outputs.
