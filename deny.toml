@@ -1,40 +1,99 @@
-[graph]
-all-features = true
+# Paved-road seed. Adopt byte for byte in the repository's migration lane.
+# cargo-deny 0.20.2; all four checks run, including development dependencies.
 
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
-db-path = "$CARGO_HOME/advisory-dbs"
-db-urls = ["https://github.com/rustsec/advisory-db"]
+# db-urls: RustSec is the shared advisory authority; no private database.
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# yanked: withdrawn releases cannot enter the paved road.
 yanked = "deny"
+# unmaintained: fail on direct and transitive abandoned dependencies.
+unmaintained = "all"
+# unsound: fail across the graph, including dependencies below bsv-rs.
+unsound = "all"
+# ignore: two entries, each with its reason, its condition and its exit (the rulings of
+# 2026-11-17, docs/RULINGS-2026-10-12.md). RUSTSEC-2026-0459 is the C SQLite that
+# libsqlite3-sys bundles below 0.39.0 (SQLite before 3.54.0). No published sqlx-sqlite
+# accepts libsqlite3-sys 0.39 (0.8.6 asks ^0.30.1; 0.9.0 asks >=0.30.1, <0.38.0); the
+# fix is on sqlx's main and its 0.9.1 is not on the index. The advisory's condition is a
+# database file, with its -wal, written by a less trusted party; the entry holds only
+# while no stack code opens a database file it did not create (no restore or import of
+# one). It covers the sqlx-sqlite path alone: a repository that reaches libsqlite3-sys
+# through rusqlite moves rusqlite to 0.41 or later. It leaves the day the lines' locks
+# carry libsqlite3-sys 0.39.0 or later, and is re-read at the 0.9.0 cut if it has not left.
+# RUSTSEC-2026-0543 is the notice that chrono is unmaintained (its maintainer's own word,
+# chronotope/chrono issue 1768; in the RustSec database since 2026-11-17). It names no
+# vulnerability and no patched version. chrono reaches the locks through the stack's own
+# calendar code, through sqlx's chrono feature, and through rmcp with schemars. The entry
+# covers the notice alone: a vulnerability filed against chrono carries its own id and
+# fails this check by itself, and the entry is re-read at once if one is filed or the
+# notice is withdrawn. It leaves the day the lines' locks no longer carry chrono: each
+# repository's own code and its sqlx feature are its captain's row (the target is `time`),
+# rmcp's dependency is upstream's. It is re-read at the 0.9.0 cut if it has not left.
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys below 0.39.0 bundles SQLite before 3.54.0; no published sqlx-sqlite accepts 0.39 (the fix is on sqlx's main, its 0.9.1 unpublished); the stack opens only database files it created; the entry leaves when the lines' locks carry libsqlite3-sys 0.39.0 or later" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained by its maintainer's own notice (chronotope/chrono issue 1768); the advisory names no vulnerability and no patched version; a vulnerability filed against chrono carries its own id and is not covered; the entry leaves when the lines' locks no longer carry chrono" },
+]
 
-[licenses]
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-DFS-2016", "Unicode-3.0", "Zlib"]
-confidence-threshold = 0.8
-
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
 [bans]
+# multiple-versions: warn while ecosystem major versions coexist; no skips.
 multiple-versions = "warn"
+# wildcards: require an explicit version requirement.
 wildcards = "deny"
-highlight = "all"
-# Wrappers are immediate parents, not an exemption for bsv-rs's whole subtree.
-# Re-read and re-stamp this list when the line's bsv-rs pin moves.
+# deny/name/wrappers: bsv-rs and immediate parents inside its dependency graph.
+# No repository outside bsv-rs is ever a wrapper, save by the owner's ruling recorded by pointer
+# (the pool's prover, its tracker #106 (a), relayed 2026-10-19). Wrappers are immediate parents,
+# not an exemption for bsv-rs's whole subtree. Re-read and re-stamp this list
+# when the line's bsv-rs pin moves.
+# reason: diagnostic text makes the migration obligation visible.
 deny = [
-    # bsv-rs 0.8.0: bsv-rs, k256, p256.
-    { name = "sha2", wrappers = ["bsv-rs", "k256", "p256"], reason = "Use bsv-rs hashing" },
-    # bsv-rs 0.8.0: bsv-rs.
+    # bsv-rs 0.5.0 (8c44ad9): bsv-rs, k256 0.13.4 and p256 0.13.2.
+    { name = "sha2", wrappers = ["bsv-rs", "k256", "p256", "sqlx-core", "sqlx-macros-core", "sqlx-mysql", "wv-prover", "p3-sha256"], reason = "Use bsv-rs hashing; wv-prover and p3-sha256 are the pool's prover and its hash gadget, a compression function bsv-rs lacks (the owner's ruling at the pool's tracker #106 (a), relayed 2026-10-19); the sqlx family hashes migration files (sqlx-core, sqlx-macros-core under the forced migrate feature) and the MySQL auth handshake (sqlx-mysql), no chain primitive (the owner's word of 2026-10-15: sqlx-core as a sha2 wrapper; its sqlx siblings are the same hashing read from cargo tree -i sha2 --depth 1 in the toolbox)" },
+    # bsv-rs 0.5.0 (8c44ad9): bsv-rs alone.
     { name = "ripemd", wrappers = ["bsv-rs"], reason = "Use bsv-rs hashing" },
-    # bsv-rs 0.8.0: secp256k1 absent; retain bsv-rs alone.
+    # bsv-rs 0.5.0 (8c44ad9): secp256k1 absent; retain bsv-rs alone.
     { name = "secp256k1", wrappers = ["bsv-rs"], reason = "Use bsv-rs keys and signatures" },
-    # bsv-rs 0.8.0: bsv-rs.
+    # bsv-rs 0.5.0 (8c44ad9): bsv-rs alone.
     { name = "k256", wrappers = ["bsv-rs"], reason = "Use bsv-rs keys and signatures" },
-    # bsv-rs 0.8.0: bsv-rs.
+    # bsv-rs 0.5.0 (8c44ad9): bsv-rs alone.
     { name = "bs58", wrappers = ["bsv-rs"], reason = "Use bsv-rs base58check" },
-    # bsv-rs 0.8.0: bsv-rs, pbkdf2, rfc6979.
+    # bsv-rs 0.5.0 (8c44ad9): bsv-rs, pbkdf2 0.12.2 and rfc6979 0.4.0.
     { name = "hmac", wrappers = ["bsv-rs", "pbkdf2", "rfc6979"], reason = "Use bsv-rs HMAC" },
-    # bsv-rs 0.8.0: bsv-rs.
+    # bsv-rs 0.5.0 (8c44ad9): bsv-rs alone; direct consumer use is hand-rolling.
     { name = "p256", wrappers = ["bsv-rs"], reason = "Use bsv-rs keys and signatures" },
 ]
 
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+[licenses]
+# allow: each entry is an SPDX license identifier, not an inferred license.
+allow = [
+    "MIT", # Stack and permissive dependencies.
+    "Apache-2.0", # Stack and patent-grant dependencies.
+    "BSD-2-Clause", # Two-clause permissive dependencies.
+    "BSD-3-Clause", # Three-clause permissive dependencies.
+    "ISC", # Short permissive dependencies.
+    "Unicode-3.0", # Current Unicode data dependencies.
+    "Unicode-DFS-2016", # Earlier Unicode data dependencies.
+    "Zlib", # Compression dependencies.
+]
+# confidence-threshold: require a close license-text match.
+confidence-threshold = 0.9
+# MPL-2.0 is absent until a dependency demonstrates the need and is reviewed.
+
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
 [sources]
+# unknown-registry/unknown-git: reject sources outside explicit lists.
 unknown-registry = "deny"
 unknown-git = "deny"
+# allow-registry: the canonical crates.io index, also used for sparse crates.io.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# allow-git: one git source, approved by the owner's ruling of 2026-10-18 (recorded in
+# the consuming program's own tracker, relayed by him): Plonky3, which no crates.io
+# release carries yet for that program's prover; the consumer pins the full commit by rev
+# (required-git-spec below) in its own manifest, and moves to the p3-* crates on
+# crates.io as its own later issue. Any further twin needs an exact URL, approved and
+# re-stamped as a line change here, before consumers copy that new seed.
+allow-git = ["https://github.com/Plonky3/Plonky3"]
+# required-git-spec: any future allowed twin must pin a full commit via rev.
+required-git-spec = "rev"
