@@ -353,12 +353,18 @@ fn a_store_that_reads_its_outcome_after_an_await_is_caught_with_no_winner() {
 }
 
 #[test]
-fn a_store_whose_first_claim_is_one_step_is_caught_by_a_random_schedule_alone() {
+fn a_store_whose_first_claim_is_one_step_is_caught_on_a_fresh_prefix_by_a_random_schedule_alone() {
     // Lockstep, reversed and every claim ahead poll the first claim on the
-    // first pass, so it writes before any later claim reads: they pass it.
+    // first pass, so it writes before any later claim reads: the laws of a
+    // fresh prefix pass it under them.
     let store = Store::new(Shape::FirstClaimInOneStep);
-    let report = run(&store, Some(0)).unwrap();
-    assert!(report.skipped.contains(&conformance::LAW_PREFIX_LEGACY));
+    let v = run(&store, Some(0)).unwrap_err();
+    // (Its re-take of a released prefix is a later claim, read; yield;
+    // write, so the re-take law catches it under those orders.)
+    assert_eq!(
+        (v.law, v.n, v.schedule),
+        (conformance::LAW_PREFIX_RETAKE, 2, Some(Schedule::Reversed))
+    );
     // A random schedule can hold the first claim back while two later ones
     // overlap.
     let v = caught(Shape::FirstClaimInOneStep);
@@ -423,7 +429,7 @@ fn stores_with_one_indivisible_claim_keep_every_law_under_every_schedule() {
     for shape in [Shape::LockAcrossTheClaim, Shape::OneStepManyAwaits] {
         let report = run(&Store::new(shape), None).unwrap_or_else(|v| panic!("{shape:?}: {v}"));
         let n = conformance::SIZES.len();
-        assert_eq!(report.checked.len(), n + n + 1 + n, "{shape:?}");
+        assert_eq!(report.checked.len(), 3 * n + 1 + n, "{shape:?}");
     }
 }
 
@@ -546,5 +552,5 @@ async fn a_store_whose_waiters_park_finishes_every_schedule_inside_a_runtime() {
         .await
         .unwrap();
     let n = conformance::SIZES.len();
-    assert_eq!(report.checked.len(), n + n + 1 + n);
+    assert_eq!(report.checked.len(), 3 * n + 1 + n);
 }

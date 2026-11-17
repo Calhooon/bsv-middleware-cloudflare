@@ -723,7 +723,7 @@ mod conformance_on_sqlite {
         .unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
         let sizes = conformance::SIZES.len();
-        assert_eq!(report.checked.len(), 3 * sizes + 2);
+        assert_eq!(report.checked.len(), 4 * sizes + 2);
     }
 
     #[test]
@@ -735,6 +735,8 @@ mod conformance_on_sqlite {
             conformance::block_on(conformance::claim_store(&store, "d1").fault(&fail).run())
                 .unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
+        let sizes = conformance::SIZES.len();
+        assert_eq!(report.checked.len(), 3 * sizes + 1);
     }
 
     #[test]

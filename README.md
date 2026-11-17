@@ -342,9 +342,13 @@ ALTER TABLE payment_claims ADD COLUMN released INTEGER NOT NULL DEFAULT 0;
 
 New tables use `PAYMENT_CLAIMS_SCHEMA`. Never expire payment-prefix rows.
 `KvPrefixStore(&session_storage)` keeps the legacy key namespace and legacy `1`
-records closed, but G3 remains: read/write races at one edge and propagation
-across edges (about 60 seconds) can admit competing transactions. A DO auth
-backend does not make this KV payment backend exact; select D1 separately.
+records closed. A payment-prefix claim must be one indivisible step against the
+backend: a compare-and-set, an upsert under a unique key read back in the same
+transaction, or a single-threaded actor. KV has no compare-and-swap: a
+`KvPrefixStore` claim is a read of the prefix's key, then a write of the txid,
+and a write at one edge reaches the others after about 60 seconds.
+`D1PrefixStore` (feature `d1-claims`) is the store whose claim is one statement.
+A DO auth backend does not change the payment backend; select D1 separately.
 
 ```toml
 bsv-middleware-cloudflare = { version = "0.7.5", features = ["d1-claims"] }

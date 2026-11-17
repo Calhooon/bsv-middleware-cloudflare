@@ -2,7 +2,8 @@
 // Miniflare runs the test Worker (src/lib.rs) with two local D1 bindings:
 // CLAIMS (the claims table) and BROKEN (no table: every statement faults).
 //   1. /kit: every law of D1PrefixStore and D1ClaimStore, in the isolate
-//      (every N from 2 to 33, under every schedule of the kit).
+//      (every N from 2 to 33, under every schedule of the kit), the
+//      re-takes after a release among them.
 //   2. /kit-wrong: a store that reads, awaits, then writes on the same D1
 //      breaks both concurrent prefix laws at every N from 2 to 33.
 //   3. N = 2, 8, 32 simultaneous requests: one prefix and one txid (one Won,
@@ -50,10 +51,13 @@ try {
   const kit = await call('GET', `/kit?ns=${ns}`)
   assert.equal(kit.prefix.pass, true, JSON.stringify(kit.prefix))
   assert.deepEqual(kit.prefix.skipped, [])
-  assert.equal(kit.prefix.checked.length, 3 * KIT_SIZES.length + 2)
+  assert.equal(kit.prefix.checked.length, 4 * KIT_SIZES.length + 2)
   assert.equal(kit.claim.pass, true, JSON.stringify(kit.claim))
   assert.deepEqual(kit.claim.skipped, [])
-  assert.equal(kit.claim.checked.length, 2 * KIT_SIZES.length + 1)
+  assert.equal(kit.claim.checked.length, 3 * KIT_SIZES.length + 1)
+  for (const [side, law] of [['prefix', 'prefix: N re-takes after a release'], ['claim', 'claim: N re-takes after a release']]) {
+    assert.equal(kit[side].checked.filter(([l]) => l === law).length, KIT_SIZES.length, law)
+  }
   lines.push(`kit: D1PrefixStore ${kit.prefix.checked.length} laws pass, D1ClaimStore ${kit.claim.checked.length} laws pass`)
 
   // 2. The read-await-write store on the same D1.
