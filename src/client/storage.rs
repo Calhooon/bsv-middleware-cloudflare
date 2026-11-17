@@ -693,6 +693,8 @@ impl WorkerStorageClient {
     ///
     /// This is the key method for payment processing — it tells the storage
     /// server to record the transaction and credit the outputs to the wallet.
+    ///
+    /// [`internalize_action_with_tx`](Self::internalize_action_with_tx) writes the same request once, taking `tx` as bytes beside `args`.
     pub async fn internalize_action(&mut self, auth: Value, args: Value) -> Result<Value> {
         self.rpc_call("internalizeAction", vec![auth, args]).await
     }

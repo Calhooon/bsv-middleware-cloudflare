@@ -8,11 +8,10 @@
 //! wallet step, what `internalize_payment` runs up to `worker::Fetch`:
 //! `WorkerStorageClient::prepare_internalize`, `sign_attempt` and the body
 //! handed to the fetch. The bound is a fixed floor plus a multiple of the
-//! header's size. The same measurement over the same request written
-//! through a `serde_json::Value` (`internalize_args`: one value per
-//! transaction byte, in `JsonRpcRequest`, serialized, copied into a `String`
-//! and into the signed payload, the payload copied for the signature)
-//! exceeds the bound: the test shows the bound tells the two apart.
+//! header's size: 1.25 MiB plus 4 bytes per header byte, on headers of
+//! 1 KiB to 128 KiB and on the 22 vectors. A control wallet step that holds
+//! the request as a `serde_json::Value` must exceed the bound at 8 KiB and
+//! above, so the measurement is known to register the request's size.
 
 use super::*;
 use crate::client::wire::RpcPayload;
@@ -251,10 +250,9 @@ fn wallet_step(
     }
 }
 
-/// The same request through a `serde_json::Value`: `internalize_args`
-/// into the params of `JsonRpcRequest`, serialized, copied into a `String`
-/// and the signed payload, the payload copied for the signature, all live
-/// at the fetch.
+/// The control: the same request held as a `serde_json::Value`
+/// (`internalize_args` in `JsonRpcRequest`), serialized and signed, all
+/// live at the fetch.
 fn wallet_step_through_a_value(
     prefix: String,
     suffix: String,
@@ -324,20 +322,18 @@ where
 fn the_paid_path_to_the_wallet_call_is_a_floor_plus_a_multiple_of_the_header() {
     let prefix = issued_prefix();
     // The slope between each header and the smallest: heap per header byte.
-    let mut first: Option<(usize, usize, usize)> = None;
-    let (mut worst, mut worst_value) = (0f64, f64::MAX);
+    let mut first: Option<(usize, usize)> = None;
+    let mut worst = 0f64;
     for header in sized_headers(&prefix) {
         let len = header.len();
         assert!((1020..=131_072).contains(&len), "{len}");
         let replica = paid_peak(header.clone(), wallet_step_through_a_value);
         let peak = paid_peak(header, wallet_step(None));
-        let (len0, peak0, replica0) = *first.get_or_insert((len, peak, replica));
+        let (len0, peak0) = *first.get_or_insert((len, peak));
         if len > len0 {
-            let slope = |a: usize, b: usize| (a as f64 - b as f64) / (len - len0) as f64;
-            worst = worst.max(slope(peak, peak0));
-            worst_value = worst_value.min(slope(replica, replica0));
+            worst = worst.max((peak as f64 - peak0 as f64) / (len - len0) as f64);
         }
-        eprintln!("header {len:>6} B: peak {peak:>8} B; through a Value {replica:>9} B");
+        eprintln!("header {len:>6} B: peak {peak:>8} B");
         assert!(
             peak <= bound(len),
             "header {len} B: peak {peak} B over {FLOOR} + {PER_HEADER_BYTE} x {len}"
@@ -345,13 +341,11 @@ fn the_paid_path_to_the_wallet_call_is_a_floor_plus_a_multiple_of_the_header() {
         if len >= 8 << 10 {
             assert!(
                 replica > bound(len),
-                "the bound must refuse the request through a Value at {len} B: {replica} B"
+                "header {len} B: the control must exceed the bound"
             );
         }
     }
-    eprintln!(
-        "per header byte above the smallest header: at most {worst:.2} B; through a Value at least {worst_value:.2} B"
-    );
+    eprintln!("per header byte above the smallest header: at most {worst:.2} B");
 }
 
 // ── the request, byte for byte ──────────────────────────────────────────
