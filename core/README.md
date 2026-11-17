@@ -138,16 +138,20 @@ single-threaded actor that owns the key. No other claim of the key may come betw
 decides a claim and the write that records it. With the feature `conformance`,
 `store::conformance` is the kit that runs an implementation against its trait's laws: N claims of
 one key, and N re-takes of a key claimed once and released, started together at every N from 2 to
-33 by default (one winner), each N driven under every schedule
-of `conformance::schedules` (reversed, lockstep, each claim held ahead in turn, and seeded random
-orders whose seed a violation names); the sequential laws; a legacy record; and a fault that is
-`Err`. It catches a store whose claim can be interrupted between its read and its write when one
-of those poll orders, at one of those N, puts another claim in that window; it does not order a
-backend's own I/O, and it runs on one thread. By default a claim is held back for at most 64
-passes (`HELD_PASSES`); a host raises the bounds with `.sizes(..)`, `.held_passes(..)` and
-`.random(..)`. An `Err` under contention is a violation. The kit can show that a store races; it
-cannot show that a store never does. A host enables it in its development dependencies and runs it in its own
-tests:
+33 by default (one winner); a release started together with N claims of its key (at most one
+winner, and the record left as the winner count says); N releases started together, then N claims
+(one winner); each N driven under every schedule of `conformance::schedules` (reversed, lockstep,
+each claim held ahead in turn, and seeded random orders whose seed a violation names); the
+sequential laws; a legacy record; and a fault that is `Err`. The kit's docs list every pair of a
+trait's operations and the law that runs that pair together. It catches a store whose claim or
+release can be interrupted between its read and its write when one of those poll orders, at one
+of those N, puts another claim or release in that window; it does not order a backend's own I/O,
+and it runs on one thread. By default a claim is held back for at most 64 passes
+(`HELD_PASSES`); a host raises the bounds with `.sizes(..)`, `.held_passes(..)` and
+`.random(..)`. An `Err` under contention is a violation, so a raised bound can also fail a store
+that never lets two claims win but answers `Err` after waiting. The kit can show that a store
+races; it cannot show that a store never does. A host enables it in its development dependencies
+and runs it in its own tests:
 
 ```rust,ignore
 // [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }

@@ -53,7 +53,8 @@ core/src/                — bsv-middleware-core (no runtime dependency)
 │                         what a backend must offer (compare-and-set, unique key, single-threaded actor)
 ├── store/conformance.rs: feature `conformance`: the kit a host runs against its own stores (N = 2..=33 claims
 │                         driven under every `schedules` order: reversed, lockstep, each ahead, seeded random;
-│                         the sequential laws, legacy, fail closed)
+│                         the re-takes, a release racing claims, releases then claims; the sequential
+│                         laws, legacy, fail closed; its docs table every pair of a trait's operations)
 ├── brc104.rs           — auth_headers, HttpRequestData/HttpResponseData, payloads, varint, signable filters
 ├── auth.rs             — SessionBinding, sign/verify, identity binding, handshake replies, response signing
 ├── session_lane.rs     — the lane's rules (moved whole)

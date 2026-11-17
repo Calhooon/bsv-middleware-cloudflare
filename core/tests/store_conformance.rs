@@ -160,16 +160,17 @@ fn memory_store_keeps_every_law_of_the_three_traits() {
         conformance::block_on(conformance::prefix_store(&store, "mem").fault(&fail).run()).unwrap();
     let sizes = conformance::SIZES.len();
     assert_eq!(sizes, 32);
-    // One fresh transaction, N transactions, re-takes; sequential; faults.
-    assert_eq!(report.checked.len(), 3 * sizes + 1 + sizes);
+    // One fresh transaction, N transactions, re-takes; sequential; faults;
+    // a release racing re-takes; releases, then re-takes.
+    assert_eq!(report.checked.len(), 3 * sizes + 1 + sizes + 2 * sizes);
     assert_eq!(report.skipped, vec![conformance::LAW_PREFIX_LEGACY]);
     let report =
         conformance::block_on(conformance::claim_store(&store, "mem").fault(&fail).run()).unwrap();
-    assert_eq!(report.checked.len(), 2 * sizes + 1 + sizes);
+    assert_eq!(report.checked.len(), 2 * sizes + 1 + sizes + 2 * sizes);
     assert!(report.skipped.is_empty());
     let report =
         conformance::block_on(conformance::nonce_store(&store, "mem").fault(&fail).run()).unwrap();
-    assert_eq!(report.checked.len(), 2 * sizes + 1 + sizes);
+    assert_eq!(report.checked.len(), 2 * sizes + 1 + sizes + 2 * sizes);
 }
 
 #[tokio::test]

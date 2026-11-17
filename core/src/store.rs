@@ -18,10 +18,13 @@
 //!
 //! With the feature `conformance`, [`conformance`] is the kit that runs an
 //! implementation against its trait's laws: N simultaneous claims of one key,
-//! and N simultaneous re-takes of a released key, under several poll
-//! schedules at every N from 2 to 33 (by default; a host can raise the sizes
-//! and the hold), the sequential laws, and fail-closed faults. It can show
-//! that a store races; it cannot show that a store never does.
+//! N simultaneous re-takes of a released key, a release started together
+//! with N claims of its key, and N simultaneous releases followed by N
+//! simultaneous claims, under several poll schedules at every N from 2 to 33
+//! (by default; a host can raise the sizes and the hold), the sequential
+//! laws, and fail-closed faults. Its docs list every pair of a trait's
+//! operations and the law that runs it. It can show that a store races; it
+//! cannot show that a store never does.
 
 use std::fmt;
 use std::future::Future;
@@ -132,12 +135,13 @@ pub enum PrefixClaim {
 ///
 /// With the feature `conformance`, `conformance::prefix_store` runs the
 /// trait's laws against an implementation: N claims of one prefix by one
-/// transaction and by N transactions, and N re-takes of a released prefix
-/// by its own transaction, started together and driven under each schedule
-/// of `conformance::schedules` (reversed, lockstep, each claim held ahead in
-/// turn, seeded random orders) at every N from 2 to 33 by default; the
-/// sequential laws below; a legacy record; a fault that is `Err`. In a
-/// host's tests:
+/// transaction and by N transactions, N re-takes of a released prefix by
+/// its own transaction, a release started together with N claims of its
+/// prefix, and N releases started together followed by N re-takes, each
+/// driven under each schedule of `conformance::schedules` (reversed,
+/// lockstep, each claim held ahead in turn, seeded random orders) at every
+/// N from 2 to 33 by default; the sequential laws below; a legacy record; a
+/// fault that is `Err`. In a host's tests:
 ///
 /// ```ignore
 /// // [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }

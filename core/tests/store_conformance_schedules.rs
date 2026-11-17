@@ -429,7 +429,7 @@ fn stores_with_one_indivisible_claim_keep_every_law_under_every_schedule() {
     for shape in [Shape::LockAcrossTheClaim, Shape::OneStepManyAwaits] {
         let report = run(&Store::new(shape), None).unwrap_or_else(|v| panic!("{shape:?}: {v}"));
         let n = conformance::SIZES.len();
-        assert_eq!(report.checked.len(), 3 * n + 1 + n, "{shape:?}");
+        assert_eq!(report.checked.len(), 3 * n + 1 + n + 2 * n, "{shape:?}");
     }
 }
 
@@ -552,5 +552,5 @@ async fn a_store_whose_waiters_park_finishes_every_schedule_inside_a_runtime() {
         .await
         .unwrap();
     let n = conformance::SIZES.len();
-    assert_eq!(report.checked.len(), 3 * n + 1 + n);
+    assert_eq!(report.checked.len(), 3 * n + 1 + n + 2 * n);
 }

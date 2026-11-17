@@ -4,9 +4,10 @@
 //! [`PaymentNonceStore`] over its own backend runs this kit against its
 //! implementation, in its own tests, to check the store against the trait's
 //! laws: one winner among simultaneous claims of a fresh key, one winner
-//! among simultaneous re-takes of a released key, the sequential laws, and
-//! a fault that is an `Err`, never a claim. A pass is not a proof that the
-//! store is atomic (see below).
+//! among simultaneous re-takes of a released key, at most one winner among
+//! claims started together with a release, one winner after simultaneous
+//! releases, the sequential laws, and a fault that is an `Err`, never a
+//! claim. A pass is not a proof that the store is atomic (see below).
 //!
 //! ```
 //! # use bsv_middleware_core::store::{conformance, MemoryStore};
@@ -20,19 +21,27 @@
 //!
 //! # How the claims are started together
 //!
-//! Every concurrent law builds its N claim futures first and then drives
-//! them on the current task under each [`Schedule`] in turn, at every N in
+//! Every concurrent law builds its futures first and then drives them on
+//! the current task under each [`Schedule`] in turn, at every N in
 //! [`SIZES`] (2 to 33). The concurrent laws are N claims of a fresh key and,
 //! for every trait (each has a release), N re-takes of a key that was
 //! claimed once and released: exactly one wins, and every other gets the
-//! trait's answer for a loser.
+//! trait's answer for a loser. Two more laws start a release together with
+//! other operations of its key: a release of a claimed key started together
+//! with N claims of it (at most one wins, and afterwards the key is held if
+//! one did and free if none did), and N releases of a claimed key started
+//! together, then N claims of it started together (exactly one wins). The
+//! table below lists, for each trait, every pair of its operations and the
+//! law that runs that pair together.
 //!
 //! - [`Schedule::Lockstep`]: each pass polls every unfinished claim once,
 //!   in the order the claims were made;
 //! - [`Schedule::Reversed`]: the same, in the reverse order;
 //! - [`Schedule::Ahead`]`(i)`, for every `i` below N: claim `i` is polled
 //!   first, then held back while the others are polled every pass, until
-//!   they have finished or [`HELD_PASSES`] passes have gone by;
+//!   they have finished or [`HELD_PASSES`] passes have gone by (in a law
+//!   that starts a release with the claims, `i` runs over every future it
+//!   starts, the release first, so `Ahead(0)` holds the release back);
 //! - [`Schedule::Random`]`(seed)`, [`RANDOM_SCHEDULES`] seeds by default:
 //!   each of the first [`HELD_PASSES`] passes polls a seeded random subset
 //!   of the unfinished claims, and every later pass all of them, in a
@@ -43,7 +52,7 @@
 //! after [`HELD_PASSES`] passes every unfinished claim is polled on every
 //! pass and waits on its own waker.
 //!
-//! Each claim of a schedule runs on a fresh key, and the law counts the
+//! Each schedule of a law runs on a fresh key, and the law counts the
 //! winners and names the law, N and the schedule.
 //!
 //! An `Err` from the store in a concurrent law is a violation ("the store
@@ -62,26 +71,83 @@
 //! claim is held back for more than 64 passes while the others run, is
 //! not caught at the defaults. A host raises each bound on its kit:
 //! `.sizes(&[..])` for the numbers of claims, `.held_passes(k)` for the
-//! hold, `.random(count, seed)` for the random orders; for one law,
-//! [`drive_held`] drives futures under a schedule with a hold of its own.
-//! A larger bound makes a run longer, never stricter about a store that is
-//! atomic.
+//! hold, `.random(count, seed)` for the random orders. The per-law
+//! functions (`*_under` included) use [`HELD_PASSES`]; [`drive_held`]
+//! drives a host's own futures under a schedule with a hold of its own. A
+//! larger bound makes a run longer. It can also fail a store that never
+//! lets two claims win but answers `Err` after waiting (an `Err` under
+//! contention is a violation), and under [`block_on`] it can exhaust
+//! [`BLOCK_ON_POLLS`].
 //!
-//! What this catches: a store whose claim can be interrupted between the
-//! read that decides and the write that records (an await that is not
-//! ready there), when some claim enters that window while another is inside
-//! it under one of these poll orders at one of these N, and whose futures
+//! # The pairs of operations, and the law that runs each
+//!
+//! Each trait has two operations, a claim and a release (for
+//! [`PaymentPrefixStore`], by the bound transaction or by another). For
+//! every pair of them, an operation with itself included, the kit either
+//! has a law that starts the pair together under every schedule at every N,
+//! with the outcome the trait's contract states, or the contract promises
+//! nothing for the pair, for the reason given.
+//!
+//! [`PaymentPrefixStore`] (`claim_prefix`, `release_prefix`):
+//!
+//! | Pair | Law |
+//! |---|---|
+//! | claim with claim, fresh prefix, one transaction | [`LAW_PREFIX_ONE_TRANSACTION`] |
+//! | claim with claim, fresh prefix, N transactions | [`LAW_PREFIX_MANY_TRANSACTIONS`] |
+//! | claim with claim, released prefix, the bound transaction | [`LAW_PREFIX_RETAKE`] |
+//! | claim with claim, the bound transaction and another | [`LAW_PREFIX_RELEASE_RACE`] |
+//! | claim (re-take or another transaction's) with release | [`LAW_PREFIX_RELEASE_RACE`] |
+//! | release with release, the bound transaction's | [`LAW_PREFIX_RELEASES`] |
+//! | release with release, the bound transaction's and another's | [`LAW_PREFIX_RELEASE_RACE`] |
+//! | release with claims of a prefix no transaction holds yet | no promise: the contract defines a release only of "this txid's attempt", and before the first claim there is none, so a release that comes first frees nothing and one that comes after frees the winner's attempt |
+//!
+//! [`ClaimStore`] (`claim`, `release`):
+//!
+//! | Pair | Law |
+//! |---|---|
+//! | claim with claim, fresh key | [`LAW_CLAIM_CONCURRENT`] |
+//! | claim with claim, released key | [`LAW_CLAIM_RETAKE`] |
+//! | claim with release | [`LAW_CLAIM_RELEASE_RACE`] |
+//! | release with release | [`LAW_CLAIM_RELEASES`] |
+//! | release with claims of a key no claim holds yet | no promise: the contract orders a release after the claim it releases ("so the same key can be claimed again"), so a release that comes first frees nothing and one that comes after frees the winner, and two claims may then win |
+//!
+//! [`PaymentNonceStore`] (`try_consume`, `release`):
+//!
+//! | Pair | Law |
+//! |---|---|
+//! | consumption with consumption, fresh nonce | [`LAW_NONCE_CONCURRENT`] |
+//! | consumption with consumption, released nonce | [`LAW_NONCE_RETAKE`] |
+//! | consumption with release | [`LAW_NONCE_RELEASE_RACE`] |
+//! | release with release | [`LAW_NONCE_RELEASES`] |
+//! | release with consumptions of a nonce not yet consumed | no promise, as for [`ClaimStore`]: a release frees "a consumed value" |
+//! | an operation with the expiry of `ttl_seconds` | no promise: the expiry is the backend's, on its clock, and no caller starts it; the concurrent laws pass `None` (retained indefinitely) |
+//!
+//! Operations on different keys (another prefix, key, nonce or scope) share
+//! no record, and the contracts promise them nothing together.
+//!
+//! The release laws read a release that answers `Ok`, with no fault
+//! switched on, as one that has taken effect: "so the same key can be
+//! claimed again" (and the sequential laws read it so too). "Best-effort"
+//! is read as a release that may fail; the fault laws of [`ClaimStore`] and
+//! [`PaymentNonceStore`] do not judge a release.
+//!
+//! # What the kit catches
+//!
+//! A store whose claim, or release, can be interrupted between the read
+//! that decides and the write that records (an await that is not ready
+//! there) is caught when another claim or release of the key enters that
+//! window under one of these poll orders at one of these N, if its futures
 //! make progress each time they are polled (a map, a local SQL connection,
 //! a store that wakes itself). What it cannot catch: a race that needs a
 //! poll order or an N it does not run; a race decided by the backend's own
 //! clock rather than by the order of polls (inside a host's runtime the kit
 //! orders the polls, not the backend's I/O); a race between processes or
-//! isolates, since the kit runs on one thread. A store with one
-//! indivisible claim (a compare-and-set, a statement under a unique
-//! constraint read back in the same transaction, a single-threaded actor)
-//! has exactly one winner under every schedule, however many awaits
-//! surround that step. The kit can show that a store races; it cannot show
-//! that a store never does.
+//! isolates, since the kit runs on one thread. A store whose claim and
+//! release are each one indivisible step (a compare-and-set, a statement
+//! under a unique constraint read back in the same transaction, a
+//! single-threaded actor) has one winner under every schedule (at most one
+//! in a race with a release), however many awaits surround that step. The
+//! kit can show that a store races; it cannot show that a store never does.
 //!
 //! The kit has no runtime of its own and spawns nothing: it runs on one
 //! thread, on every target (wasm32 included), and accepts stores that are
@@ -170,6 +236,17 @@ pub const LAW_PREFIX_MANY_TRANSACTIONS: &str = "prefix: N transactions, one pref
 /// A prefix won and released by one transaction, then N re-takes by that
 /// transaction: one `Won`, every other `SameTransaction`.
 pub const LAW_PREFIX_RETAKE: &str = "prefix: N re-takes after a release";
+/// A prefix won by one transaction, then its release by that transaction
+/// started together with N claims (N - 1 re-takes by that transaction, one
+/// claim by another) and a release by the other transaction: the releases
+/// answer `Ok`, at most one re-take `Won`, every other `SameTransaction`,
+/// the other transaction `OtherTransaction`; afterwards the record is held
+/// if a re-take won and released if none did.
+pub const LAW_PREFIX_RELEASE_RACE: &str = "prefix: a release racing N claims";
+/// A prefix won by one transaction, then N releases by it started together,
+/// then N re-takes by it started together: one `Won`, every other
+/// `SameTransaction`.
+pub const LAW_PREFIX_RELEASES: &str = "prefix: N releases, then N re-takes";
 /// The trait's sequential laws: held refuses its own transaction; release
 /// lets only the bound transaction re-take; another transaction is refused
 /// forever.
@@ -182,6 +259,13 @@ pub const LAW_PREFIX_FAIL_CLOSED: &str = "prefix: fail closed";
 pub const LAW_CLAIM_CONCURRENT: &str = "claim: N claims, one key";
 /// A key claimed once and released, then N claims of it: one `true`.
 pub const LAW_CLAIM_RETAKE: &str = "claim: N re-takes after a release";
+/// A key claimed once, then its release started together with N claims of
+/// it: the release answers `Ok`, at most one `true`; afterwards the key is
+/// claimed if a claim won and free if none did.
+pub const LAW_CLAIM_RELEASE_RACE: &str = "claim: a release racing N claims";
+/// A key claimed once, then N releases of it started together, then N claims
+/// of it started together: one `true`.
+pub const LAW_CLAIM_RELEASES: &str = "claim: N releases, then N claims";
 /// A claimed key refuses; a released key can be claimed again.
 pub const LAW_CLAIM_SEQUENTIAL: &str = "claim: sequential laws";
 /// A store that reports a fault answers `Err`, never a claim.
@@ -190,6 +274,13 @@ pub const LAW_CLAIM_FAIL_CLOSED: &str = "claim: fail closed";
 pub const LAW_NONCE_CONCURRENT: &str = "nonce: N consumptions, one nonce";
 /// A nonce consumed once and released, then N consumptions of it: one `true`.
 pub const LAW_NONCE_RETAKE: &str = "nonce: N re-consumptions after a release";
+/// A nonce consumed once, then its release started together with N
+/// consumptions of it: the release answers `Ok`, at most one `true`;
+/// afterwards the nonce is consumed if a consumption won and free if none did.
+pub const LAW_NONCE_RELEASE_RACE: &str = "nonce: a release racing N consumptions";
+/// A nonce consumed once, then N releases of it started together, then N
+/// consumptions of it started together: one `true`.
+pub const LAW_NONCE_RELEASES: &str = "nonce: N releases, then N consumptions";
 /// A consumed nonce refuses; scopes are separate; a released nonce can be
 /// consumed again.
 pub const LAW_NONCE_SEQUENTIAL: &str = "nonce: sequential laws";
@@ -480,6 +571,118 @@ fn expect<T: PartialEq + fmt::Debug>(
     }
 }
 
+/// One answer of a race between claims and releases.
+enum Raced<T> {
+    Claim(Result<T, StoreError>),
+    Release(Result<(), StoreError>),
+}
+
+/// At most one winner (a race with a release may have none).
+fn at_most_one(law: &'static str, n: usize, count: &str, won: usize) -> Result<(), Violation> {
+    if won <= 1 {
+        Ok(())
+    } else {
+        Err(Violation {
+            law,
+            n,
+            schedule: None,
+            detail: format!("{count}: answered {won}, the law allows at most 1"),
+        })
+    }
+}
+
+/// The race law of [`ClaimStore`] and [`PaymentNonceStore`]: a key won
+/// once, then its release started together with `n` claims of it.
+#[allow(clippy::too_many_arguments)]
+async fn bool_release_race<'a, C, CF, R, RF>(
+    law: &'static str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+    what: &str,
+    count: &str,
+    claim: C,
+    release: R,
+) -> Result<(), Violation>
+where
+    C: Fn() -> CF,
+    CF: Future<Output = Result<bool, StoreError>> + 'a,
+    R: Fn() -> RF,
+    RF: Future<Output = Result<(), StoreError>> + 'a,
+{
+    let first = claim()
+        .await
+        .map_err(|e| fault(law, n, &format!("the first {what}"), &e))?;
+    expect(law, n, &format!("the first {what}"), first, true)?;
+    let mut ops: Vec<LocalFuture<'a, Raced<bool>>> = Vec::with_capacity(n + 1);
+    let released = release();
+    ops.push(Box::pin(async move { Raced::Release(released.await) }));
+    for _ in 0..n {
+        let claimed = claim();
+        ops.push(Box::pin(async move { Raced::Claim(claimed.await) }));
+    }
+    let mut won = 0;
+    for (i, answer) in drive_held(ops, schedule, held)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        match answer {
+            Raced::Release(Ok(())) => {}
+            Raced::Release(Err(e)) => return Err(fault(law, n, "the release", &e)),
+            Raced::Claim(Ok(true)) => won += 1,
+            Raced::Claim(Ok(false)) => {}
+            Raced::Claim(Err(e)) => return Err(fault(law, n, &format!("{what} {}", i - 1), &e)),
+        }
+    }
+    at_most_one(law, n, count, won)?;
+    let after = |step: String| move |e: StoreError| fault(law, n, &step, &e);
+    if won == 1 {
+        let step = format!("after the race (one won): a {what}");
+        let again = claim().await.map_err(after(step.clone()))?;
+        expect(law, n, &step, again, false)
+    } else {
+        let step = format!("after the race (none won): a {what}");
+        let again = claim().await.map_err(after(step.clone()))?;
+        expect(law, n, &step, again, true)?;
+        let step = format!("after the race (none won): a second {what}");
+        let again = claim().await.map_err(after(step.clone()))?;
+        expect(law, n, &step, again, false)
+    }
+}
+
+/// The releases law of [`ClaimStore`] and [`PaymentNonceStore`]: a key won
+/// once, then `n` releases of it started together, then `n` claims of it
+/// started together.
+#[allow(clippy::too_many_arguments)]
+async fn bool_releases<'a, C, CF, R, RF>(
+    law: &'static str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+    what: &str,
+    count: &str,
+    claim: C,
+    release: R,
+) -> Result<(), Violation>
+where
+    C: Fn() -> CF,
+    CF: Future<Output = Result<bool, StoreError>> + 'a,
+    R: Fn() -> RF,
+    RF: Future<Output = Result<(), StoreError>> + 'a,
+{
+    let first = claim()
+        .await
+        .map_err(|e| fault(law, n, &format!("the first {what}"), &e))?;
+    expect(law, n, &format!("the first {what}"), first, true)?;
+    let releases = drive_held((0..n).map(|_| release()).collect(), schedule, held).await;
+    for (i, answer) in releases.into_iter().enumerate() {
+        answer.map_err(|e| fault(law, n, &format!("release {i}"), &e))?;
+    }
+    let answers = drive_held((0..n).map(|_| claim()).collect(), schedule, held).await;
+    one_true(law, n, what, count, answers)
+}
+
 // ── PaymentPrefixStore ──────────────────────────────────────────────────
 
 const AGENT: &str = "conformance";
@@ -707,6 +910,204 @@ async fn retake<S: PaymentPrefixStore>(
         .release_prefix(&prefix, &txid)
         .await
         .map_err(|e| fault(law, n, "the release", &e))?;
+    let answers = drive_held(
+        (0..n)
+            .map(|_| store.claim_prefix(&prefix, &txid, AGENT))
+            .collect(),
+        schedule,
+        held,
+    )
+    .await;
+    same_transaction_losers(law, n, answers)
+}
+
+/// The race law: a fresh prefix won by one transaction; then its release by
+/// that transaction, `n - 1` re-takes by it, one claim by another
+/// transaction and one release by another transaction, started together in
+/// that order (`n` claims, `n + 2` futures; [`Schedule::Ahead`]`(0)` holds
+/// the release back):
+/// the releases answer `Ok`, at most one re-take `Won` and every other
+/// `SameTransaction`, the other transaction's claim `OtherTransaction`.
+/// Afterwards the record is held if a re-take won (a re-take answers
+/// `SameTransaction`) and released if none did (a re-take answers `Won`,
+/// the next `SameTransaction`); another transaction is still refused. Run
+/// under every schedule of [`schedules`]`(n + 2, RANDOM_SCHEDULES,
+/// DEFAULT_SEED)`.
+pub async fn prefix_release_race<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+) -> Result<(), Violation> {
+    for schedule in schedules(n + 2, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        prefix_release_race_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`prefix_release_race`] under one schedule.
+pub async fn prefix_release_race_under<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    release_race(store, namespace, n, schedule, HELD_PASSES)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn release_race<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+) -> Result<(), Violation> {
+    let law = LAW_PREFIX_RELEASE_RACE;
+    let prefix = key_under(namespace, law, n, schedule);
+    let txid = txid_for(namespace, &prefix);
+    let other = txid_for(namespace, &format!("{prefix}/other"));
+    let (prefix, txid, other) = (prefix.as_str(), txid.as_str(), other.as_str());
+    let first = store
+        .claim_prefix(prefix, txid, AGENT)
+        .await
+        .map_err(|e| fault(law, n, "the first claim", &e))?;
+    expect(law, n, "the first claim", first, PrefixClaim::Won)?;
+    let mut ops: Vec<LocalFuture<'_, Raced<PrefixClaim>>> = Vec::with_capacity(n + 2);
+    let released = store.release_prefix(prefix, txid);
+    ops.push(Box::pin(async move { Raced::Release(released.await) }));
+    for _ in 1..n {
+        let claimed = store.claim_prefix(prefix, txid, AGENT);
+        ops.push(Box::pin(async move { Raced::Claim(claimed.await) }));
+    }
+    let claimed = store.claim_prefix(prefix, other, AGENT);
+    ops.push(Box::pin(async move { Raced::Claim(claimed.await) }));
+    let released = store.release_prefix(prefix, other);
+    ops.push(Box::pin(async move { Raced::Release(released.await) }));
+    let mut won = 0;
+    for (i, answer) in drive_held(ops, schedule, held)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        let step = match i {
+            0 => "the release".to_string(),
+            i if i < n => format!("re-take {}", i - 1),
+            i if i == n => "the claim by another transaction".to_string(),
+            _ => "the release by another transaction".to_string(),
+        };
+        match answer {
+            Raced::Release(Ok(())) => {}
+            Raced::Release(Err(e)) | Raced::Claim(Err(e)) => return Err(fault(law, n, &step, &e)),
+            Raced::Claim(Ok(claim)) if i == n => {
+                expect(law, n, &step, claim, PrefixClaim::OtherTransaction)?
+            }
+            Raced::Claim(Ok(PrefixClaim::Won)) => won += 1,
+            Raced::Claim(Ok(PrefixClaim::SameTransaction)) => {}
+            Raced::Claim(Ok(claim)) => {
+                return Err(Violation {
+                    law,
+                    n,
+                    schedule: None,
+                    detail: format!("{step} answered {claim:?}; only Won or SameTransaction"),
+                })
+            }
+        }
+    }
+    at_most_one(law, n, "the number of Won", won)?;
+    let check = |who: &str, step: String, want: PrefixClaim| {
+        let who = who.to_string();
+        async move {
+            let got = store
+                .claim_prefix(prefix, &who, AGENT)
+                .await
+                .map_err(|e| fault(law, n, &step, &e))?;
+            expect(law, n, &step, got, want)
+        }
+    };
+    if won == 1 {
+        check(
+            txid,
+            "after the race (one Won): a re-take".into(),
+            PrefixClaim::SameTransaction,
+        )
+        .await?;
+    } else {
+        check(
+            txid,
+            "after the race (no Won): a re-take".into(),
+            PrefixClaim::Won,
+        )
+        .await?;
+        check(
+            txid,
+            "after the race (no Won): a second re-take".into(),
+            PrefixClaim::SameTransaction,
+        )
+        .await?;
+    }
+    check(
+        other,
+        "after the race: a claim by another transaction".into(),
+        PrefixClaim::OtherTransaction,
+    )
+    .await
+}
+
+/// The releases law: a fresh prefix won by one transaction, then `n`
+/// releases by that transaction started together, then `n` re-takes by it
+/// started together: the releases answer `Ok`, exactly one re-take `Won`,
+/// every other `SameTransaction`. Both are driven under each schedule of
+/// [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
+pub async fn prefix_releases<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        prefix_releases_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`prefix_releases`] under one schedule.
+pub async fn prefix_releases_under<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    releases(store, namespace, n, schedule, HELD_PASSES)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn releases<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+) -> Result<(), Violation> {
+    let law = LAW_PREFIX_RELEASES;
+    let prefix = key_under(namespace, law, n, schedule);
+    let txid = txid_for(namespace, &prefix);
+    let first = store
+        .claim_prefix(&prefix, &txid, AGENT)
+        .await
+        .map_err(|e| fault(law, n, "the first claim", &e))?;
+    expect(law, n, "the first claim", first, PrefixClaim::Won)?;
+    let done = drive_held(
+        (0..n)
+            .map(|_| store.release_prefix(&prefix, &txid))
+            .collect(),
+        schedule,
+        held,
+    )
+    .await;
+    for (i, answer) in done.into_iter().enumerate() {
+        answer.map_err(|e| fault(law, n, &format!("release {i}"), &e))?;
+    }
     let answers = drive_held(
         (0..n)
             .map(|_| store.claim_prefix(&prefix, &txid, AGENT))
@@ -998,6 +1399,22 @@ impl<'a, S: PaymentPrefixStore> PrefixStoreKit<'a, S> {
             }
             None => report.skipped.push(LAW_PREFIX_FAIL_CLOSED),
         }
+        for &n in self.sizes {
+            for schedule in schedules(n + 2, self.random, self.seed) {
+                release_race(store, namespace, n, schedule, held)
+                    .await
+                    .map_err(under(schedule))?;
+            }
+            report.checked.push((LAW_PREFIX_RELEASE_RACE, n));
+        }
+        for &n in self.sizes {
+            for schedule in schedules(n, self.random, self.seed) {
+                releases(store, namespace, n, schedule, held)
+                    .await
+                    .map_err(under(schedule))?;
+            }
+            report.checked.push((LAW_PREFIX_RELEASES, n));
+        }
         Ok(report)
     }
 }
@@ -1117,6 +1534,108 @@ async fn claim_again<S: ClaimStore>(
     )
     .await;
     one_true(law, n, "claim", "the number of claims won", answers)
+}
+
+/// The race law: a fresh key claimed once, then its release started
+/// together with `n` claims of it (`n + 1` futures, the release first): the
+/// release answers `Ok`, at most one claim `true`. Afterwards the key is
+/// claimed if a claim won (a claim answers `false`) and free if none did (a
+/// claim answers `true`, the next `false`). Run under every schedule of
+/// [`schedules`]`(n + 1, RANDOM_SCHEDULES, DEFAULT_SEED)`.
+pub async fn claim_release_race<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+) -> Result<(), Violation> {
+    for schedule in schedules(n + 1, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        claim_release_race_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`claim_release_race`] under one schedule.
+pub async fn claim_release_race_under<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    claim_race(store, namespace, n, schedule, HELD_PASSES)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn claim_race<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+) -> Result<(), Violation> {
+    let law = LAW_CLAIM_RELEASE_RACE;
+    let claim_key = key_under(namespace, law, n, schedule);
+    let k = claim_key.as_str();
+    bool_release_race(
+        law,
+        n,
+        schedule,
+        held,
+        "claim",
+        "the number of claims won",
+        move || store.claim(k, AGENT),
+        move || store.release(k),
+    )
+    .await
+}
+
+/// The releases law: a fresh key claimed once, then `n` releases of it
+/// started together, then `n` claims of it started together: the releases
+/// answer `Ok`, exactly one claim `true`. Both are driven under each
+/// schedule of [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
+pub async fn claim_releases<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        claim_releases_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`claim_releases`] under one schedule.
+pub async fn claim_releases_under<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    claim_released(store, namespace, n, schedule, HELD_PASSES)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn claim_released<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+) -> Result<(), Violation> {
+    let law = LAW_CLAIM_RELEASES;
+    let claim_key = key_under(namespace, law, n, schedule);
+    let k = claim_key.as_str();
+    bool_releases(
+        law,
+        n,
+        schedule,
+        held,
+        "claim",
+        "the number of claims won",
+        move || store.claim(k, AGENT),
+        move || store.release(k),
+    )
+    .await
 }
 
 /// A fresh key is won once; a second claim is refused; after a release it
@@ -1256,6 +1775,22 @@ impl<'a, S: ClaimStore> ClaimStoreKit<'a, S> {
             }
             None => report.skipped.push(LAW_CLAIM_FAIL_CLOSED),
         }
+        for &n in self.sizes {
+            for schedule in schedules(n + 1, self.random, self.seed) {
+                claim_race(store, namespace, n, schedule, held)
+                    .await
+                    .map_err(under(schedule))?;
+            }
+            report.checked.push((LAW_CLAIM_RELEASE_RACE, n));
+        }
+        for &n in self.sizes {
+            for schedule in schedules(n, self.random, self.seed) {
+                claim_released(store, namespace, n, schedule, held)
+                    .await
+                    .map_err(under(schedule))?;
+            }
+            report.checked.push((LAW_CLAIM_RELEASES, n));
+        }
         Ok(report)
     }
 }
@@ -1373,6 +1908,109 @@ async fn nonce_again<S: PaymentNonceStore>(
         "the number of consumptions won",
         answers,
     )
+}
+
+/// The race law: a fresh nonce consumed once, then its release started
+/// together with `n` consumptions of it (`n + 1` futures, the release
+/// first): the release answers `Ok`, at most one consumption `true`.
+/// Afterwards the nonce is consumed if a consumption won (a consumption
+/// answers `false`) and free if none did (a consumption answers `true`, the
+/// next `false`). Run under every schedule of
+/// [`schedules`]`(n + 1, RANDOM_SCHEDULES, DEFAULT_SEED)`.
+pub async fn nonce_release_race<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+) -> Result<(), Violation> {
+    for schedule in schedules(n + 1, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        nonce_release_race_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`nonce_release_race`] under one schedule.
+pub async fn nonce_release_race_under<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    nonce_race(store, namespace, n, schedule, HELD_PASSES)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn nonce_race<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+) -> Result<(), Violation> {
+    let law = LAW_NONCE_RELEASE_RACE;
+    let scope = key_under(namespace, law, n, schedule);
+    let scope = scope.as_str();
+    bool_release_race(
+        law,
+        n,
+        schedule,
+        held,
+        "consumption",
+        "the number of consumptions won",
+        move || store.try_consume(scope, "nonce", None),
+        move || store.release(scope, "nonce"),
+    )
+    .await
+}
+
+/// The releases law: a fresh nonce consumed once, then `n` releases of it
+/// started together, then `n` consumptions of it started together: the
+/// releases answer `Ok`, exactly one consumption `true`. Both are driven
+/// under each schedule of [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
+pub async fn nonce_releases<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        nonce_releases_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`nonce_releases`] under one schedule.
+pub async fn nonce_releases_under<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    nonce_released(store, namespace, n, schedule, HELD_PASSES)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn nonce_released<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+    held: usize,
+) -> Result<(), Violation> {
+    let law = LAW_NONCE_RELEASES;
+    let scope = key_under(namespace, law, n, schedule);
+    let scope = scope.as_str();
+    bool_releases(
+        law,
+        n,
+        schedule,
+        held,
+        "consumption",
+        "the number of consumptions won",
+        move || store.try_consume(scope, "nonce", None),
+        move || store.release(scope, "nonce"),
+    )
+    .await
 }
 
 /// A fresh nonce is consumed once; the same nonce in another scope is
@@ -1532,6 +2170,22 @@ impl<'a, S: PaymentNonceStore> NonceStoreKit<'a, S> {
                 }
             }
             None => report.skipped.push(LAW_NONCE_FAIL_CLOSED),
+        }
+        for &n in self.sizes {
+            for schedule in schedules(n + 1, self.random, self.seed) {
+                nonce_race(store, namespace, n, schedule, held)
+                    .await
+                    .map_err(under(schedule))?;
+            }
+            report.checked.push((LAW_NONCE_RELEASE_RACE, n));
+        }
+        for &n in self.sizes {
+            for schedule in schedules(n, self.random, self.seed) {
+                nonce_released(store, namespace, n, schedule, held)
+                    .await
+                    .map_err(under(schedule))?;
+            }
+            report.checked.push((LAW_NONCE_RELEASES, n));
         }
         Ok(report)
     }

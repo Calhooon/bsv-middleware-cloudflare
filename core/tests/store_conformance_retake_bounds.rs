@@ -4,6 +4,8 @@
 //! store that races only above 33 simultaneous claims, and one whose lock
 //! is taken from a claim held back for 100 polls, keep every law at the
 //! kit's defaults and are caught once the host raises the bound they need.
+//! A store that never lets two claims win but answers `Err` after waiting
+//! keeps every law at the defaults and fails at a raised bound.
 
 #![cfg(feature = "conformance")]
 
@@ -437,6 +439,122 @@ fn drive_held_holds_a_claim_back_for_the_passes_it_is_given() {
         // (or on the second pass, when the hold is 0 or 1).
         assert_eq!(seen.get(), Some(held.max(1)), "hold {held}");
     }
+}
+
+// ── a larger bound can fail a store that never lets two claims win ──────
+
+/// One lock across the read, four awaits and the write, so no two claims
+/// can both win; a claim that has waited `budget` polls for the lock gives
+/// up with `Err`.
+struct Busy {
+    rows: Rows,
+    locked: Cell<bool>,
+    budget: usize,
+    fail: Cell<bool>,
+}
+
+impl Busy {
+    fn new(budget: usize) -> Self {
+        Busy {
+            rows: Default::default(),
+            locked: Cell::new(false),
+            budget,
+            fail: Cell::new(false),
+        }
+    }
+}
+
+impl PaymentPrefixStore for Busy {
+    async fn claim_prefix(
+        &self,
+        prefix: &str,
+        txid: &str,
+        _agent: &str,
+    ) -> Result<PrefixClaim, StoreError> {
+        fault_if(&self.fail)?;
+        let mut waited = 0;
+        while self.locked.get() {
+            waited += 1;
+            if waited > self.budget {
+                return Err(StoreError::new("busy"));
+            }
+            yield_once().await;
+        }
+        self.locked.set(true);
+        let claim = decide(&self.rows, prefix, txid);
+        for _ in 0..4 {
+            yield_once().await;
+        }
+        if claim == PrefixClaim::Won {
+            hold(&self.rows, prefix, txid);
+        }
+        self.locked.set(false);
+        Ok(claim)
+    }
+
+    async fn release_prefix(&self, prefix: &str, txid: &str) -> Result<(), StoreError> {
+        fault_if(&self.fail)?;
+        release_rows(&self.rows, prefix, txid);
+        Ok(())
+    }
+}
+
+fn busy_run(
+    sizes: Option<&[usize]>,
+    held: Option<usize>,
+) -> Result<conformance::Report, Violation> {
+    let store = Busy::new(400);
+    let fail = |on: bool| store.fail.set(on);
+    let kit = conformance::prefix_store(&store, "busy").fault(&fail);
+    let kit = match sizes {
+        Some(sizes) => kit.sizes(sizes),
+        None => kit,
+    };
+    let kit = match held {
+        Some(passes) => kit.held_passes(passes),
+        None => kit,
+    };
+    conformance::block_on(kit.run())
+}
+
+#[test]
+fn a_store_that_answers_err_after_waiting_keeps_the_defaults_and_fails_a_raised_bound() {
+    // At the defaults its waits stay under 400 polls: every law.
+    let report = busy_run(None, None).unwrap();
+    assert_eq!(report.checked.len(), 6 * conformance::SIZES.len() + 1);
+    // With N up to 128, the claims queued behind the lock wait more than
+    // 400 polls, and one gives up: an `Err` under contention, a violation.
+    let raised: Vec<usize> = (2..=128).collect();
+    let v = busy_run(Some(&raised), None).unwrap_err();
+    eprintln!("busy, sizes 2..=128: {v}");
+    assert_eq!(
+        (v.law, v.n, v.schedule),
+        (
+            conformance::LAW_PREFIX_ONE_TRANSACTION,
+            86,
+            Some(Schedule::Ahead(0))
+        )
+    );
+    assert_eq!(
+        v.detail,
+        "claim 85: the store faulted (busy) outside a fault test"
+    );
+    // With a hold of 1000 passes, claim 0 keeps the lock for more than 400
+    // polls of claim 1 at N = 2.
+    let v = busy_run(None, Some(1000)).unwrap_err();
+    eprintln!("busy, hold 1000: {v}");
+    assert_eq!(
+        (v.law, v.n, v.schedule),
+        (
+            conformance::LAW_PREFIX_ONE_TRANSACTION,
+            2,
+            Some(Schedule::Ahead(0))
+        )
+    );
+    assert_eq!(
+        v.detail,
+        "claim 1: the store faulted (busy) outside a fault test"
+    );
 }
 
 // ── block_on's budget ───────────────────────────────────────────────────
