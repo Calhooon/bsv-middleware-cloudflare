@@ -1,8 +1,7 @@
-// The differential pin's two sides: the linking read the payment check used
-// through core 0.4.2 (`Transaction::from_beef(bytes, None)`, kept here and
-// nowhere else) against the crate's `verify_payment_output` and
-// `payment_subject_txid`. Shared by `payment_subject_read.rs` and
-// `work_budget.rs` through `#[path]`.
+// The differential pin's two sides: the reference read kept for comparison
+// (`Transaction::from_beef(bytes, None)`, here and nowhere else) against the
+// crate's `verify_payment_output` and `payment_subject_txid`. Shared by
+// `payment_subject_read.rs` and `work_budget.rs` through `#[path]`.
 use bsv_middleware_core::{
     expected_locking_script, payment_subject_txid, verify_payment_output, PaymentVerdict,
     UnverifiableReason,
@@ -19,13 +18,13 @@ pub struct Terms<'a> {
     pub required: u64,
 }
 
-/// The linking read: the subject with its input ancestry linked.
+/// The reference read: the subject with its input ancestry linked.
 pub fn linked_subject(bytes: &[u8]) -> Result<Transaction, bsv_sdk::Error> {
     Transaction::from_beef(bytes, None)
 }
 
-/// The output check over the linking read, as core 0.4.2 wrote it: script
-/// first, then amount, at the named output only.
+/// The output check over the reference read: script first, then amount, at
+/// the named output only.
 pub fn linked_verdict(terms: &Terms, bytes: &[u8]) -> PaymentVerdict {
     verdict_of(terms, linked_subject(bytes))
 }
@@ -70,15 +69,15 @@ fn verdict_of(terms: &Terms, read: Result<Transaction, bsv_sdk::Error>) -> Payme
 pub struct Tally {
     /// Bodies compared.
     pub bodies: usize,
-    /// The linking read verified; the crate read the same txid and verdict.
+    /// The reference read verifies; the crate reads the same txid and verdict.
     pub verified: usize,
-    /// The linking read read a subject that does not pay (wrong script,
-    /// underpaid, no such output); the crate read the same txid and verdict.
+    /// The reference read reads a subject that does not pay (wrong script,
+    /// underpaid, no such output); the crate reads the same txid and verdict.
     pub read_not_paying: usize,
     /// Neither read a subject; the same refusal, word for word.
     pub both_refused: usize,
-    /// The linking read refused the body at its link bound; the crate read
-    /// the subject.
+    /// The reference read stops at bsv-rs's link bound; the crate reads the
+    /// subject.
     pub link_bound_only: usize,
 }
 
@@ -92,10 +91,10 @@ impl Tally {
     }
 }
 
-/// Compare the two reads on one body. Wherever the linking read read a
-/// subject, the crate reads the same txid and the same verdict; wherever it
-/// refused, the crate refuses with the same reason, except a refusal at the
-/// link bound, where the crate reads the subject the bytes name.
+/// Compare the two reads on one body. Wherever the reference read reads a
+/// subject, the crate reads the same txid and the same verdict; where it
+/// stops at bsv-rs's link bound, the crate reads the subject the bytes name;
+/// wherever else it refuses, the crate refuses with the same reason.
 pub fn compare(label: &str, terms: &Terms, bytes: &[u8]) -> Tally {
     let verdict = verify_payment_output(
         terms.server_key,
@@ -115,8 +114,8 @@ pub fn compare(label: &str, terms: &Terms, bytes: &[u8]) -> Tally {
     match linked_subject(bytes) {
         Ok(linked) => {
             assert_eq!(txid.as_deref(), Ok(linked.id().as_str()), "{label}: txid");
-            let before = linked_verdict(terms, bytes);
-            assert_eq!(verdict, before, "{label}: verdict");
+            let reference = linked_verdict(terms, bytes);
+            assert_eq!(verdict, reference, "{label}: verdict");
             if matches!(verdict, PaymentVerdict::Verified { .. }) {
                 tally.verified = 1;
             } else {
