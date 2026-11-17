@@ -1,7 +1,7 @@
 //! The conformance kit's own proof: `MemoryStore` keeps every law, and a
-//! store that reads, yields once, then writes (the shape of a key-value
-//! namespace with no compare-and-set) breaks the concurrent laws at every N
-//! while keeping the sequential ones.
+//! store that reads, yields once, then writes breaks the concurrent laws at
+//! every N while keeping the sequential ones. `store_conformance_schedules`
+//! holds the stores that only some schedules or sizes catch.
 
 #![cfg(feature = "conformance")]
 
@@ -158,15 +158,17 @@ fn memory_store_keeps_every_law_of_the_three_traits() {
     let fail = |on: bool| store.fail(on);
     let report =
         conformance::block_on(conformance::prefix_store(&store, "mem").fault(&fail).run()).unwrap();
-    assert_eq!(report.checked.len(), 3 + 3 + 1 + 3);
+    let sizes = conformance::SIZES.len();
+    assert_eq!(sizes, 32);
+    assert_eq!(report.checked.len(), sizes + sizes + 1 + sizes);
     assert_eq!(report.skipped, vec![conformance::LAW_PREFIX_LEGACY]);
     let report =
         conformance::block_on(conformance::claim_store(&store, "mem").fault(&fail).run()).unwrap();
-    assert_eq!(report.checked.len(), 3 + 1 + 3);
+    assert_eq!(report.checked.len(), sizes + 1 + sizes);
     assert!(report.skipped.is_empty());
     let report =
         conformance::block_on(conformance::nonce_store(&store, "mem").fault(&fail).run()).unwrap();
-    assert_eq!(report.checked.len(), 3 + 1 + 3);
+    assert_eq!(report.checked.len(), sizes + 1 + sizes);
 }
 
 #[tokio::test]

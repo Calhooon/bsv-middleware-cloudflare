@@ -482,15 +482,6 @@ mod kv_retry_tests {
 /// for exact M14 enforcement. After a release, edge-cached reads can still
 /// refuse the same txid as a replay for about 60 seconds. Values are `txid` or
 /// `released:txid`, never deleted or expired; the legacy `1` sentinel refuses reuse as `PrefixClaim::Unknown`.
-///
-/// Deprecated in 0.7.5: a claim here is a KV read and a separate KV write,
-/// not the one indivisible step [`PaymentPrefixStore`] requires (its docs
-/// name what a backend must offer; `bsv_middleware_core::store::conformance`
-/// checks an implementation). Payment prefixes belong in `D1PrefixStore`.
-#[deprecated(
-    since = "0.7.5",
-    note = "a KV read and a separate write cannot claim a prefix atomically; use D1PrefixStore (feature `d1-claims`)"
-)]
 pub struct KvPrefixStore<'a>(pub &'a KvSessionStorage);
 
 use bsv_middleware_core::{PaymentPrefixStore, PrefixClaim, StoreError};
@@ -508,7 +499,6 @@ fn judge_prefix_value(value: Option<&str>, txid: &str) -> PrefixClaim {
     }
 }
 
-#[allow(deprecated)]
 impl PaymentPrefixStore for KvPrefixStore<'_> {
     async fn claim_prefix(
         &self,

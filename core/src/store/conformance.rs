@@ -19,18 +19,39 @@
 //! # How the claims are started together
 //!
 //! Every concurrent law builds its N claim futures first and then drives
-//! them with [`together`]: each time it is polled, it polls every claim not
-//! yet finished, once, in order, with the caller's waker. Nothing runs a
-//! claim ahead of the others: when one claim reaches an await that is not
-//! ready, every other claim is polled to its own next await before the
-//! first is polled again. A store that reads, awaits, then writes therefore
-//! has all N reads issued before any write is: the first pass issues every
-//! read, and no write can be issued before its own read has answered, so
-//! every claim reads the key absent and every claim reports a win. The kit
-//! counts the winners and names the law. A store whose claim is one atomic
-//! step (a compare-and-set, a statement under a unique constraint, a
-//! single-threaded actor, or a claim that never awaits between its read and
-//! its write) has exactly one winner however the claims interleave.
+//! them on the current task under each [`Schedule`] in turn, at every N in
+//! [`SIZES`] (2 to 33):
+//!
+//! - [`Schedule::Lockstep`]: each pass polls every unfinished claim once,
+//!   in the order the claims were made;
+//! - [`Schedule::Reversed`]: the same, in the reverse order;
+//! - [`Schedule::Ahead`]`(i)`, for every `i` below N: claim `i` is polled
+//!   first, then held back (polled once every [`AHEAD_PERIOD`] passes, and
+//!   every pass once the others have finished) while the others are polled
+//!   every pass;
+//! - [`Schedule::Random`]`(seed)`, [`RANDOM_SCHEDULES`] seeds by default:
+//!   each pass polls a seeded random subset of the unfinished claims in a
+//!   seeded random order. A violation names its schedule, and with it the
+//!   seed, so the run can be repeated.
+//!
+//! Each claim of a schedule runs on a fresh key, and the law counts the
+//! winners and names the law, N and the schedule.
+//!
+//! What this catches: a store whose claim can be interrupted between the
+//! read that decides and the write that records (an await that is not
+//! ready there), when some claim enters that window while another is inside
+//! it under one of these poll orders at one of these N, and whose futures
+//! make progress each time they are polled (a map, a local SQL connection,
+//! a store that wakes itself). What it cannot catch: a race that needs a
+//! poll order or an N it does not run; a race decided by the backend's own
+//! clock rather than by the order of polls (inside a host's runtime the kit
+//! orders the polls, not the backend's I/O); a race between processes or
+//! isolates, since the kit runs on one thread. A store with one
+//! indivisible claim (a compare-and-set, a statement under a unique
+//! constraint read back in the same transaction, a single-threaded actor)
+//! has exactly one winner under every schedule, however many awaits
+//! surround that step. The kit can show that a store races; it cannot show
+//! that a store never does.
 //!
 //! The kit has no runtime of its own and spawns nothing: it runs on one
 //! thread, on every target (wasm32 included), and accepts stores that are
@@ -46,8 +67,23 @@ use std::task::{Context, Poll, Waker};
 
 use super::{ClaimStore, PaymentNonceStore, PaymentPrefixStore, PrefixClaim, StoreError};
 
-/// The numbers of simultaneous claims every concurrent law is run at.
-pub const SIZES: &[usize] = &[2, 8, 32];
+/// The numbers of simultaneous claims every concurrent law is run at: every
+/// N from 2 to 33.
+pub const SIZES: &[usize] = &[
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 33,
+];
+
+/// The number of [`Schedule::Random`] schedules each concurrent law runs at
+/// each N, by default.
+pub const RANDOM_SCHEDULES: usize = 8;
+
+/// The base seed of the default [`Schedule::Random`] schedules.
+pub const DEFAULT_SEED: u64 = 0x6b69_7473_6565_6400;
+
+/// Under [`Schedule::Ahead`], the held-back claim is polled once every this
+/// many passes until the others have finished.
+pub const AHEAD_PERIOD: usize = 64;
 
 /// A boxed future that need not be `Send`.
 pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
@@ -56,20 +92,27 @@ pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub type LegacySeeder<'a> = dyn Fn(String) -> LocalFuture<'a, Result<(), StoreError>> + 'a;
 
 /// A law the store broke: which law, at which number of simultaneous claims
-/// (1 for a sequential law), and what was observed.
+/// (1 for a sequential law), under which schedule, and what was observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     /// The law's name (one of the `LAW_*` constants).
     pub law: &'static str,
     /// The number of simultaneous claims (1 for a sequential law).
     pub n: usize,
+    /// The schedule the claims were driven under (`None` for a sequential
+    /// law, and for the fault laws, which run in lockstep).
+    pub schedule: Option<Schedule>,
     /// What the store answered.
     pub detail: String,
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "law `{}` at N={}: {}", self.law, self.n, self.detail)
+        write!(f, "law `{}` at N={}", self.law, self.n)?;
+        if let Some(schedule) = self.schedule {
+            write!(f, " under {schedule}")?;
+        }
+        write!(f, ": {}", self.detail)
     }
 }
 
@@ -114,26 +157,148 @@ pub const LAW_NONCE_FAIL_CLOSED: &str = "nonce: fail closed";
 
 // ── the driver ──────────────────────────────────────────────────────────
 
-/// Drives `futures` together on the current task: every poll polls each
-/// unfinished future once, in order, with the caller's waker. Outputs come
-/// back in the order of the input.
+/// The order in which a concurrent law polls its N claims, pass by pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Schedule {
+    /// Each pass polls every unfinished claim once, in the order made.
+    Lockstep,
+    /// Each pass polls every unfinished claim once, in the reverse order.
+    Reversed,
+    /// Claim `i` is polled first, once; then each pass polls the others,
+    /// and claim `i` only once every [`AHEAD_PERIOD`] passes until the
+    /// others have finished.
+    Ahead(usize),
+    /// Each pass polls a random subset of the unfinished claims (each with
+    /// probability one half) in a random order, both drawn from the seed.
+    Random(u64),
+}
+
+impl Schedule {
+    fn tag(&self) -> String {
+        match self {
+            Schedule::Lockstep => "lockstep".into(),
+            Schedule::Reversed => "reversed".into(),
+            Schedule::Ahead(i) => format!("ahead-{i}"),
+            Schedule::Random(seed) => format!("random-{seed:016x}"),
+        }
+    }
+}
+
+impl fmt::Display for Schedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Schedule::Lockstep => f.write_str("schedule lockstep"),
+            Schedule::Reversed => f.write_str("schedule reversed"),
+            Schedule::Ahead(i) => write!(f, "schedule ahead (claim {i} first, then held back)"),
+            Schedule::Random(seed) => write!(f, "schedule random (seed {seed:#018x})"),
+        }
+    }
+}
+
+/// The schedules a concurrent law runs at `n` claims, in this order:
+/// reversed, lockstep, each claim ahead in turn, and `random` seeded random schedules whose
+/// seeds are drawn from `seed` and `n`.
+pub fn schedules(n: usize, random: usize, seed: u64) -> Vec<Schedule> {
+    let mut out = vec![Schedule::Reversed, Schedule::Lockstep];
+    out.extend((0..n).map(Schedule::Ahead));
+    out.extend(
+        (0..random)
+            .map(|k| Schedule::Random(splitmix(seed ^ splitmix((n as u64) << 32 | k as u64)))),
+    );
+    out
+}
+
+fn splitmix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Drives `futures` together on the current task in lockstep: every poll
+/// polls each unfinished future once, in order, with the caller's waker.
+/// Outputs come back in the order of the input.
 pub async fn together<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
-    Together {
+    drive(futures, Schedule::Lockstep).await
+}
+
+/// Drives `futures` together on the current task under `schedule`, with
+/// the caller's waker. A pass that leaves an unfinished future unpolled
+/// wakes the task, so a held-back future is always polled again. Outputs
+/// come back in the order of the input.
+pub async fn drive<F: Future>(futures: Vec<F>, schedule: Schedule) -> Vec<F::Output> {
+    let state = match schedule {
+        Schedule::Random(seed) => seed,
+        _ => 0,
+    };
+    Driven {
         futures: futures.into_iter().map(|f| Some(Box::pin(f))).collect(),
         outputs: Vec::new(),
+        schedule,
+        pass: 0,
+        state,
     }
     .await
 }
 
-struct Together<F: Future> {
+struct Driven<F: Future> {
     futures: Vec<Option<Pin<Box<F>>>>,
     outputs: Vec<Option<F::Output>>,
+    schedule: Schedule,
+    pass: usize,
+    state: u64,
 }
 
 // Each future is boxed, so nothing is pinned in place in this struct.
-impl<F: Future> Unpin for Together<F> {}
+impl<F: Future> Unpin for Driven<F> {}
 
-impl<F: Future> Future for Together<F> {
+impl<F: Future> Driven<F> {
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(1);
+        splitmix(self.state)
+    }
+
+    /// The claims this pass polls, in order.
+    fn order(&mut self) -> Vec<usize> {
+        let n = self.futures.len();
+        match self.schedule {
+            Schedule::Lockstep => (0..n).collect(),
+            Schedule::Reversed => (0..n).rev().collect(),
+            Schedule::Ahead(ahead) => {
+                let others_done = self
+                    .futures
+                    .iter()
+                    .enumerate()
+                    .all(|(i, f)| i == ahead || f.is_none());
+                if self.pass == 0 {
+                    std::iter::once(ahead)
+                        .chain((0..n).filter(|&i| i != ahead))
+                        .collect()
+                } else if others_done || self.pass % AHEAD_PERIOD == AHEAD_PERIOD - 1 {
+                    (0..n).collect()
+                } else {
+                    (0..n).filter(|&i| i != ahead).collect()
+                }
+            }
+            Schedule::Random(_) => {
+                let mut order: Vec<usize> = (0..n).collect();
+                for i in (1..n).rev() {
+                    let j = (self.next() % (i as u64 + 1)) as usize;
+                    order.swap(i, j);
+                }
+                let mut kept = Vec::with_capacity(n);
+                for i in order {
+                    if self.next() & 1 == 1 {
+                        kept.push(i);
+                    }
+                }
+                kept
+            }
+        }
+    }
+}
+
+impl<F: Future> Future for Driven<F> {
     type Output = Vec<F::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -141,22 +306,33 @@ impl<F: Future> Future for Together<F> {
         if this.outputs.len() != this.futures.len() {
             this.outputs = (0..this.futures.len()).map(|_| None).collect();
         }
-        let mut pending = false;
-        for (slot, out) in this.futures.iter_mut().zip(this.outputs.iter_mut()) {
-            if let Some(future) = slot {
-                match future.as_mut().poll(cx) {
-                    Poll::Ready(value) => {
-                        *out = Some(value);
-                        *slot = None;
-                    }
-                    Poll::Pending => pending = true,
+        let order = this.order();
+        this.pass += 1;
+        let mut polled = vec![false; this.futures.len()];
+        for i in order {
+            polled[i] = true;
+            if let Some(future) = &mut this.futures[i] {
+                if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                    this.outputs[i] = Some(value);
+                    this.futures[i] = None;
                 }
             }
         }
-        if pending {
-            return Poll::Pending;
+        let unfinished = this.futures.iter().any(Option::is_some);
+        if !unfinished {
+            return Poll::Ready(this.outputs.iter_mut().filter_map(Option::take).collect());
         }
-        Poll::Ready(this.outputs.iter_mut().filter_map(Option::take).collect())
+        // A future this pass did not poll has registered no waker for it:
+        // wake the task so that it is polled on a later pass.
+        if this
+            .futures
+            .iter()
+            .zip(&polled)
+            .any(|(f, &p)| f.is_some() && !p)
+        {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     }
 }
 
@@ -196,10 +372,22 @@ fn key(namespace: &str, law: &str, n: usize) -> String {
     format!("{namespace}:{law}:{n}")
 }
 
+fn key_under(namespace: &str, law: &str, n: usize, schedule: Schedule) -> String {
+    format!("{}:{}", key(namespace, law, n), schedule.tag())
+}
+
+fn under(schedule: Schedule) -> impl Fn(Violation) -> Violation {
+    move |mut v| {
+        v.schedule = Some(schedule);
+        v
+    }
+}
+
 fn fault(law: &'static str, n: usize, step: &str, e: &StoreError) -> Violation {
     Violation {
         law,
         n,
+        schedule: None,
         detail: format!("{step}: the store faulted ({e}) outside a fault test"),
     }
 }
@@ -217,6 +405,7 @@ fn expect<T: PartialEq + fmt::Debug>(
         Err(Violation {
             law,
             n,
+            schedule: None,
             detail: format!("{step}: answered {got:?}, the law requires {want:?}"),
         })
     }
@@ -227,19 +416,45 @@ fn expect<T: PartialEq + fmt::Debug>(
 const AGENT: &str = "conformance";
 
 /// Law (a): `n` claims of one fresh prefix by one transaction, started
-/// together: exactly one `Won`, every other `SameTransaction`.
+/// together: exactly one `Won`, every other `SameTransaction`. Run under
+/// every schedule of [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
 pub async fn prefix_one_transaction<S: PaymentPrefixStore>(
     store: &S,
     namespace: &str,
     n: usize,
 ) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        prefix_one_transaction_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// Law (a) under one schedule.
+pub async fn prefix_one_transaction_under<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    one_transaction(store, namespace, n, schedule)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn one_transaction<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
     let law = LAW_PREFIX_ONE_TRANSACTION;
-    let prefix = key(namespace, law, n);
+    let prefix = key_under(namespace, law, n, schedule);
     let txid = txid_for(namespace, &prefix);
-    let answers = together(
+    let answers = drive(
         (0..n)
             .map(|_| store.claim_prefix(&prefix, &txid, AGENT))
             .collect(),
+        schedule,
     )
     .await;
     let mut won = 0;
@@ -251,6 +466,7 @@ pub async fn prefix_one_transaction<S: PaymentPrefixStore>(
                 return Err(Violation {
                     law,
                     n,
+                    schedule: None,
                     detail: format!("claim {i} answered {other:?}; only Won or SameTransaction"),
                 })
             }
@@ -263,22 +479,48 @@ pub async fn prefix_one_transaction<S: PaymentPrefixStore>(
 /// Law (b): `n` claims of one fresh prefix by `n` different transactions,
 /// started together: exactly one `Won`, every other `OtherTransaction`;
 /// afterwards the winner's transaction is bound for every later claim, and
-/// stays bound after its release.
+/// stays bound after its release. Run under every schedule of
+/// [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
 pub async fn prefix_many_transactions<S: PaymentPrefixStore>(
     store: &S,
     namespace: &str,
     n: usize,
 ) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        prefix_many_transactions_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// Law (b) under one schedule.
+pub async fn prefix_many_transactions_under<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
+    many_transactions(store, namespace, n, schedule)
+        .await
+        .map_err(under(schedule))
+}
+
+async fn many_transactions<S: PaymentPrefixStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
     let law = LAW_PREFIX_MANY_TRANSACTIONS;
-    let prefix = key(namespace, law, n);
+    let prefix = key_under(namespace, law, n, schedule);
     let txids: Vec<String> = (0..n)
         .map(|i| txid_for(namespace, &format!("{prefix}/{i}")))
         .collect();
-    let answers = together(
+    let answers = drive(
         txids
             .iter()
             .map(|txid| store.claim_prefix(&prefix, txid, AGENT))
             .collect(),
+        schedule,
     )
     .await;
     let mut winners = Vec::new();
@@ -290,6 +532,7 @@ pub async fn prefix_many_transactions<S: PaymentPrefixStore>(
                 return Err(Violation {
                     law,
                     n,
+                    schedule: None,
                     detail: format!("claim {i} answered {other:?}; only Won or OtherTransaction"),
                 })
             }
@@ -434,6 +677,7 @@ pub async fn prefix_legacy<S: PaymentPrefixStore>(
     seed(prefix.clone()).await.map_err(|e| Violation {
         law,
         n: 1,
+        schedule: None,
         detail: format!("the legacy seeder faulted: {e}"),
     })?;
     for label in ["a", "b"] {
@@ -487,6 +731,7 @@ pub async fn prefix_fail_closed<S: PaymentPrefixStore>(
             return Err(Violation {
                 law,
                 n,
+                schedule: None,
                 detail: format!("claim {i} under a fault answered Ok({claim:?}); a fault is Err"),
             });
         }
@@ -495,6 +740,7 @@ pub async fn prefix_fail_closed<S: PaymentPrefixStore>(
         return Err(Violation {
             law,
             n,
+            schedule: None,
             detail: "a release under a fault answered Ok; a fault is Err".into(),
         });
     }
@@ -506,6 +752,8 @@ pub struct PrefixStoreKit<'a, S> {
     store: &'a S,
     namespace: &'a str,
     sizes: &'a [usize],
+    random: usize,
+    seed: u64,
     fault: Option<&'a dyn Fn(bool)>,
     legacy: Option<&'a LegacySeeder<'a>>,
 }
@@ -521,6 +769,8 @@ pub fn prefix_store<'a, S: PaymentPrefixStore>(
         store,
         namespace,
         sizes: SIZES,
+        random: RANDOM_SCHEDULES,
+        seed: DEFAULT_SEED,
         fault: None,
         legacy: None,
     }
@@ -545,15 +795,28 @@ impl<'a, S: PaymentPrefixStore> PrefixStoreKit<'a, S> {
         self
     }
 
+    /// The number of [`Schedule::Random`] schedules at each N (default
+    /// [`RANDOM_SCHEDULES`]) and the base seed they are drawn from
+    /// (default [`DEFAULT_SEED`]).
+    pub fn random(mut self, count: usize, seed: u64) -> Self {
+        self.random = count;
+        self.seed = seed;
+        self
+    }
+
     /// Every law, in order; the first law broken is the `Err`.
     pub async fn run(self) -> Result<Report, Violation> {
         let mut report = Report::default();
         for &n in self.sizes {
-            prefix_one_transaction(self.store, self.namespace, n).await?;
+            for schedule in schedules(n, self.random, self.seed) {
+                prefix_one_transaction_under(self.store, self.namespace, n, schedule).await?;
+            }
             report.checked.push((LAW_PREFIX_ONE_TRANSACTION, n));
         }
         for &n in self.sizes {
-            prefix_many_transactions(self.store, self.namespace, n).await?;
+            for schedule in schedules(n, self.random, self.seed) {
+                prefix_many_transactions_under(self.store, self.namespace, n, schedule).await?;
+            }
             report.checked.push((LAW_PREFIX_MANY_TRANSACTIONS, n));
         }
         prefix_sequential(self.store, self.namespace).await?;
@@ -580,24 +843,42 @@ impl<'a, S: PaymentPrefixStore> PrefixStoreKit<'a, S> {
 
 // ── ClaimStore ──────────────────────────────────────────────────────────
 
-/// `n` claims of one fresh key, started together: exactly one `true`.
+/// `n` claims of one fresh key, started together: exactly one `true`. Run
+/// under every schedule of [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
 pub async fn claim_concurrent<S: ClaimStore>(
     store: &S,
     namespace: &str,
     n: usize,
 ) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        claim_concurrent_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`claim_concurrent`] under one schedule.
+pub async fn claim_concurrent_under<S: ClaimStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
     let law = LAW_CLAIM_CONCURRENT;
-    let claim_key = key(namespace, law, n);
-    let answers = together((0..n).map(|_| store.claim(&claim_key, AGENT)).collect()).await;
+    let claim_key = key_under(namespace, law, n, schedule);
+    let answers = drive(
+        (0..n).map(|_| store.claim(&claim_key, AGENT)).collect(),
+        schedule,
+    )
+    .await;
     let mut won = 0;
     for (i, answer) in answers.into_iter().enumerate() {
         match answer {
             Ok(true) => won += 1,
             Ok(false) => {}
-            Err(e) => return Err(fault(law, n, &format!("claim {i}"), &e)),
+            Err(e) => return Err(under(schedule)(fault(law, n, &format!("claim {i}"), &e))),
         }
     }
-    expect(law, n, "the number of claims won", won, 1)
+    expect(law, n, "the number of claims won", won, 1).map_err(under(schedule))
 }
 
 /// A fresh key is won once; a second claim is refused; after a release it
@@ -646,6 +927,7 @@ pub async fn claim_fail_closed<S: ClaimStore>(
         return Err(Violation {
             law,
             n,
+            schedule: None,
             detail: format!("claim {i} under a fault answered Ok({won}); a fault is Err"),
         });
     }
@@ -657,6 +939,8 @@ pub struct ClaimStoreKit<'a, S> {
     store: &'a S,
     namespace: &'a str,
     sizes: &'a [usize],
+    random: usize,
+    seed: u64,
     fault: Option<&'a dyn Fn(bool)>,
 }
 
@@ -666,6 +950,8 @@ pub fn claim_store<'a, S: ClaimStore>(store: &'a S, namespace: &'a str) -> Claim
         store,
         namespace,
         sizes: SIZES,
+        random: RANDOM_SCHEDULES,
+        seed: DEFAULT_SEED,
         fault: None,
     }
 }
@@ -683,11 +969,22 @@ impl<'a, S: ClaimStore> ClaimStoreKit<'a, S> {
         self
     }
 
+    /// The number of [`Schedule::Random`] schedules at each N (default
+    /// [`RANDOM_SCHEDULES`]) and the base seed they are drawn from
+    /// (default [`DEFAULT_SEED`]).
+    pub fn random(mut self, count: usize, seed: u64) -> Self {
+        self.random = count;
+        self.seed = seed;
+        self
+    }
+
     /// Every law, in order; the first law broken is the `Err`.
     pub async fn run(self) -> Result<Report, Violation> {
         let mut report = Report::default();
         for &n in self.sizes {
-            claim_concurrent(self.store, self.namespace, n).await?;
+            for schedule in schedules(n, self.random, self.seed) {
+                claim_concurrent_under(self.store, self.namespace, n, schedule).await?;
+            }
             report.checked.push((LAW_CLAIM_CONCURRENT, n));
         }
         claim_sequential(self.store, self.namespace).await?;
@@ -708,18 +1005,33 @@ impl<'a, S: ClaimStore> ClaimStoreKit<'a, S> {
 // ── PaymentNonceStore ───────────────────────────────────────────────────
 
 /// `n` consumptions of one fresh nonce in one scope, started together:
-/// exactly one `true`.
+/// exactly one `true`. Run under every schedule of
+/// [`schedules`]`(n, RANDOM_SCHEDULES, DEFAULT_SEED)`.
 pub async fn nonce_concurrent<S: PaymentNonceStore>(
     store: &S,
     namespace: &str,
     n: usize,
 ) -> Result<(), Violation> {
+    for schedule in schedules(n, RANDOM_SCHEDULES, DEFAULT_SEED) {
+        nonce_concurrent_under(store, namespace, n, schedule).await?;
+    }
+    Ok(())
+}
+
+/// [`nonce_concurrent`] under one schedule.
+pub async fn nonce_concurrent_under<S: PaymentNonceStore>(
+    store: &S,
+    namespace: &str,
+    n: usize,
+    schedule: Schedule,
+) -> Result<(), Violation> {
     let law = LAW_NONCE_CONCURRENT;
-    let scope = key(namespace, law, n);
-    let answers = together(
+    let scope = key_under(namespace, law, n, schedule);
+    let answers = drive(
         (0..n)
             .map(|_| store.try_consume(&scope, "nonce", None))
             .collect(),
+        schedule,
     )
     .await;
     let mut won = 0;
@@ -727,10 +1039,17 @@ pub async fn nonce_concurrent<S: PaymentNonceStore>(
         match answer {
             Ok(true) => won += 1,
             Ok(false) => {}
-            Err(e) => return Err(fault(law, n, &format!("consumption {i}"), &e)),
+            Err(e) => {
+                return Err(under(schedule)(fault(
+                    law,
+                    n,
+                    &format!("consumption {i}"),
+                    &e,
+                )))
+            }
         }
     }
-    expect(law, n, "the number of consumptions won", won, 1)
+    expect(law, n, "the number of consumptions won", won, 1).map_err(under(schedule))
 }
 
 /// A fresh nonce is consumed once; the same nonce in another scope is
@@ -797,6 +1116,7 @@ pub async fn nonce_fail_closed<S: PaymentNonceStore>(
         return Err(Violation {
             law,
             n,
+            schedule: None,
             detail: format!("consumption {i} under a fault answered Ok({won}); a fault is Err"),
         });
     }
@@ -808,6 +1128,8 @@ pub struct NonceStoreKit<'a, S> {
     store: &'a S,
     namespace: &'a str,
     sizes: &'a [usize],
+    random: usize,
+    seed: u64,
     fault: Option<&'a dyn Fn(bool)>,
 }
 
@@ -820,6 +1142,8 @@ pub fn nonce_store<'a, S: PaymentNonceStore>(
         store,
         namespace,
         sizes: SIZES,
+        random: RANDOM_SCHEDULES,
+        seed: DEFAULT_SEED,
         fault: None,
     }
 }
@@ -837,11 +1161,22 @@ impl<'a, S: PaymentNonceStore> NonceStoreKit<'a, S> {
         self
     }
 
+    /// The number of [`Schedule::Random`] schedules at each N (default
+    /// [`RANDOM_SCHEDULES`]) and the base seed they are drawn from
+    /// (default [`DEFAULT_SEED`]).
+    pub fn random(mut self, count: usize, seed: u64) -> Self {
+        self.random = count;
+        self.seed = seed;
+        self
+    }
+
     /// Every law, in order; the first law broken is the `Err`.
     pub async fn run(self) -> Result<Report, Violation> {
         let mut report = Report::default();
         for &n in self.sizes {
-            nonce_concurrent(self.store, self.namespace, n).await?;
+            for schedule in schedules(n, self.random, self.seed) {
+                nonce_concurrent_under(self.store, self.namespace, n, schedule).await?;
+            }
             report.checked.push((LAW_NONCE_CONCURRENT, n));
         }
         nonce_sequential(self.store, self.namespace).await?;

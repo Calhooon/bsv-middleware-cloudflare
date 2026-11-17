@@ -130,16 +130,21 @@ a fixture (`LookupFn` wraps a closure).
 permanently (M14, BRC-105). `claim_prefix` returns `PrefixClaim::{Won, SameTransaction,
 OtherTransaction, Unknown}`. Only `Won` proceeds to the wallet. A released record can be re-taken
 only by its own txid; held and served records refuse even that txid. `release_prefix` retains the
-binding forever. The adapter provides the D1 implementation (`D1PrefixStore`); its KV
-implementation (`KvPrefixStore`) is deprecated.
+binding forever. The adapter provides `D1PrefixStore` (D1) and `KvPrefixStore` (KV).
 
 **What a backend must offer.** A claim is one indivisible step against the backend: a
 compare-and-set, an upsert under a unique key read back in the same transaction, or a
-single-threaded actor that owns the key. A read followed by a separate write is not a claim.
-With the feature `conformance`, `store::conformance` is the kit that shows an implementation
-keeps its trait: N claims of one key started together and interleaved at every await (N = 2, 8,
-32; one winner), the sequential laws, a legacy record, and a fault that is `Err`. A host enables
-it in its development dependencies and runs it in its own tests:
+single-threaded actor that owns the key. No other claim of the key may come between the read that
+decides a claim and the write that records it. With the feature `conformance`,
+`store::conformance` is the kit that runs an implementation against its trait's laws: N claims of
+one key started together at every N from 2 to 33 (one winner), each N driven under every schedule
+of `conformance::schedules` (reversed, lockstep, each claim held ahead in turn, and seeded random
+orders whose seed a violation names); the sequential laws; a legacy record; and a fault that is
+`Err`. It catches a store whose claim can be interrupted between its read and its write when one
+of those poll orders, at one of those N, puts another claim in that window; it does not order a
+backend's own I/O, and it runs on one thread. The kit can show that a store races; it cannot show
+that a store never does. A host enables it in its development dependencies and runs it in its own
+tests:
 
 ```rust,ignore
 // [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }

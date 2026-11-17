@@ -35,7 +35,7 @@ use bsv_middleware_cloudflare::{
         sign_json_response, AuthMiddlewareOptions, AuthResult, AuthSession,
         PaymentMiddlewareOptions, PaymentResult,
     },
-    storage::KvSessionStorage,
+    storage::{KvPrefixStore, KvSessionStorage},
     types::AuthContext,
 };
 use serde_json::json;
@@ -126,12 +126,11 @@ async fn handle_paid(
     let payment_options =
         PaymentMiddlewareOptions::new(server_key.to_string(), |_req: &Request| 100u64);
 
-    // KvPrefixStore is deprecated (a KV read and a separate write). A host
-    // enables `d1-claims` and passes `D1PrefixStore` over its CLAIMS table.
+    // KV retains the G3 race/propagation window. Production hosts that need
+    // exact M14 enforcement should enable d1-claims and pass D1PrefixStore.
     let session_storage = KvSessionStorage::new(env.kv("AUTH_SESSIONS")?, "auth", 3600);
 
-    #[allow(deprecated)]
-    let payment_prefixes = bsv_middleware_cloudflare::storage::KvPrefixStore(&session_storage);
+    let payment_prefixes = KvPrefixStore(&session_storage);
     let payment_ctx =
         match process_payment_with_storage(&req, auth, &payment_options, &payment_prefixes)
             .await

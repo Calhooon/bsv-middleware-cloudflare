@@ -12,14 +12,15 @@
 //! A claim must be one indivisible step against the backend: a
 //! compare-and-set (put-if-absent), a write under a unique constraint whose
 //! outcome is read in the same transaction, or a single-threaded actor that
-//! owns the key (a Durable Object, a map on one thread). A read followed by
-//! a separate write is not a claim: two requests that both read before
-//! either writes both win. A key-value namespace without compare-and-set
-//! cannot back these traits.
+//! owns the key (a Durable Object, a map on one thread). No other claim of
+//! the key may come between the read that decides a claim and the write
+//! that records it.
 //!
-//! With the feature `conformance`, [`conformance`] is the kit that shows an
-//! implementation keeps its trait: simultaneous claims interleaved at every
-//! await, the sequential laws, and fail-closed faults.
+//! With the feature `conformance`, [`conformance`] is the kit that runs an
+//! implementation against its trait's laws: N simultaneous claims of one key
+//! under several poll schedules at every N from 2 to 33, the sequential
+//! laws, and fail-closed faults. It can show that a store races; it cannot
+//! show that a store never does.
 
 use std::fmt;
 use std::future::Future;
@@ -122,17 +123,19 @@ pub enum PrefixClaim {
 /// compare-and-set on the record, an upsert under the prefix's unique key
 /// whose result is read in the same transaction (the adapter's
 /// `D1PrefixStore`: one upsert and its classifying read in one D1 batch), or
-/// a single-threaded actor that owns the prefix. A read, an await, then a
-/// write lets two simultaneous claims both win; a key-value namespace
-/// without compare-and-set cannot implement this trait.
+/// a single-threaded actor that owns the prefix. No other claim of the
+/// prefix may come between the read that decides and the write that
+/// records.
 ///
 /// # Showing it
 ///
 /// With the feature `conformance`, `conformance::prefix_store` runs the
 /// trait's laws against an implementation: N claims of one prefix by one
-/// transaction and by N transactions, started together and interleaved at
-/// every await (N = 2, 8, 32); the sequential laws below; a legacy record;
-/// a fault that is `Err`. In a host's tests:
+/// transaction and by N transactions, started together and driven under
+/// each schedule of `conformance::schedules` (reversed, lockstep, each
+/// claim held ahead in turn, seeded random orders) at every N from 2 to 33;
+/// the sequential laws below; a legacy record; a fault that is `Err`. In a
+/// host's tests:
 ///
 /// ```ignore
 /// // [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }

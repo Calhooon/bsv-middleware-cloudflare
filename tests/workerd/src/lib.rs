@@ -127,7 +127,13 @@ fn report_json(answer: std::result::Result<Report, Violation>) -> Value {
 }
 
 fn violation_json(v: &Violation) -> Value {
-    json!({ "pass": false, "law": v.law, "n": v.n, "detail": v.detail })
+    json!({
+        "pass": false,
+        "law": v.law,
+        "n": v.n,
+        "schedule": v.schedule.map(|s| s.to_string()),
+        "detail": v.detail,
+    })
 }
 
 async fn schema(db: &D1Database) -> Result<()> {

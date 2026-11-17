@@ -656,7 +656,7 @@ mod conformance_on_sqlite {
     }
 
     /// The same table read by one statement and written by another, with an
-    /// await between them: a key-value namespace's shape on SQL.
+    /// await between them.
     struct ReadThenWriteOnSqlite<'a>(&'a Sqlite);
 
     impl PaymentPrefixStore for ReadThenWriteOnSqlite<'_> {
@@ -722,7 +722,8 @@ mod conformance_on_sqlite {
         )
         .unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
-        assert_eq!(report.checked.len(), 11);
+        let sizes = conformance::SIZES.len();
+        assert_eq!(report.checked.len(), 3 * sizes + 2);
     }
 
     #[test]

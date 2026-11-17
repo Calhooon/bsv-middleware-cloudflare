@@ -1,9 +1,10 @@
 // The single-use stores' conformance kit on workerd's D1, fully local.
 // Miniflare runs the test Worker (src/lib.rs) with two local D1 bindings:
 // CLAIMS (the claims table) and BROKEN (no table: every statement faults).
-//   1. /kit: every law of D1PrefixStore and D1ClaimStore, in the isolate.
+//   1. /kit: every law of D1PrefixStore and D1ClaimStore, in the isolate
+//      (every N from 2 to 33, under every schedule of the kit).
 //   2. /kit-wrong: a store that reads, awaits, then writes on the same D1
-//      breaks both concurrent prefix laws at N = 2, 8, 32.
+//      breaks both concurrent prefix laws at every N from 2 to 33.
 //   3. N = 2, 8, 32 simultaneous requests: one prefix and one txid (one Won,
 //      the rest SameTransaction); one prefix and N txids (one Won, the rest
 //      OtherTransaction, then the winner bound for every later claim); one
@@ -21,6 +22,7 @@ const { Miniflare } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
 
 const here = dirname(fileURLToPath(import.meta.url))
 const SIZES = [2, 8, 32]
+const KIT_SIZES = Array.from({ length: 32 }, (_, i) => i + 2)
 const ns = `run-${Date.now()}-${randomBytes(4).toString('hex')}`
 const hex64 = () => randomBytes(32).toString('hex')
 
@@ -48,15 +50,15 @@ try {
   const kit = await call('GET', `/kit?ns=${ns}`)
   assert.equal(kit.prefix.pass, true, JSON.stringify(kit.prefix))
   assert.deepEqual(kit.prefix.skipped, [])
-  assert.equal(kit.prefix.checked.length, 11)
+  assert.equal(kit.prefix.checked.length, 3 * KIT_SIZES.length + 2)
   assert.equal(kit.claim.pass, true, JSON.stringify(kit.claim))
   assert.deepEqual(kit.claim.skipped, [])
-  assert.equal(kit.claim.checked.length, 7)
+  assert.equal(kit.claim.checked.length, 2 * KIT_SIZES.length + 1)
   lines.push(`kit: D1PrefixStore ${kit.prefix.checked.length} laws pass, D1ClaimStore ${kit.claim.checked.length} laws pass`)
 
   // 2. The read-await-write store on the same D1.
   const wrong = await call('GET', `/kit-wrong?ns=${ns}-wrong`)
-  assert.equal(wrong.laws.length, SIZES.length * 2)
+  assert.equal(wrong.laws.length, KIT_SIZES.length * 2)
   for (const law of wrong.laws) {
     assert.equal(law.pass, false, JSON.stringify(law))
     assert.match(law.detail, new RegExp(`^the number of Won: answered ${law.n},`), JSON.stringify(law))

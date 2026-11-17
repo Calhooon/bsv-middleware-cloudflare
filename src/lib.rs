@@ -191,7 +191,6 @@ pub use payment_verify::{
     UrlHeaderService, DEFAULT_CHAINTRACKS_URL,
 };
 pub use storage::do_session::{AuthSessionStore, DoSessionStorage};
-#[allow(deprecated)]
 pub use storage::{
     KvPaymentStorage, KvPrefixStore, KvSessionStorage, LaneVerdict, LaneVerifyAsk,
     SessionNonceStore, SessionStorage,

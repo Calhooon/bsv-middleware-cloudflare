@@ -5,7 +5,7 @@ patch versions are additive unless a line below says otherwise.
 
 ## 0.4.4 (adapter 0.7.5) - 2026-11-17
 
-- Add `store::conformance` (feature `conformance`): the kit a host's tests run against its own `PaymentPrefixStore`, `ClaimStore` or `PaymentNonceStore`. N claims started together and interleaved at every await (N = 2, 8, 32; one winner), the sequential laws, a legacy record, a fault that is `Err`. No runtime of its own; stores that are not `Send` are accepted. See the adapter's changelog for the proof runs (memory, SQLite, workerd's D1).
+- Add `store::conformance` (feature `conformance`): the kit a host's tests run against its own `PaymentPrefixStore`, `ClaimStore` or `PaymentNonceStore`. N claims started together at every N from 2 to 33 (one winner), each N driven under every schedule of `conformance::schedules`: reversed, lockstep, each claim held ahead in turn, and seeded random orders (a violation names its schedule and seed); the sequential laws, a legacy record, a fault that is `Err`. The kit can show that a store races; it cannot show that a store never does. No runtime of its own; stores that are not `Send` are accepted. See the adapter's changelog for the proof runs (memory, SQLite, workerd's D1).
 - The store traits' docs say what a backend must offer: a compare-and-set, an upsert under a unique key read back in the same transaction, or a single-threaded actor. No call shape moves.
 
 ## 0.4.0 (adapter 0.7.0) - 2026-10-19
