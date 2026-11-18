@@ -85,8 +85,8 @@
 //! [`PaymentPrefixStore`], by the bound transaction or by another). For
 //! every pair of them, an operation with itself included, the kit either
 //! has a law that starts the pair together under every schedule at every N,
-//! with the outcome the trait's contract states, or the contract promises
-//! nothing for the pair, for the reason given.
+//! with the outcome the trait's contract states, or it has no law for the
+//! pair, for the reason given.
 //!
 //! [`PaymentPrefixStore`] (`claim_prefix`, `release_prefix`):
 //!
@@ -99,7 +99,7 @@
 //! | claim (re-take or another transaction's) with release | [`LAW_PREFIX_RELEASE_RACE`] |
 //! | release with release, the bound transaction's | [`LAW_PREFIX_RELEASES`] |
 //! | release with release, the bound transaction's and another's | [`LAW_PREFIX_RELEASE_RACE`] |
-//! | release with claims of a prefix no transaction holds yet | no promise: the contract defines a release only of "this txid's attempt", and before the first claim there is none, so a release that comes first frees nothing and one that comes after frees the winner's attempt |
+//! | release with claims of a prefix no transaction holds yet | no law: a release that lands before the first claim has no attempt to free, and one that lands after frees the winner's attempt, so that transaction may win once more; whatever the order, the prefix stays bound to one transaction ("a different txid must never become eligible"), but no law releases a prefix no claim holds |
 //!
 //! [`ClaimStore`] (`claim`, `release`):
 //!
@@ -109,7 +109,7 @@
 //! | claim with claim, released key | [`LAW_CLAIM_RETAKE`] |
 //! | claim with release | [`LAW_CLAIM_RELEASE_RACE`] |
 //! | release with release | [`LAW_CLAIM_RELEASES`] |
-//! | release with claims of a key no claim holds yet | no promise: the contract orders a release after the claim it releases ("so the same key can be claimed again"), so a release that comes first frees nothing and one that comes after frees the winner, and two claims may then win |
+//! | release with claims of a key no claim holds yet | no law: a release that lands before the first claim frees nothing, and one that lands after frees the winner, so one or two claims win; no law releases a key no claim holds |
 //!
 //! [`PaymentNonceStore`] (`try_consume`, `release`):
 //!
@@ -119,11 +119,11 @@
 //! | consumption with consumption, released nonce | [`LAW_NONCE_RETAKE`] |
 //! | consumption with release | [`LAW_NONCE_RELEASE_RACE`] |
 //! | release with release | [`LAW_NONCE_RELEASES`] |
-//! | release with consumptions of a nonce not yet consumed | no promise, as for [`ClaimStore`]: a release frees "a consumed value" |
+//! | release with consumptions of a nonce not yet consumed | no law, as for [`ClaimStore`] |
 //! | an operation with the expiry of `ttl_seconds` | no promise: the expiry is the backend's, on its clock, and no caller starts it; the concurrent laws pass `None` (retained indefinitely) |
 //!
 //! Operations on different keys (another prefix, key, nonce or scope) share
-//! no record, and the contracts promise them nothing together.
+//! no record; no law starts them together.
 //!
 //! The release laws read a release that answers `Ok`, with no fault
 //! switched on, as one that has taken effect: "so the same key can be
@@ -135,11 +135,14 @@
 //!
 //! A store whose claim, or release, can be interrupted between the read
 //! that decides and the write that records (an await that is not ready
-//! there) is caught when another claim or release of the key enters that
-//! window under one of these poll orders at one of these N, if its futures
-//! make progress each time they are polled (a map, a local SQL connection,
-//! a store that wakes itself). What it cannot catch: a race that needs a
-//! poll order or an N it does not run; a race decided by the backend's own
+//! there) is caught when the operations one law starts together (claims of
+//! a key; one release and claims of a held key; releases of a held key,
+//! then claims) break it in that window under one of these poll orders at
+//! one of these N, if its futures make progress each time they are polled
+//! (a map, a local SQL connection, a store that wakes itself). What it
+//! cannot catch: a race that needs a poll order, an N or a mix of
+//! operations it does not run (two releases and a claim of a key at once; a
+//! release of a key no claim holds); a race decided by the backend's own
 //! clock rather than by the order of polls (inside a host's runtime the kit
 //! orders the polls, not the backend's I/O); a race between processes or
 //! isolates, since the kit runs on one thread. A store whose claim and

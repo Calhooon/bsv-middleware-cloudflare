@@ -143,14 +143,15 @@ winner, and the record left as the winner count says); N releases started togeth
 (one winner); each N driven under every schedule of `conformance::schedules` (reversed, lockstep,
 each claim held ahead in turn, and seeded random orders whose seed a violation names); the
 sequential laws; a legacy record; and a fault that is `Err`. The kit's docs list every pair of a
-trait's operations and the law that runs that pair together. It catches a store whose claim or
-release can be interrupted between its read and its write when one of those poll orders, at one
-of those N, puts another claim or release in that window; it does not order a backend's own I/O,
-and it runs on one thread. By default a claim is held back for at most 64 passes
-(`HELD_PASSES`); a host raises the bounds with `.sizes(..)`, `.held_passes(..)` and
-`.random(..)`. An `Err` under contention is a violation, so a raised bound can also fail a store
-that never lets two claims win but answers `Err` after waiting. The kit can show that a store
-races; it cannot show that a store never does. A host enables it in its development dependencies
+trait's operations and the law that runs that pair together, or why there is none. It catches a
+store whose claim or release can be interrupted between its read and its write when the claims
+or releases one law starts together, under one of those poll orders at one of those N, break it
+in that window; it runs no law with two releases and a claim at once, nor a release of a key no
+claim holds; it does not order a backend's own I/O, and it runs on one thread. By default a
+claim is held back for at most 64 passes (`HELD_PASSES`); a host raises the bounds with
+`.sizes(..)`, `.held_passes(..)` and `.random(..)`. An `Err` under contention is a violation,
+so a raised bound can also fail a store that never lets two claims win but answers `Err` after
+waiting. The kit can show that a store races; it cannot show that a store never does. A host enables it in its development dependencies
 and runs it in its own tests:
 
 ```rust,ignore

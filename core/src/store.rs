@@ -23,8 +23,8 @@
 //! simultaneous claims, under several poll schedules at every N from 2 to 33
 //! (by default; a host can raise the sizes and the hold), the sequential
 //! laws, and fail-closed faults. Its docs list every pair of a trait's
-//! operations and the law that runs it. It can show that a store races; it
-//! cannot show that a store never does.
+//! operations and the law that runs it, or why there is none. It can show
+//! that a store races; it cannot show that a store never does.
 
 use std::fmt;
 use std::future::Future;
