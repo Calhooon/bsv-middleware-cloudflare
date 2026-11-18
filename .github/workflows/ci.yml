@@ -240,9 +240,12 @@ jobs:
       - name: Scan the tracked tree, commit patches and diff
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           base="${BASE_SHA:-}"
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            base=$(git rev-list --max-parents=0 HEAD | head -1)
+          if [ "${REF_TYPE:-}" = tag ]; then
+            base=--tag
+          elif [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base=--all
           fi
           tools/ci/secrets_scan.sh "$base"
