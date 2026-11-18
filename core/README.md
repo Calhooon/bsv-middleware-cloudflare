@@ -7,10 +7,10 @@ rules to its runtime; `bsv-middleware-cloudflare` 0.7.0 is the Cloudflare Worker
 ## Install
 
 ```toml
-bsv-middleware-core = "0.4.1"
+bsv-middleware-core = "0.4.4"
 ```
 
-The SDK floor is bsv-rs 0.8 (caret, since core 0.4.1); core 0.4.0 provides a source API and an optional work limit.
+The SDK floor is bsv-rs 0.8.12 (caret, since core 0.4.4); core 0.4.0 provides a source API and an optional work limit.
 A script declining under a work or memory bound is payer-side `Unverifiable` with
 `SpendRefused`, naming the decline and input (400 `ERR_PAYMENT_INVALID` in the adapter).
 The crates set no bound themselves. The SDK's `MerklePath` refuses a lone hashed leaf
@@ -130,7 +130,35 @@ a fixture (`LookupFn` wraps a closure).
 permanently (M14, BRC-105). `claim_prefix` returns `PrefixClaim::{Won, SameTransaction,
 OtherTransaction, Unknown}`. Only `Won` proceeds to the wallet. A released record can be re-taken
 only by its own txid; held and served records refuse even that txid. `release_prefix` retains the
-binding forever. The adapter provides exact D1 and eventually consistent KV implementations.
+binding forever. The adapter provides `D1PrefixStore` (D1) and `KvPrefixStore` (KV).
+
+**What a backend must offer.** A claim is one indivisible step against the backend: a
+compare-and-set, an upsert under a unique key read back in the same transaction, or a
+single-threaded actor that owns the key. No other claim of the key may come between the read that
+decides a claim and the write that records it. With the feature `conformance`,
+`store::conformance` is the kit that runs an implementation against its trait's laws: N claims of
+one key, and N re-takes of a key claimed once and released, started together at every N from 2 to
+33 by default (one winner); a release started together with N claims of its key (at most one
+winner, and the record left as the winner count says); N releases started together, then N claims
+(one winner); each N driven under every schedule of `conformance::schedules` (reversed, lockstep,
+each claim held ahead in turn, and seeded random orders whose seed a violation names); the
+sequential laws; a legacy record; and a fault that is `Err`. The kit's docs list every pair of a
+trait's operations and the law that runs that pair together, or why there is none. It catches a
+store whose claim or release can be interrupted between its read and its write when the claims
+or releases one law starts together, under one of those poll orders at one of those N, break it
+in that window; it runs no law with two releases and a claim at once, nor a release of a key no
+claim holds; it does not order a backend's own I/O, and it runs on one thread. By default a
+claim is held back for at most 64 passes (`HELD_PASSES`); a host raises the bounds with
+`.sizes(..)`, `.held_passes(..)` and `.random(..)`. An `Err` under contention is a violation,
+so a raised bound can also fail a store that never lets two claims win but answers `Err` after
+waiting. The kit can show that a store races; it cannot show that a store never does. A host enables it in its development dependencies
+and runs it in its own tests:
+
+```rust,ignore
+// [dev-dependencies] bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }
+let fail = |on: bool| store.fail(on); // the store's fault switch, if it has one
+conformance::prefix_store(&store, "run-1").fault(&fail).run().await.unwrap();
+```
 
 `PaymentNonceStore` holds BRC-104 request nonces under their session; `ClaimStore` holds idempotency
 keys, such as refund-once keys. Neither is for payment prefixes. All fail closed by contract:

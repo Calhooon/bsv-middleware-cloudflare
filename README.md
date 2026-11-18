@@ -46,12 +46,12 @@ Error codes, HTTP statuses, and all `x-bsv-auth-*` / `x-bsv-payment-*` header na
 ## Install
 
 ```toml
-bsv-middleware-cloudflare = "0.7.2"
+bsv-middleware-cloudflare = "0.7.5"
 # Runtime-free hosts:
-bsv-middleware-core = "0.4.1"
+bsv-middleware-core = "0.4.4"
 ```
 
-Both crates require bsv-rs 0.7.0 or later in 0.7.x (caret). Work limits are optional, default `None`.
+Both crates require bsv-rs 0.8.12 or later in 0.8.x (caret). Work limits are optional, default `None`.
 A local evaluator decline names the resource and input as payer-side `Unverifiable` (`SpendRefused`),
 400 `ERR_PAYMENT_INVALID` in the adapter. A lone hashed leaf at a nonzero offset is refused by the
 SDK's `MerklePath`, with a payer-side refusal naming the offset. See [the migration](CHANGELOG.md).
@@ -342,12 +342,16 @@ ALTER TABLE payment_claims ADD COLUMN released INTEGER NOT NULL DEFAULT 0;
 
 New tables use `PAYMENT_CLAIMS_SCHEMA`. Never expire payment-prefix rows.
 `KvPrefixStore(&session_storage)` keeps the legacy key namespace and legacy `1`
-records closed, but G3 remains: read/write races at one edge and propagation
-across edges (about 60 seconds) can admit competing transactions. A DO auth
-backend does not make this KV payment backend exact; select D1 separately.
+records closed. A payment-prefix claim must be one indivisible step against the
+backend: a compare-and-set, an upsert under a unique key read back in the same
+transaction, or a single-threaded actor. KV has no compare-and-swap: a
+`KvPrefixStore` claim is a read of the prefix's key, then a write of the txid,
+and a write at one edge reaches the others after about 60 seconds.
+`D1PrefixStore` (feature `d1-claims`) is the store whose claim is one statement.
+A DO auth backend does not change the payment backend; select D1 separately.
 
 ```toml
-bsv-middleware-cloudflare = { version = "0.7.2", features = ["d1-claims"] }
+bsv-middleware-cloudflare = { version = "0.7.5", features = ["d1-claims"] }
 ```
 
 ## Session storage backends

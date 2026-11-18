@@ -1,0 +1,26 @@
+# One test Worker that exposes the single-use stores' conformance kit over
+# HTTP, run on workerd's D1 by `run.mjs` (Miniflare). A package of its own,
+# outside the workspace; never published.
+#   worker-build --release   (worker-build 0.8.4)
+#   npm ci && node run.mjs
+[package]
+name = "kit-worker"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bsv-middleware-cloudflare = { path = "../..", features = ["d1-claims"] }
+bsv-middleware-core = { path = "../../core", features = ["conformance"] }
+worker = { version = "0.8", features = ["d1"] }
+serde_json = "1"
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "s"
+
+[workspace]

@@ -15,7 +15,7 @@ Since 0.5.1 (core 0.2.1) the floor is bsv-rs 0.4.1: a raw transaction with no in
 bsv-middleware-rs 0.4.1), and the core's own `NoProof` for that shape stays beneath the reader as defense in depth.
 No behavior change for a host: payer-side, 400 either way; the 22 vectors are unchanged.
 
-Current release: adapter 0.7.2 / core 0.4.1, both on `bsv-rs = "0.8"` (caret; 0.8.0 adds `Error::WalletBusy` and marks `Error` `#[non_exhaustive]`), Rust 1.88.
+Current release: adapter 0.7.5 / core 0.4.4, both on `bsv-rs = "0.8.12"` (caret, so a later 0.8 patch resolves), Rust 1.88.
 Hashing uses bsv-rs `primitives::hash::{sha256, sha256_hmac, Sha256}`; no direct sha2 or hmac.
 
 ## Build
@@ -49,7 +49,12 @@ core/src/                — bsv-middleware-core (no runtime dependency)
 ├── payment_verify.rs   — verify_brc29_payment / verify_brc29_payment_verified (ONE pass through bsv-rs 0.4's
 │                         verify_stream with every root granted, a Tap judging the subject's output as the bytes
 │                         pass, then the roots asked of the service), verify_brc29_payment_structural_only
-├── store.rs            : PaymentPrefixStore + PrefixClaim, auth PaymentNonceStore, idempotency ClaimStore, MemoryStore
+├── store.rs            : PaymentPrefixStore + PrefixClaim, auth PaymentNonceStore, idempotency ClaimStore, MemoryStore;
+│                         what a backend must offer (compare-and-set, unique key, single-threaded actor)
+├── store/conformance.rs: feature `conformance`: the kit a host runs against its own stores (N = 2..=33 claims
+│                         driven under every `schedules` order: reversed, lockstep, each ahead, seeded random;
+│                         the re-takes, a release racing claims, releases then claims; the sequential
+│                         laws, legacy, fail closed; its docs table every pair of a trait's operations)
 ├── brc104.rs           — auth_headers, HttpRequestData/HttpResponseData, payloads, varint, signable filters
 ├── auth.rs             — SessionBinding, sign/verify, identity binding, handshake replies, response signing
 ├── session_lane.rs     — the lane's rules (moved whole)
@@ -78,7 +83,8 @@ src/                     — bsv-middleware-cloudflare (the Workers adapter)
 │   └── kv_payment.rs   — payment records, unspent tracking, derivation prefix lifecycle
 ├── client/
 │   ├── json_rpc.rs     — JSON-RPC 2.0 types with tolerant deserialization
-│   └── storage.rs      — WorkerStorageClient: auth'd RPC to a wallet storage server
+│   ├── storage.rs      — WorkerStorageClient: auth'd RPC to a wallet storage server; internalize_action_with_tx
+│   └── wire.rs         — RpcPayload: a request written once into the BRC-104 payload it is signed over
 ├── transport/
 │   └── cloudflare.rs   — CloudflareTransport: BRC-104 header extraction (payload build and
 │                         header names are the core's brc104, re-exported)
@@ -212,7 +218,7 @@ Payment: `x-bsv-payment`, `x-bsv-payment-version`, `x-bsv-payment-satoshis-requi
 |---|---|
 | Express auth middleware (reference) | `~/bsv/auth-express-middleware/` |
 | Express payment middleware (reference) | `~/bsv/payment-express-middleware/` |
-| BSV SDK (used for auth, wallet, transaction) | `~/bsv/bsv-rs/` (crates.io: `bsv-rs = "0.8"`) |
+| BSV SDK (used for auth, wallet, transaction) | `~/bsv/bsv-rs/` (crates.io: `bsv-rs = "0.8.12"`) |
 | Consumer example | `~/bsv/rust-message-box/` |
 | Agent consumers | `~/bsv/agents/{banana-agent,claude-agent,...}` |
 

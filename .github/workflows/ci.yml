@@ -50,6 +50,12 @@ jobs:
       - name: Run the tests of both crates
         run: cargo test --workspace --all-features
 
+      # serde_json's `preserve_order` changes the key order of its maps, and
+      # any crate in a host's build may turn it on: the wallet request's
+      # byte-for-byte tests run under both orders.
+      - name: Run the adapter's tests with serde_json's preserve_order
+        run: cargo test -p bsv-middleware-cloudflare --all-features --features serde_json/preserve_order --lib
+
   fmt:
     runs-on: ubuntu-latest
     steps:

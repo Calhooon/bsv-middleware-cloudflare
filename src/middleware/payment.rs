@@ -516,6 +516,8 @@ where
         // Express catches parse error and returns ERR_MALFORMED_PAYMENT
         Err(_) => return Ok(PaymentDecision::MalformedHeader),
     };
+    // The header's text is read; the payment holds what is used from it.
+    drop(payment_json);
 
     // Step 6: Verify derivation prefix (nonce)
     // Express: `const valid = await verifyNonce(paymentData.derivationPrefix, wallet)`
@@ -983,8 +985,10 @@ async fn internalize_payment<F>(
     //     outputs: [{ paymentRemittance: { derivationPrefix, derivationSuffix, senderIdentityKey }, outputIndex: 0, protocol: 'wallet payment' }],
     //     description: 'Payment for request'
     //   })
-    let args_json = internalize_args(
-        &tx_bytes,
+    //
+    // The request is written once, `tx` as its byte values straight into the
+    // signed buffer, and `tx_bytes` is released before it is sent.
+    let args_json = remittance_args(
         derivation_prefix,
         derivation_suffix,
         &auth_context.identity_key,
@@ -992,14 +996,44 @@ async fn internalize_payment<F>(
     );
 
     storage_client
-        .internalize_action(auth_json, args_json)
+        .internalize_action_with_tx(auth_json, args_json, tx_bytes)
         .await
 }
 
-/// The `internalizeAction` args for a verified payment — pure so the wire
-/// shape (incl. the labels key) is unit-testable. Labels ride top-level
-/// (the shape wallet storage persists and `listActions({labels})` filters
-/// on); `None` omits the key entirely (bit-compatible pre-labels shape).
+/// The `internalizeAction` args for a verified payment, every field but
+/// `tx` (which the storage client writes beside them, in the place
+/// [`internalize_args`]' value holds it). Labels ride top-level (the shape
+/// wallet storage persists and `listActions({labels})` filters on); `None`
+/// omits the key entirely (bit-compatible pre-labels shape).
+fn remittance_args(
+    derivation_prefix: &str,
+    derivation_suffix: &str,
+    sender_identity_key: &str,
+    labels: Option<&Vec<String>>,
+) -> serde_json::Value {
+    let mut args = serde_json::json!({
+        "outputs": [{
+            "outputIndex": PAYMENT_OUTPUT_INDEX,
+            "protocol": "wallet payment",
+            "paymentRemittance": {
+                "derivationPrefix": derivation_prefix,
+                "derivationSuffix": derivation_suffix,
+                "senderIdentityKey": sender_identity_key
+            },
+            "insertionRemittance": null
+        }],
+        "description": "Payment for request"
+    });
+    if let Some(labels) = labels {
+        args["labels"] = serde_json::json!(labels);
+    }
+    args
+}
+
+/// The `internalizeAction` args for a verified payment as one value, `tx`
+/// included: the tests pin the request the storage client writes to the
+/// one this value serializes to.
+#[cfg(test)]
 fn internalize_args(
     tx_bytes: &[u8],
     derivation_prefix: &str,
@@ -2369,3 +2403,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "payment_heap_tests.rs"]
+mod heap_tests;

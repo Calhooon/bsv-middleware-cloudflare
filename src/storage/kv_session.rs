@@ -476,10 +476,11 @@ mod kv_retry_tests {
 
 /// A permanent payment-prefix binding over the session store's KV namespace.
 ///
-/// G3 residual window: KV has no compare-and-swap. Concurrent requests at one
-/// edge, or requests at different edges before propagation (about 60 seconds),
-/// can both win and overwrite bindings. Use `D1PrefixStore` (feature `d1-claims`)
-/// for exact M14 enforcement. After a release, edge-cached reads can still
+/// G3 residual window: KV has no compare-and-swap. A claim is a read of the
+/// prefix's key, then, when the read finds it free, a write of the txid: two
+/// operations, and a write at one edge reaches the others after about 60 seconds.
+/// `D1PrefixStore` (feature `d1-claims`) is the store whose claim is one
+/// statement; use it for exact M14 enforcement. After a release, edge-cached reads can still
 /// refuse the same txid as a replay for about 60 seconds. Values are `txid` or
 /// `released:txid`, never deleted or expired; the legacy `1` sentinel refuses reuse as `PrefixClaim::Unknown`.
 pub struct KvPrefixStore<'a>(pub &'a KvSessionStorage);
